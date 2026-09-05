@@ -627,7 +627,7 @@ struct LibraryScreen:
                     var src_h = packed % 1000000
                     # canvas is screen-px: scale design coords up.
                     var s = Float64(ui.ui_scale)
-                    ui.canvas[unsafe_offset=0].blit_bgrx(
+                    ui.canvas[unsafe_offset=0].blit_rgba(
                         pixels,
                         src_w,
                         src_h,

@@ -514,7 +514,7 @@ struct Canvas(Copyable, Movable):
     # blits
     # ---------------------------------------------------------------------------
 
-    def blit_bgrx(
+    def blit_rgba(
         mut self,
         src: Pointer[UInt8, MutUntrackedOrigin],
         src_w: Int,
@@ -525,8 +525,12 @@ struct Canvas(Copyable, Movable):
         dw: Float64,
         dh: Float64,
     ):
-        """Nearest-neighbor scaled BGRX blit (cover art; the app's single
-        texture op — draw_texture_pro with full source, no rotation)."""
+        """Nearest-neighbor scaled RGBA→BGRX blit (cover art; the app's single
+        texture op — draw_texture_pro with full source, no rotation).
+
+        Source pixels are RGBA (as produced by resources.imdecode); the
+        canvas buffer is BGRX (ARGB8888 shm layout, byte 0 = blue), so
+        R and B are swapped during the copy."""
         if dw <= 0.0 or dh <= 0.0 or src_w <= 0 or src_h <= 0:
             return
         var dx0 = Int(dx)
@@ -561,10 +565,10 @@ struct Canvas(Copyable, Movable):
                     sx = 0
                 var sp = src_row.unsafe_offset(sx * 4)
                 var dp = dst_row.unsafe_offset(xx * 4)
-                dp[unsafe_offset=0] = sp[unsafe_offset=0]
-                dp[unsafe_offset=1] = sp[unsafe_offset=1]
-                dp[unsafe_offset=2] = sp[unsafe_offset=2]
-                dp[unsafe_offset=3] = sp[unsafe_offset=3]
+                dp[unsafe_offset=0] = sp[unsafe_offset=2]  # B
+                dp[unsafe_offset=1] = sp[unsafe_offset=1]  # G
+                dp[unsafe_offset=2] = sp[unsafe_offset=0]  # R
+                dp[unsafe_offset=3] = sp[unsafe_offset=3]  # A
 
     def blit_mask(
         mut self,

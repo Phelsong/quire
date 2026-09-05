@@ -151,7 +151,8 @@ struct PlayerScreen:
     var play_requested: Bool
     var play_book_index: Int
 
-    # Cover art pixels (decoded BGRX bytes via Pillow; no GPU textures).
+    # Cover art pixels (decoded RGBA bytes via resources.imdecode; no GPU
+    # textures — blit_rgba swaps to the canvas BGRX layout).
     var cover_pixels: Optional[Pointer[UInt8, MutUntrackedOrigin]]
     var cover_w: Int
     var cover_h: Int
@@ -1123,10 +1124,10 @@ struct PlayerScreen:
             var cover_x = (sw_design - cover_w) / 2.0
             var cover_y = header_h + 14.0
             # Canvas is in SCREEN pixels; all imui primitives convert
-            # design->screen via ui_scale. blit_bgrx expects screen px too,
+            # design->screen via ui_scale. blit_rgba expects screen px too,
             # so scale the design-space cover rect before blitting.
             var scale = Float64(ui.ui_scale)
-            ui.canvas[unsafe_offset=0].blit_bgrx(
+            ui.canvas[unsafe_offset=0].blit_rgba(
                 self.cover_pixels.value(),
                 self.cover_w,
                 self.cover_h,
