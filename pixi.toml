@@ -1,0 +1,78 @@
+[workspace]
+name = "quire"
+version = "0.1.0"
+channels = [
+  "https://conda.modular.com/max",
+  "https://repo.prefix.dev/modular-community",
+  "https://prefix.dev/pixi-build-backends",
+  "https://prefix.dev/conda-forge",
+]
+channel-priority = "flexible"
+description = "Desktop Plex audiobook client"
+# platforms = ["linux-64"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+preview = ["pixi-build"]
+
+[package]
+name = "quire"
+version = "0.1.0"
+
+[package.build]
+# backend = { name = "pixi-build-rattler-build", version = "*" }
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+[package.build.config]
+experimental = true
+
+[dependencies]
+emberjson = ">=0.3.3"
+mojo-wayland = { path = "../mojo-wayland" }
+httpx = ">=0.28.1,<0.29"
+mojo = "==1.0.0"
+ffmpeg = ">=7.0,<9"
+# uuid = { git = "https://github.com/ehsanmok/uuid.git", branch = "main" }
+
+[pypi-dependencies]
+aiohttp = ">=3.14.1, <4"
+websocket-client = ">=1.9.0, <2"
+requests = ">=2.34.2, <3"
+cryptography = ">=49.0.0, <50"
+plyer = ">=2.1.0, <3"
+mutagen = ">=1.47.0, <2"
+defusedxml = ">=0.7.1, <0.8"
+
+[tasks]
+# The C shim (libwayland_shim.so) is a build artifact of the local
+# ../mojo-wayland checkout, not packaged by conda. Build it into this
+# project's .pixi/lib before any link task runs.
+shim = """mkdir -p .pixi/lib && \
+gcc -shared -fPIC -O2 -Wall \
+  -o .pixi/lib/libwayland_shim.so \
+  ../mojo-wayland/wayland/c/shim.c \
+  ../mojo-wayland/wayland/c/generated/xdg-shell-protocol.c \
+  -lwayland-client"""
+
+# dev
+dev = { cmd = "mojo build main.mojo -I . -Xlinker -L.pixi/lib -Xlinker -L.pixi/envs/default/lib -Xlinker -lwayland_shim -Xlinker -lwayland-client -Xlinker -lfreetype -Xlinker -lpulse-simple -Xlinker -lpulse -o .pixi/main && LD_LIBRARY_PATH=.pixi/lib:.pixi/envs/default/lib PYTHONPATH=.pixi/envs/default/lib/python3.14/site-packages .pixi/main", depends-on = [
+  "shim",
+] }
+format = "mojo format . -q"
+# dist
+app = "LD_LIBRARY_PATH=.pixi/lib:.pixi/envs/default/lib PYTHONPATH=.pixi/envs/default/lib/python3.14/site-packages .pixi/main"
+build = { cmd = "mojo build main.mojo -I . -Xlinker -L.pixi/lib -Xlinker -L.pixi/envs/default/lib -Xlinker -lwayland_shim -Xlinker -lwayland-client -Xlinker -lfreetype -Xlinker -lpulse-simple -Xlinker -lpulse -o .pixi/main", depends-on = [
+  "shim",
+] }
+dist = { cmd = "python3 scripts/make_bundle.py", depends-on = [
+  "build",
+] }
+appimage = { cmd = "python3 scripts/make_appimage.py", depends-on = [
+  "dist",
+] }
+# test/debug
+test = "mojo tests/test_config.mojo"
+wayland-test = { cmd = "mojo build tests/test_globals.mojo -I . -o .pixi/test_globals -Xlinker -L.pixi/lib -Xlinker -L.pixi/envs/default/lib -Xlinker -lwayland_shim -Xlinker -lwayland-client && LD_LIBRARY_PATH=.pixi/lib:.pixi/envs/default/lib .pixi/test_globals", depends-on = [
+  "shim",
+] }
+wayland-window = { cmd = "mojo build tests/test_window.mojo -I . -o .pixi/test_window -Xlinker -L.pixi/lib -Xlinker -L.pixi/envs/default/lib -Xlinker -lwayland_shim -Xlinker -lwayland-client && LD_LIBRARY_PATH=.pixi/lib:.pixi/envs/default/lib .pixi/test_window", depends-on = [
+  "shim",
+] }
