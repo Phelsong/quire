@@ -8,6 +8,7 @@ Python at the httpx call sites; only _http_get and _xml_to_dict otherwise
 touch PythonObject.
 """
 
+from std.logger import Logger, Level
 from std.python import Python, PythonObject
 from std.python.conversions import ConvertibleToPython
 from std.os import makedirs, path, remove, getenv
@@ -36,6 +37,7 @@ from resources.config import (
     load_config,
     save_config,
     get_or_create_client_id,
+    LOG_LEVEL
 )
 
 # ---------------------------------------------------------------------------
@@ -184,6 +186,8 @@ def _http_get(
     which they immediately convert into native Mojo structs.
     """
     var httpx = Python.import_module("httpx")
+    
+    var logger = Logger[LOG_LEVEL]()
     var resp = httpx.get(
         url,
         headers=headers.copy().to_python_object(),
@@ -193,8 +197,8 @@ def _http_get(
 
     var status_code = Int(py=resp.status_code)
     if status_code >= 400:
-        print("[plex_bridge] GET " + url + " -> " + String(status_code))
-        print("[plex_bridge] Response: " + String(resp.text[0:500]))
+        logger.warning("[plex_bridge] GET " + url + " -> " + String(status_code))
+        logger.warning("[plex_bridge] Response: " + String(resp.text[0:500]))
 
     resp.raise_for_status()
 

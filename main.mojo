@@ -1,7 +1,7 @@
 from std.python import Python
 from std.time import perf_counter
 from std.memory import alloc, Layout
-from std.logger import Logger
+from std.logger import Logger, Level
 
 from platform.window import Window, WindowInput
 from platform.gamepad import Gamepad
@@ -20,7 +20,7 @@ from functions.plex_bridge import (
     download_track,
 )
 from functions.ascii import AsciiTable
-from resources.config import Config, load_config, save_config
+from resources.config import Config, load_config, save_config, LOG_LEVEL
 from resources.keys import KEY_ENTER, KEY_ESCAPE, key_combo
 
 from resources.palette import (
@@ -49,12 +49,11 @@ comptime SCREEN_H = 1000  # Default window height (logical pixels)
 # Main entry point
 # ---------------------------------------------------------------------------
 
-
 def main() raises:
     # Audio is handled by the native AudioBackend (pa_simple via libpulse);
     # it creates/destroys its own device connection per stream. Nothing to
     # initialize here.
-    var logger = Logger()
+    var logger = Logger[LOG_LEVEL]()
 
     logger.info("opening window")
     # Open a native Wayland window (xdg-shell + wl_shm)
@@ -235,7 +234,7 @@ def main() raises:
     var pad = Gamepad()
     var pad_ok = pad.open()
     if not pad_ok:
-        print("gamepad: no pad found (gamepad binds inert)")
+        logger.info("gamepad: no pad found (gamepad binds inert)")
     var pad_box = alloc(Layout[Gamepad](count=1)).unsafe_leak()
     pad_box.unsafe_write(pad^)
 

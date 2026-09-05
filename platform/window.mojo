@@ -73,6 +73,7 @@ from wayland.gen.xdg_shell import (
     xdg_toplevel_listen,
     xdg_toplevel_next_configure,
     xdg_toplevel_next_close,
+    xdg_toplevel_set_maximized,
     xdg_toplevel_set_title,
 )
 
@@ -173,6 +174,16 @@ def _arg_as_u32(a: WLArgument) -> UInt32:
     for i in range(4):
         v = v | (Int(a.raw[i]) << (8 * i))
     return UInt32(v)
+
+
+def _arg_as_i32(a: WLArgument) -> Int:
+    """Signed 32-bit wire arg (toplevel configure width/height are Int)."""
+    var v = 0
+    for i in range(4):
+        v = v | (Int(Int32(a.raw[i]) & 0xFF) << (8 * i))
+    # Reinterpret the 32-bit pattern as signed.
+    var signed = Int32(UInt32(v) & 0xFFFFFFFF)
+    return Int(signed)
 
 
 def _arg_as_fixed(a: WLArgument) -> Float64:
@@ -605,6 +616,10 @@ struct Window(Copyable, Movable):
         var xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface)
         var toplevel = xdg_surface_get_toplevel(xdg_surface)
         xdg_toplevel_set_title(toplevel, _wlstring(title))
+        # Request a maximized toplevel BEFORE the first commit. The
+        # compositor answers with a configure carrying the real workbench
+        # size (see below) — the caller reads it from frame.width/height.
+        xdg_toplevel_set_maximized(toplevel)
 
         var qs_buf = stack_allocation[1, WLPtr]()
         var qt_buf = stack_allocation[1, WLPtr]()
@@ -618,11 +633,21 @@ struct Window(Copyable, Movable):
         wl_surface_commit(surface)
         _ = wl_display_roundtrip(w.display)
 
-        # toplevel configure → ack → surface configure → ack
+        # toplevel configure → ack → surface configure → ack.
+        # The configure's (width, height) args carry the compositor-assigned
+        # size — for a maximized toplevel that's the real workarea, which
+        # overrides the requested w/h when valid (0 = "pick your own").
+        var fb_w = width
+        var fb_h = height
         var targs = stack_allocation[MAX_EVENT_ARGS, WLArgument]()
         var configured = False
         for round in range(50):
             while xdg_toplevel_next_configure(top_queue, targs):
+                var cw = _arg_as_i32(targs[unsafe_offset=0])
+                var ch = _arg_as_i32(targs[unsafe_offset=1])
+                if cw > 0 and ch > 0:
+                    fb_w = cw
+                    fb_h = ch
                 configured = True
                 break
             if configured:
@@ -702,8 +727,8 @@ struct Window(Copyable, Movable):
         # framebuffers: TWO ARGB8888 shm buffers for double-buffering. The
         # app draws into `back` via draw_buffer(); present() memcmps it
         # against the shown `frame`, commits only on change, then swaps.
-        var frame = Frame._build(width, height, shm, surface)
-        var back = Frame._build(width, height, shm, surface)
+        var frame = Frame._build(fb_w, fb_h, shm, surface)
+        var back = Frame._build(fb_w, fb_h, shm, surface)
 
         wl_surface_attach(surface, frame.buffer, 0, 0)
         wl_surface_commit(surface)

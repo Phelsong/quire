@@ -420,7 +420,7 @@ struct LibraryScreen:
             return
 
         self.scroll_offset += wheel_delta * 40.0
-        var max_scroll = Float32(total_height - visible_height - 100)
+        var max_scroll = Float32(total_height - visible_height - 300)
         if self.scroll_offset < 0.0:
             self.scroll_offset = 0.0
         elif self.scroll_offset > max_scroll:
@@ -447,7 +447,7 @@ struct LibraryScreen:
 
         # Settings button (right side)
         var settings_w = sw_design * 0.12
-        var btn_h = 36.0
+        var btn_h = 40.0
         var settings_result = ui.button_at(
             ICON_SETTINGS,
             sw_design - settings_w - 20.0,
@@ -465,7 +465,7 @@ struct LibraryScreen:
         # --- Search bar ---
         # Placed below the header. Bounds in screen px (matches mouse_pos).
         var search_y = header_h + 14.0
-        var search_h = 60.0
+        var search_h = 80.0
         var search_w = sw_design * 0.6
         var search_x = (sw_design - search_w) / 2.0
         var search_bounds = ui.rect(search_x, search_y, search_w, search_h)
@@ -480,21 +480,24 @@ struct LibraryScreen:
             if ui._hit(search_bounds):
                 ui.item_clicked = True
         # Draw the search input (font size 16, design px).
-        self.search_input.draw(ui, 16, ui.dt)
+        self.search_input.draw(ui, 20, ui.dt)
 
         # --- Status + pagination line ---
         var status_y = search_y + search_h + 4.0
         var page_count = self._page_count()
 
         # PREV button (left of status) — disabled on first page.
+        # Fitted width: the grown rect is what's drawn AND what the status
+        # label offsets from, so they stay in sync.
         var prev_w = 70.0
+        var prev_fit_w = ui.fitted_button_w("PREV", 22, prev_w)
         if self.page > 0:
             var prev_result = ui.button_at(
                 "PREV",
                 20.0,
                 status_y - 2.0,
                 prev_w,
-                22.0,
+                36.0,
                 BTN_DARK_LIB,
                 TEXT_LIGHT,
                 Color(55, 64, 80, 255),
@@ -508,7 +511,7 @@ struct LibraryScreen:
                 20.0,
                 status_y - 2.0,
                 prev_w,
-                22.0,
+                36.0,
                 CARD_BG,
                 TEXT_MUTED,
                 CARD_BG,
@@ -516,19 +519,21 @@ struct LibraryScreen:
 
         # Status message (center).
         if self.status_message.byte_length() > 0:
-            ui.move_to(20.0 + prev_w + 12.0, status_y)
+            ui.move_to(20.0 + prev_fit_w + 12.0, status_y)
             ui.label(self.status_message, 16, self.status_color)
 
-        # NEXT button (right) — disabled on last page.
+        # NEXT button (right) — disabled on last page. Right-anchored with
+        # the fitted width so the grown rect stays inside the right margin.
         var next_w = 70.0
-        var next_x = sw_design - 20.0 - next_w
+        var next_fit_w = ui.fitted_button_w("NEXT", 22, next_w)
+        var next_x = sw_design - 20.0 - next_fit_w
         if self.page + 1 < page_count and len(self.books) > 0:
             var next_result = ui.button_at(
                 "NEXT",
                 next_x,
                 status_y - 2.0,
                 next_w,
-                22.0,
+                36.0,
                 BTN_DARK_LIB,
                 TEXT_LIGHT,
                 Color(55, 64, 80, 255),
@@ -541,7 +546,7 @@ struct LibraryScreen:
                 next_x,
                 status_y - 2.0,
                 next_w,
-                22.0,
+                36.0,
                 CARD_BG,
                 TEXT_MUTED,
                 CARD_BG,
@@ -572,7 +577,7 @@ struct LibraryScreen:
 
         var row_pad = 20.0
         var row_gap = 16.0
-        var row_h = 176.0
+        var row_h = 180.0
         var inner_pad = 16.0
 
         # scroll_offset is in screen px; convert to design px
@@ -608,7 +613,7 @@ struct LibraryScreen:
             var row_hover = ui._hit(row_rect)
             if row_hover:
                 ui.card(
-                    row_pad, row_y, row_w, row_h, SELECTED_BG, roundness=0.06
+                    row_pad, row_y, row_w, row_h, SELECTED_BG, roundness=0.08
                 )
 
             # --- Square cover (left) ---
@@ -645,7 +650,7 @@ struct LibraryScreen:
                     cover_size,
                     cover_size,
                     PLACEHOLDER_BG,
-                    roundness=0.06,
+                    roundness=0.08,
                 )
 
             # Book info (right of cover) — vertically centered in the row.
@@ -668,11 +673,11 @@ struct LibraryScreen:
                 title_text = title_text
 
             ui.move_to(info_x, title_y)
-            ui.label(title_text, 18, TEXT_BRIGHT)
+            ui.label(title_text, 32, TEXT_BRIGHT)
 
             # Author
-            ui.move_to(info_x, title_y + 24.0)
-            ui.label(book.author, 16, TEXT_DIM)
+            ui.move_to(info_x, title_y + 40.0)
+            ui.label(book.author, 20, TEXT_DIM)
 
             # Progress line
             var progress_text = "Not Started"
@@ -699,17 +704,20 @@ struct LibraryScreen:
                         Float64(book.duration_ms) / 1000.0
                     )
 
-            ui.move_to(info_x, title_y + 46.0)
+            ui.move_to(info_x, title_y + 70.0)
             ui.label(progress_text, 14, GREEN)
 
             # --- Row actions (right side): SAVE + PLAY ---
-            var play_w = 56.0
-            var play_h = 34.0
-            var save_w = 56.0
-            var save_gap = 10.0
-            var play_x = row_pad + row_w - inner_pad - play_w
+            var play_w = 60.0
+            var play_h = 60.0
+            var save_w = 60.0
+            var save_gap = 40.0
+            # SAVE auto-widens to fit its label (see imui.fitted_button_w);
+            # reserve the grown width so it doesn't overlap the PLAY button.
+            var save_fit_w = ui.fitted_button_w("SAVE", 26, save_w)
+            var play_x = row_pad + row_w - inner_pad - play_w - 100
             var play_y = row_y + (row_h - play_h) / 2.0
-            var save_x = play_x - save_gap - save_w
+            var save_x = play_x - save_gap - save_fit_w
 
             var save_result = ui.button_at(
                 "SAVE",

@@ -879,11 +879,10 @@ struct SettingsScreen:
         var preset_count = len(presets)
         var preset_w = 72.0
         var preset_gap = 10.0
-        var preset_start_x = 20.0
+        var px = 20.0
         for i in range(preset_count):
             var value = presets[i]
             var label = String(_round(value * 100.0)) + "%"
-            var px = preset_start_x + Float64(i) * (preset_w + preset_gap)
             var selected = abs(self.font_multiplier - value) < 0.001
             var bg = BTN_DARK_LIB
             if selected:
@@ -891,6 +890,9 @@ struct SettingsScreen:
             var fg = TEXT_LIGHT
             if selected:
                 fg = ACCENT_DARK
+            # Fitted width per button: labels like "125%" outgrow the 72px
+            # base rect, so stride from the grown width to avoid overlap.
+            var fit_w = ui.fitted_button_w(label, 22, preset_w)
             var r = ui.button_at(
                 label,
                 px,
@@ -904,6 +906,7 @@ struct SettingsScreen:
             if r.clicked and not selected:
                 self.font_multiplier = value
                 self.dirty = True
+            px = px + fit_w + preset_gap
 
     def _draw_keybind_section(
         mut self,

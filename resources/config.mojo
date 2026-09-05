@@ -8,6 +8,7 @@ get_or_create_client_id from here.
 from std.os import makedirs, path
 from std.pathlib import Path
 from std.io.file import open
+from std.logger import Logger, Level
 from std.python import Python
 
 from emberjson import try_deserialize, serialize
@@ -15,6 +16,7 @@ from emberjson import try_deserialize, serialize
 
 comptime _CONFIG_FILE = "~/.config/quire/config.json"
 
+comptime LOG_LEVEL = Level(Int(30))
 
 struct Config(Copyable, Defaultable, Deinitable, Movable, Writable):
     var client_identifier: String

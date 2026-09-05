@@ -1072,16 +1072,16 @@ struct PlayerScreen:
         var sh_design = Float64(ui.screen_h) / Float64(ui.ui_scale)
 
         # --- Header bar ---
-        var header_h = 50.0
+        var header_h = 60.0
         ui.panel_bg(0.0, 0.0, sw_design, header_h, PLAYER_BG)
 
         # Back button
-        var btn_w = sw_design * 0.25
-        var btn_h = 36.0
+        var btn_w = sw_design * 0.10
+        var btn_h = 40.0
         ui.move_to(20.0, 7.0)
         ui.cursor_w = Float32(btn_w) * ui.ui_scale
         var back_result = ui.button(
-            "<< LIBRARY",
+            "<- LIBRARY",
             btn_h,
             BTN_DARK_LIB,
             TEXT_LIGHT,
@@ -1097,16 +1097,16 @@ struct PlayerScreen:
         # "Now Playing" label (right-aligned in header)
         var now_playing = "Now Playing"
         var np_meas = ui._measure_text(now_playing, 22)
-        var np_x = sw_design - ui.text_w_design(np_meas.x) - 20.0
+        var np_x = sw_design - ui.text_w_design(np_meas.x) - 100.0
         ui.move_to(np_x, 12.0)
         ui.label(now_playing, 22, GREEN)
 
         # --- Content area (vertical stack: cover → metadata → description → player → chapters) ---
         var content_x = 20.0
-        var content_w = sw_design - 40.0
+        var content_w = sw_design - 100.0
 
         # --- Cover art (centered on app width, scaled to x% width bound, aspect-preserving) ---
-        var cover_max = min(sw_design * 0.4, sh_design * 0.4)
+        var cover_max = min(sw_design * 0.35, sh_design * 0.35)
         var cover_w = cover_max
         var cover_h = cover_max
         if self.has_cover:
@@ -1173,7 +1173,7 @@ struct PlayerScreen:
             meta_y += 30.0
 
         if self.book_author.byte_length() > 0:
-            var author_meas = ui._measure_text(self.book_author, 16)
+            var author_meas = ui._measure_text(self.book_author, 18)
             var author_x = (sw_design - ui.text_w_design(author_meas.x)) / 2.0
             ui.move_to(author_x, meta_y)
             ui.label(self.book_author, 20, TEXT_DIM)
@@ -1208,7 +1208,7 @@ struct PlayerScreen:
             var desc_max_chars = Int(desc_max_w / 6.0)
             if desc_max_chars > 3:
                 var desc_text = truncate_string(
-                    self.book_description, desc_max_chars * 3
+                    self.book_description, desc_max_chars * 4
                 )
                 ui.move_to(content_x, desc_y)
                 ui.label(desc_text, 20, TEXT_DIM)
@@ -1219,13 +1219,13 @@ struct PlayerScreen:
             desc_y += 0.0
 
         # --- Player bar (progress + controls + speed/volume) ---
-        var player_y = desc_y + 8.0
-        var player_w = content_w
-        var player_x = content_x
+        var player_y = desc_y + 16.0
+        var player_w = content_w - 40
+        var player_x = content_x + 40
 
         # --- Progress bar ---
         var progress_y = player_y
-        var progress_h = 8.0
+        var progress_h = 10.0
         var progress_result = ui.slider(
             player_x,
             progress_y,
@@ -1273,13 +1273,13 @@ struct PlayerScreen:
             remaining = 0.0
         var remaining_str = "-" + format_time(remaining)
         var rem_meas = ui._measure_text(remaining_str, 12)
-        var rem_x = player_x + player_w - ui.text_w_design(rem_meas.x)
+        var rem_x = player_x + player_w - ui.text_w_design(rem_meas.x + 20)
         ui.move_to(rem_x, time_y)
         ui.label(remaining_str, 20, TEXT_DIM)
 
         # --- Chapter seek bar (tracks position within the current chapter) ---
         var chap_bar_y = time_y + 30.0
-        var chap_bar_h = 6.0
+        var chap_bar_h = 8.0
         var chap_start = self._chapter_start_sec()
         var chap_end = self._chapter_end_sec()
         var chap_dur = chap_end - chap_start
@@ -1329,7 +1329,7 @@ struct PlayerScreen:
             self.chapter_dragging = False
 
         # Chapter time labels
-        var chap_time_y = chap_bar_y + chap_bar_h + 8.0
+        var chap_time_y = chap_bar_y + chap_bar_h + 10.0
         var chap_elapsed_str = format_time(chap_pos)
         ui.move_to(player_x, chap_time_y)
         ui.label(chap_elapsed_str, 18, TEXT_DIM)
@@ -1339,7 +1339,7 @@ struct PlayerScreen:
             chap_remaining = 0.0
         var chap_rem_str = "-" + format_time(chap_remaining)
         var chap_rem_meas = ui._measure_text(chap_rem_str, 12)
-        var chap_rem_x = player_x + player_w - ui.text_w_design(chap_rem_meas.x)
+        var chap_rem_x = player_x + player_w - ui.text_w_design(chap_rem_meas.x + 20)
         ui.move_to(chap_rem_x, chap_time_y)
         ui.label(chap_rem_str, 18, TEXT_DIM)
 
@@ -1359,16 +1359,16 @@ struct PlayerScreen:
         ui.label(chap_label, 18, GREEN)
 
         # --- Playback control buttons (5 buttons, equal width) ---
-        var ctrl_y = chap_time_y + 30.0
-        var ctrl_btn_h = 40.0
-        var ctrl_gap = 20.0
+        var ctrl_y = chap_time_y + 50.0
+        var ctrl_btn_h = 120.0
+        var ctrl_gap = 80.0
         var total_btns = 5
-        var total_gap_w = Float64(total_btns - 1) * ctrl_gap
+        var total_gap_w = Float64(total_btns-1) * ctrl_gap
         var ctrl_btn_w = (player_w - total_gap_w) / Float64(total_btns)
 
         # Prev chapter
         var prev_ch_result = ui.button_at(
-            "<< Prev",
+            "|<",
             player_x,
             ctrl_y,
             ctrl_btn_w,
@@ -1384,7 +1384,7 @@ struct PlayerScreen:
 
         # Skip back 30s
         var skip_back_result = ui.button_at(
-            "< 30s",
+            "< 10s",
             player_x + ctrl_btn_w + ctrl_gap,
             ctrl_y,
             ctrl_btn_w,
@@ -1395,7 +1395,7 @@ struct PlayerScreen:
             action="skip_back",
         )
         if skip_back_result.clicked:
-            self.current_time = self.current_time - 30.0
+            self.current_time = self.current_time - 10.0
             if self.current_time < 0.0:
                 self.current_time = 0.0
             self._update_current_chapter()
@@ -1421,7 +1421,7 @@ struct PlayerScreen:
 
         # Skip forward 30s
         var skip_fwd_result = ui.button_at(
-            "> 30s",
+            "10s >",
             player_x + 3.0 * ctrl_btn_w + 3.0 * ctrl_gap,
             ctrl_y,
             ctrl_btn_w,
@@ -1432,7 +1432,7 @@ struct PlayerScreen:
             action="skip_forward",
         )
         if skip_fwd_result.clicked:
-            self.current_time = self.current_time + 30.0
+            self.current_time = self.current_time + 10.0
             if self.current_time > self.duration:
                 self.current_time = self.duration
             self._update_current_chapter()
@@ -1440,7 +1440,7 @@ struct PlayerScreen:
 
         # Next chapter
         var next_ch_result = ui.button_at(
-            "Next >>",
+            ">|",
             player_x + 4.0 * ctrl_btn_w + 4.0 * ctrl_gap,
             ctrl_y,
             ctrl_btn_w,
@@ -1459,12 +1459,16 @@ struct PlayerScreen:
 
         # Speed: two buttons (− / +) with the current speed label between.
         # ±0.05 per click, pitch-correct via ffmpeg atempo restart.
+        # Buttons auto-widen to label + padding (fitted_button_w), so all
+        # x offsets below must use the GROWN widths to stay in sync.
+        var speed_btn_w = 40.0
+        var speed_btn_w_minus = ui.fitted_button_w("-", 22, speed_btn_w)
         var speed_minus_result = ui.button_at(
             "-",
             player_x,
             vol_y,
-            30.0,
-            30.0,
+            speed_btn_w,
+            52.0,
             BTN_CONTROL,
             TEXT_LIGHT,
             Color(55, 64, 80, 255),
@@ -1475,22 +1479,25 @@ struct PlayerScreen:
 
         # Speed label (read-only, centered between the two buttons)
         var speed_lbl = self._speed_label()
-        var speed_meas = ui._measure_text(speed_lbl, 14)
+        var speed_meas = ui._measure_text(speed_lbl, 16)
+        var speed_lbl_slot = 110.0  # design-px reserved for the label
         var speed_lbl_x = (
             player_x
-            + 30.0
+            + speed_btn_w_minus
             + 10.0
-            + (60.0 - ui.text_w_design(speed_meas.x)) / 2.0
+            + (speed_lbl_slot - ui.text_w_design(speed_meas.x)) / 2.0
         )
         ui.move_to(speed_lbl_x, vol_y + 8.0)
         ui.label(speed_lbl, 18, TEXT_BRIGHT)
 
+        var speed_plus_x = player_x + speed_btn_w_minus + 10.0 + speed_lbl_slot + 10.0
+        var speed_btn_w_plus = ui.fitted_button_w("+", 22, speed_btn_w)
         var speed_plus_result = ui.button_at(
             "+",
-            player_x + 30.0 + 10.0 + 60.0 + 10.0,
+            speed_plus_x,
             vol_y,
-            30.0,
-            30.0,
+            speed_btn_w,
+            52.0,
             BTN_CONTROL,
             TEXT_LIGHT,
             Color(55, 64, 80, 255),
@@ -1500,17 +1507,17 @@ struct PlayerScreen:
             self._change_speed(0.05)
 
         # Volume label
-        var vol_label_x = player_x + 30.0 + 10.0 + 60.0 + 10.0 + 30.0 + 10.0
-        ui.move_to(vol_label_x, vol_y + 6.0)
-        ui.label("Vol", 18, TEXT_DIM)
+        var vol_label_x = speed_plus_x + speed_btn_w_plus + 140.0
+        ui.move_to(vol_label_x, vol_y + 12.0)
+        ui.label("Vol", 26, TEXT_DIM)
 
         # Volume slider
-        var vol_slider_x = vol_label_x + 30.0
-        var vol_slider_w = 150.0
-        var vol_slider_h = 6.0
+        var vol_slider_x = vol_label_x + 200.0
+        var vol_slider_w = 300.0
+        var vol_slider_h = 10.0
         var vol_result = ui.slider(
             vol_slider_x,
-            vol_y + 10.0,
+            vol_y + 16.0,
             vol_slider_w,
             vol_slider_h,
             self.volume,
@@ -1534,14 +1541,14 @@ struct PlayerScreen:
         var vol_pct = Int(self.volume * 100.0)
         var vol_pct_str = String(vol_pct) + "%"
         ui.move_to(vol_slider_x + vol_slider_w + 8.0, vol_y + 6.0)
-        ui.label(vol_pct_str, 18, TEXT_DIM)
+        ui.label(vol_pct_str, 20, TEXT_DIM)
 
         # --- Chapter list (scrollable) ---
         if len(self.chapters) > 0:
-            var chap_list_y = vol_y + 56.0
+            var chap_list_y = vol_y + 90.0
             var chap_list_bottom = sh_design - 10.0
             var chap_list_h = chap_list_bottom - chap_list_y
-            var chap_h = 32.0
+            var chap_h = 60.0
 
             ui.begin_clip(player_x, chap_list_y, player_w, chap_list_h)
 
@@ -1577,7 +1584,7 @@ struct PlayerScreen:
                 # Chapter number
                 var ch_num = String(chap.index)
                 ui.move_to(player_x + 8.0, row_y + 12.0)
-                ui.label(ch_num, 18, GREEN if chap.is_current else TEXT_DIM)
+                ui.label(ch_num, 20, GREEN if chap.is_current else TEXT_DIM)
 
                 # Chapter title (truncated)
                 var title_x_d = player_x + 40.0
@@ -1595,7 +1602,7 @@ struct PlayerScreen:
 
                 ui.move_to(title_x_d, row_y + 12.0)
                 var title_color = TEXT_BRIGHT if chap.is_current else TEXT_LIGHT
-                ui.label(chap_title, 20, title_color)
+                ui.label(chap_title, 26, title_color)
 
                 # Time range
                 var time_range = (
@@ -1605,10 +1612,10 @@ struct PlayerScreen:
                 )
                 var time_meas = ui._measure_text(time_range, 12)
                 var time_x = (
-                    player_x + player_w - ui.text_w_design(time_meas.x) - 8.0
+                    player_x + player_w - ui.text_w_design(time_meas.x) - 100.0
                 )
                 ui.move_to(time_x, row_y + 9.0)
-                ui.label(time_range, 20, TEXT_MUTED)
+                ui.label(time_range, 26, TEXT_MUTED)
 
                 # Click detection for chapter row (same rectangle as drawn)
                 var click_rect = ui.rect(player_x, row_y, player_w, chap_h)

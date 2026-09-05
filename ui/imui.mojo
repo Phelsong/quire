@@ -30,6 +30,9 @@ from resources.palette import (
 comptime DESIGN_W = 1200.0
 comptime DESIGN_H = 1600.0
 
+# Minimum horizontal padding (design px) between a button label and its edge.
+comptime BUTTON_PAD_X = 30.0
+
 # Atlas ladder sizes (must match FontSet fields in ui/font.mojo).
 comptime ATLAS_SIZES = (12, 14, 16, 18, 20, 22, 26, 32, 48, 56, 64, 81, 96)
 
@@ -506,6 +509,27 @@ struct UIContext:
     # Primitive: button
     # ------------------------------------------------------------------
 
+    def _label_screen_w(mut self, label: String, fsize: Int) -> Float64:
+        """Rendered label width in screen px at the ladder's native size."""
+        var atlas = self.font(fsize)
+        var label_mut = String(label)
+        return Float64(atlas[unsafe_offset=0].text_width(label_mut))
+
+    def fitted_button_w(
+        mut self, label: String, fsize: Int, w: Float64
+    ) -> Float64:
+        """Design-px width a button will occupy (grow to fit label + padding).
+
+        Public so call sites that place buttons right-to-left or in fixed
+        strides can reserve the grown width up front, keeping neighbors
+        from overlapping when button_at widens a rect.
+        """
+        var pad_screen = Float64(self.s(BUTTON_PAD_X))
+        var needed = (self._label_screen_w(label, fsize) + 2.0 * pad_screen) / Float64(
+            self.ui_scale
+        )
+        return max(w, needed)
+
     def button(
         mut self,
         label: String,
@@ -520,7 +544,14 @@ struct UIContext:
         If action is non-empty, the button also activates when its keybind
         combo is triggered (see UIContext.check_keybind).
         """
-        var design_w = Float64(self.cursor_w) / Float64(self.ui_scale)
+        var fsize = 22
+        if h >= 40.0:
+            fsize = 32
+        if h >= 80.0:
+            fsize = 56
+        var design_w = self.fitted_button_w(
+            label, fsize, Float64(self.cursor_w) / Float64(self.ui_scale)
+        )
         var r = self.rect(
             Float64(self.cursor_x) / Float64(self.ui_scale),
             Float64(self.cursor_y) / Float64(self.ui_scale),
@@ -545,11 +576,6 @@ struct UIContext:
             color,
         )
 
-        var fsize = 22
-        if h >= 40.0:
-            fsize = 32
-        if h >= 80.0:
-            fsize = 56
         self._draw_button_label(label, r, fsize, fg)
         self.advance(h + 10.0)
         return UIResult(hovered=hovered, clicked=clicked, bounds=r)
@@ -569,9 +595,15 @@ struct UIContext:
         If action is non-empty, the button also activates when its keybind
         combo is triggered.
         """
+        var fsize = 22
+        if h >= 42.0:
+            fsize = 42
+        if h >= 66.0:
+            fsize = 56
+        var fit_w = self.fitted_button_w(label, fsize, w)
         var design_x = Float64(self.cursor_x) / Float64(self.ui_scale)
         var design_y = Float64(self.cursor_y) / Float64(self.ui_scale)
-        var r = self.rect(design_x, design_y, w, h)
+        var r = self.rect(design_x, design_y, fit_w, h)
         var hovered = self._hit(r)
         var clicked = self._clicked(r)
         if action.byte_length() > 0 and self.check_keybind(action):
@@ -590,11 +622,6 @@ struct UIContext:
             color,
         )
 
-        var fsize = 22
-        if h >= 42.0:
-            fsize = 42
-        if h >= 66.0:
-            fsize = 56
         self._draw_button_label(label, r, fsize, fg)
         # Advance cursor by width (so next element goes to the right)
         self.cursor_x += r.width
@@ -618,7 +645,13 @@ struct UIContext:
         If action is non-empty, the button also activates when its keybind
         combo is triggered.
         """
-        var r = self.rect(x, y, w, h)
+        var fsize = 22
+        if h >= 48.0:
+            fsize = 26
+        if h >= 80.0:
+            fsize = 56
+        var fit_w = self.fitted_button_w(label, fsize, w)
+        var r = self.rect(x, y, fit_w, h)
         var hovered = self._hit(r)
         var clicked = self._clicked(r)
         if action.byte_length() > 0 and self.check_keybind(action):
@@ -637,11 +670,6 @@ struct UIContext:
             color,
         )
 
-        var fsize = 22
-        if h >= 48.0:
-            fsize = 48
-        if h >= 80.0:
-            fsize = 64
         self._draw_button_label(label, r, fsize, fg)
         return UIResult(hovered=hovered, clicked=clicked, bounds=r)
 

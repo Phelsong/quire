@@ -4,6 +4,10 @@ experimental plex audiobook app for the linux (wayland) desktop in Mojo
 
 * Note github is a push mirror
 
+# Structure
+resoures = comptime and pure structs
+
+
 ## Screenshots
 
 ![Library page](assets/library-page-alpha.png)
