@@ -88,10 +88,10 @@ struct Mutex[T: Copyable & Deinitable](Movable):
         _ = _mutex_init(self._mem)
         self._item = alloc[Self.T](Layout[Self.T](count=1)).unsafe_leak()
 
-    def init_with(mut self, item: Self.T):
+    def init_with(mut self, var item: Self.T):
         # T is Copyable for our use cases; explicit .copy() avoids the
         # move-then-abandoned-value problem with generic `item^` on 1.0.0.
-        self._item[unsafe_offset=0] = item.copy()
+        self._item[unsafe_offset=0] = item^
 
     def __moveinit__(mut self, existing: Self):
         self._mem = existing._mem

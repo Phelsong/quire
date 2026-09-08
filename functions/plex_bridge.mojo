@@ -37,7 +37,7 @@ from resources.config import (
     load_config,
     save_config,
     get_or_create_client_id,
-    LOG_LEVEL
+    LOG_LEVEL,
 )
 
 # ---------------------------------------------------------------------------
@@ -167,6 +167,8 @@ def plex_headers(
         "&videoCodec=*"
         "&subtitleCodec=*)"
     )
+
+    # var extra = "&X-Plex-Client-Profile-Extra=“add-transcode-target(type=musicProfile&context=streaming&protocol=http&audioCodec=aac,mp3)"
     if token.byte_length() > 0:
         headers["X-Plex-Token"] = token
     return headers^
@@ -186,7 +188,7 @@ def _http_get(
     which they immediately convert into native Mojo structs.
     """
     var httpx = Python.import_module("httpx")
-    
+
     var logger = Logger[LOG_LEVEL]()
     var resp = httpx.get(
         url,
@@ -197,7 +199,9 @@ def _http_get(
 
     var status_code = Int(py=resp.status_code)
     if status_code >= 400:
-        logger.warning("[plex_bridge] GET " + url + " -> " + String(status_code))
+        logger.warning(
+            "[plex_bridge] GET " + url + " -> " + String(status_code)
+        )
         logger.warning("[plex_bridge] Response: " + String(resp.text[0:500]))
 
     resp.raise_for_status()
@@ -1061,9 +1065,10 @@ def get_playback_decision(
     params["session"] = session_id
     params["hasMDE"] = "1"
     params["directPlay"] = "1"
-    params["directStream"] = "1"
-    params["musicBitrate"] = "320"
-    params["maxAudioBitrate"] = "320"
+    params["download"] = "0"
+    params["directStreamAudio"] = "1"
+    params["musicBitrate"] = "256"
+    params["peakBitrate"] = "256"
     var query = String()
     var first = True
     for entry in params.items():
@@ -1072,7 +1077,9 @@ def get_playback_decision(
         first = False
         query += entry.key + "=" + _percent_encode(entry.value)
 
-    var url = server_url + "/music/:/transcode/universal/decision?" + query
+    var url = (
+        server_url + "/audio/:/transcode/universal/decision?" + query + extra
+    )
 
     var data: PythonObject
     try:
