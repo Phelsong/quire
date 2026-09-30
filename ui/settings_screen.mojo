@@ -21,7 +21,7 @@ from functions.plex_bridge import PlexSession
 from ui.icons import ICON_BACK, ICON_LOGOUT
 
 from resources.color import Color
-from ui.imui import UIContext, UIResult, Vec2, Rect
+from render.imui import UIContext, UIResult, Vec2, Rect
 
 from resources.palette import (
     GREEN,
@@ -45,8 +45,6 @@ from resources.palette import (
 
 from ui import Screen
 
-# raylib keycodes needed for key capture + reverse-name lookup. Kept in
-# sync with resources/keys.mojo.
 from resources.keys import (
     GAMEPAD_BUTTON_LEFT_FACE_DOWN,
     GAMEPAD_BUTTON_LEFT_FACE_LEFT,
@@ -563,7 +561,9 @@ struct SettingsScreen:
             self.font_multiplier = 0.5
         if self.font_multiplier > 3.0:
             self.font_multiplier = 3.0
-        # Deep-copy keybinds so edits don't mutate the caller's dict.
+        # Copy the dict so edits don't mutate the caller's. List.copy() is
+        # shallow COW: the binding lists share storage until one side mutates
+        # (element replace writes through setitem, which rebinds — verified).
         self.keybinds = Dict[String, List[String]]()
         for entry in keybinds.items():
             self.keybinds[entry.key] = entry.value.copy()
@@ -571,36 +571,45 @@ struct SettingsScreen:
         self.status_message = ""
         self.status_color = TEXT_DIM
 
-    def _kb_binding_display(self, action: String) -> String:
-        """First keyboard binding for an action, or 'Unbound'."""
-        var bindings = self.keybinds.get(action, List[String]()).copy()
+    def _kb_binding_display(self, action: String) raises -> String:
+        """First keyboard binding for an action, or 'Unbound'.
+
+        The `in` guard makes the raising getitem unreachable; `raises` is
+        the borrow-checker's price for a zero-copy `ref` binding.
+        """
+        if action not in self.keybinds:
+            return "Unbound"
+        ref bindings = self.keybinds[action]
         for i in range(len(bindings)):
             var b = bindings[i]
             if b.byte_length() > 0 and not b.startswith("GAMEPAD"):
                 return _pretty_binding(b)
         return "Unbound"
 
-    def _gp_binding_display(self, action: String) -> String:
+    def _gp_binding_display(self, action: String) raises -> String:
         """First gamepad binding for an action, or 'Unbound'."""
-        var bindings = self.keybinds.get(action, List[String]()).copy()
+        if action not in self.keybinds:
+            return "Unbound"
+        ref bindings = self.keybinds[action]
         for i in range(len(bindings)):
             var b = bindings[i]
             if b.byte_length() > 0 and b.startswith("GAMEPAD"):
                 return _pretty_binding(b)
         return "Unbound"
 
-    def _set_kb_binding(mut self, action: String, key_spec: String):
+    def _set_kb_binding(mut self, action: String, key_spec: String) raises:
         """Replace the keyboard binding for an action.
 
         Preserves all gamepad bindings (entries starting with "GAMEPAD").
         The new keyboard spec is inserted at the front.
         """
         var preserved = List[String]()
-        var existing = self.keybinds.get(action, List[String]()).copy()
-        for i in range(len(existing)):
-            var b = existing[i]
-            if b.startswith("GAMEPAD"):
-                preserved.append(b)
+        if action in self.keybinds:
+            ref existing = self.keybinds[action]
+            for i in range(len(existing)):
+                var b = existing[i]
+                if b.startswith("GAMEPAD"):
+                    preserved.append(b)
         var new_list = List[String]()
         new_list.append(key_spec)
         for i in range(len(preserved)):
@@ -608,18 +617,19 @@ struct SettingsScreen:
         self.keybinds[action] = new_list^
         self.dirty = True
 
-    def _set_gp_binding(mut self, action: String, key_spec: String):
+    def _set_gp_binding(mut self, action: String, key_spec: String) raises:
         """Replace the gamepad binding for an action.
 
         Preserves all keyboard bindings (entries NOT starting with "GAMEPAD").
         The new gamepad spec is appended after the keyboard entries.
         """
         var preserved = List[String]()
-        var existing = self.keybinds.get(action, List[String]()).copy()
-        for i in range(len(existing)):
-            var b = existing[i]
-            if not b.startswith("GAMEPAD"):
-                preserved.append(b)
+        if action in self.keybinds:
+            ref existing = self.keybinds[action]
+            for i in range(len(existing)):
+                var b = existing[i]
+                if not b.startswith("GAMEPAD"):
+                    preserved.append(b)
         var new_list = List[String]()
         for i in range(len(preserved)):
             new_list.append(preserved[i])
@@ -633,7 +643,7 @@ struct SettingsScreen:
         self.status_message = ""
         self.status_color = TEXT_DIM
 
-    def _capture_key(mut self, mut ui: UIContext):
+    def _capture_key(mut self, mut ui: UIContext) raises:
         """Capture the next pressed key or gamepad button while rebinding.
 
         Gated on rebinding_is_gamepad: if True, only captures gamepad buttons
@@ -914,7 +924,7 @@ struct SettingsScreen:
         sw_design: Float64,
         sh_design: Float64,
         y: Float64,
-    ):
+    ) raises:
         """Scrollable list of keybind rows — keyboard + gamepad slots each."""
         # Section heading
         ui.move_to(20.0, y)

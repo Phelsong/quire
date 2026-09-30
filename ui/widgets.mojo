@@ -5,7 +5,9 @@
 # `font` params on draw() are the atlas for the caller's chosen design size.
 
 from ui.font import FontSet
-from ui.plex_objects import PlexBookCard
+from platform.text import TextAtlas
+from functions.helpers import truncate_string
+from functions.ascii import AsciiTable
 from resources.color import Color
 from resources.palette import (
     GREEN,
@@ -17,11 +19,9 @@ from resources.palette import (
     BULLET,
     CHECKMARK,
 )
-from functions.helpers import truncate_string
-from functions.ascii import AsciiTable
-from ui.imui import Vec2, Rect, UIContext
-from platform.text import TextAtlas
+from resources.plex_objects import PlexBookCard
 from render.canvas import Canvas
+from render.imui import Vec2, Rect, UIContext
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +112,6 @@ struct TextInput:
             self._refresh_display()
             self.cursor_blink_timer = 0.0
 
-    def handle_delete(mut self):
-        """Delete character at cursor (no-op for end-cursor)."""
-        pass
-
     def draw(
         mut self,
         mut ui: UIContext,
@@ -158,7 +154,7 @@ struct TextInput:
             draw_color = TEXT_DIM
 
         var atlas = ui.font(design_size)
-        var font_px = atlas[unsafe_offset=0].pixel_size
+        # var font_px = atlas[unsafe_offset=0].pixel_size
         var text_w = atlas[unsafe_offset=0].text_width(draw_text_str)
 
         # Text position: left-aligned with 12px padding, vertically centered
@@ -174,7 +170,7 @@ struct TextInput:
             + Float64(atlas[unsafe_offset=0].ascent)
         )
         canvas[unsafe_offset=0].draw_text(
-            atlas[unsafe_offset=0], draw_text_str, text_x, baseline, draw_color
+            atlas, draw_text_str, text_x, baseline, draw_color
         )
 
         # Blinking cursor when focused
@@ -264,8 +260,7 @@ struct Button:
 
         # Label centered in button
         var atlas = ui.font(design_size)
-        var label_mut = String(self.label)
-        var text_w = atlas[0].text_width(label_mut)
+        var text_w = atlas[0].text_width(self.label)
         var text_x = (
             Float64(self.bounds.x)
             + (Float64(self.bounds.width) - Float64(text_w)) / 2.0
@@ -278,7 +273,7 @@ struct Button:
         var fg = self.fg_color
         if self.is_disabled:
             fg = TEXT_DIM
-        canvas[0].draw_text(atlas[0], self.label, text_x, baseline, fg)
+        canvas[0].draw_text(atlas, self.label, text_x, baseline, fg)
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +336,7 @@ struct Checkbox:
 
             # Checkmark centered in box
             var atlas = ui.font(design_size)
-            var check_mut = String(CHECKMARK)
-            var check_w = atlas[0].text_width(check_mut)
+            var check_w = atlas[0].text_width(CHECKMARK)
             var cx = (
                 Float64(self.bounds.x)
                 + (Float64(self.bounds.width) - Float64(check_w)) / 2.0
@@ -353,8 +347,4 @@ struct Checkbox:
             var baseline = (
                 Float64(self.bounds.y) + mid + Float64(atlas[0].ascent)
             )
-            canvas[0].draw_text(atlas[0], CHECKMARK, cx, baseline, ACCENT_DARK)
-
-
-# ---------------------------------------------------------------------------
-# Book widget — PlexBookCard is defined in ui/plex_objects.mojo
+            canvas[0].draw_text(atlas, CHECKMARK, cx, baseline, ACCENT_DARK)

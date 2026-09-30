@@ -1,9 +1,8 @@
 from std.os import makedirs, path
 from std.pathlib import Path
-from std.python import Python, PythonObject
 from std.collections import List, Dict, Optional
 from std.memory.unsafe_pointer import Pointer
-from std.memory import alloc, dealloc, Layout, ThinAllocation
+from std.memory import alloc, dealloc, Layout, ThinAllocation, unsafe_memcpy
 from std.math import min
 from resources.color import Color
 from resources.imdecode import imdecode
@@ -14,14 +13,14 @@ from resources.keys import (
     KEY_DELETE,
     KEY_ESCAPE,
 )
-from ui.imui import UIContext, UIResult, Vec2, Rect
+from render.imui import UIContext, UIResult, Vec2, Rect
 
 from functions.helpers import (
     format_time,
     truncate_string,
 )
 from functions.audio_pipe import AudioPipe, ChunkResult, HttpHeader
-from functions.audio_backend import AudioBackend
+from platform.audio_backend import AudioBackend
 from functions.plex_bridge import (
     PlexSession,
     get_book_detail,
@@ -34,6 +33,7 @@ from functions.plex_bridge import (
     get_thumbnail_url,
     report_progress,
     mark_watched,
+    mark_unwatched,
     fetch_thumbnail,
     load_cached_cover,
     save_cached_cover,
@@ -71,12 +71,17 @@ from resources.palette import (
     BULLET,
     CHECKMARK,
 )
+from resources.plex_objects import (
+    PlexTrack,
+    PlexChapter,
+    LibraryItem,
+    ServerItem,
+)
+from render.imui import UIContext, UIResult
 
 from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
 from ui.font import FontSet
-from ui.imui import UIContext, UIResult
 from ui import Screen
-from ui.plex_objects import PlexTrack, PlexChapter, LibraryItem, ServerItem
 from ui.icons import ICON_PLAY, ICON_PAUSE
 
 # ---------------------------------------------------------------------------
@@ -84,8 +89,7 @@ from ui.icons import ICON_PLAY, ICON_PAUSE
 #
 # The IMUI refactor fixes the critical draw/click layout mismatch bug:
 # layout now happens once in draw() and clicks are checked against the same
-# rectangles returned by UI elements. No more duplicated constants with
-# different values between draw() and handle_mouse_click().
+# rectangles returned by UI elements.
 # ---------------------------------------------------------------------------
 
 
@@ -199,7 +203,7 @@ struct PlayerScreen:
         self.play_queue_id = 0
         self.play_queue_items = Dict[String, Int]()
         self.progress_sync_timer = 0.0
-        self.progress_sync_interval = 15.0
+        self.progress_sync_interval = 5.0
         self.current_track_rating_key = ""
         self.server_url = ""
         self.token = ""
@@ -310,9 +314,11 @@ struct PlayerScreen:
             app_state.client_id,
         )
 
-        for i in range(len(tracks)):
-            self.tracks.append(tracks[i].copy())
+        # COW transfer: shares track storage with the API result until one
+        # side mutates — no per-track copy loop.
+        self.tracks = tracks.copy()
 
+        for i in range(len(tracks)):
             var track_chapters = get_track_chapters(
                 app_state.server_url,
                 token,
@@ -321,7 +327,7 @@ struct PlayerScreen:
             )
 
             for j in range(len(track_chapters)):
-                var chapter = track_chapters[j].copy()
+                var chapter = track_chapters[j]
                 chapter.is_current = False
                 self.chapters.append(chapter)
 
@@ -347,6 +353,10 @@ struct PlayerScreen:
         #      unwatched track (sum of durations of all viewed tracks).
         #   3. Otherwise leave current_time at 0 (fresh start).
         if len(self.tracks) > 0:
+            var total_ms = 0
+            for i in range(len(self.tracks)):
+                total_ms += self.tracks[i].duration_ms
+
             var cumulative_ms = 0
             var found_progress = False
             for i in range(len(self.tracks)):
@@ -373,7 +383,14 @@ struct PlayerScreen:
                 var resume_ms = 0
                 for i in range(viewed):
                     resume_ms += self.tracks[i].duration_ms
-                self.current_time = Float64(resume_ms) / 1000.0
+                # A fully-viewed book restarts from the beginning. Resuming
+                # at "sum of all durations" would spawn ffmpeg past EOF,
+                # which produces no audio and lands on the end-of-stream
+                # path — the start-at-the-end bug.
+                if viewed < len(self.tracks) and resume_ms < total_ms:
+                    self.current_time = Float64(resume_ms) / 1000.0
+                else:
+                    self.current_time = 0.0
             elif not found_progress and detail.view_offset_ms > 0:
                 # Album-level offset only (single-track or edge case).
                 self.current_time = Float64(detail.view_offset_ms) / 1000.0
@@ -448,12 +465,14 @@ struct PlayerScreen:
 
         # 2) Use the Plex playback decision stream URL (HTTP). ffmpeg reads
         #    HTTP directly — no download needed for the streaming path.
-        if len(self.tracks) > 0 and self.tracks[0].file_key.byte_length() > 0:
+        if len(self.tracks) > 0 and self.tracks[0].rating_key.byte_length() > 0:
             try:
+                # Decision endpoint resolves by METADATA path (/library/metadata/N);
+                # part paths (/library/parts/...) are rejected with 400 by PMS.
                 var decision = get_playback_decision(
                     self.server_url,
                     self.token,
-                    self.tracks[0].file_key,
+                    "/library/metadata/" + self.tracks[0].rating_key,
                     "quire-" + self.client_id,
                     self.client_id,
                 )
@@ -638,19 +657,28 @@ struct PlayerScreen:
             self.cover_loaded = True
             return
 
-        var decoded = imdecode(image_data)
+        # Move the fetch temp into the decoder (ownership transfer).
+        var decoded = imdecode(image_data^)
         self.cover_w = decoded.width
         self.cover_h = decoded.height
 
-        # Copy RGBA pixels into the layout-allocated pixel buffer the
-        # Canvas rasterizer blits directly.
+        # Bulk-copy RGBA pixels into the layout-allocated pixel buffer the
+        # Canvas rasterizer blits directly (one memcpy, not n byte stores).
         var n = self.cover_w * self.cover_h * 4
         var layout = Layout[UInt8](count=n)
-        self.cover_pixels = Optional[Pointer[UInt8, MutUntrackedOrigin]](
-            alloc(layout).unsafe_leak()
+        var dst = alloc(layout).unsafe_leak()
+        unsafe_memcpy(
+            dest=Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(dst)
+            ),
+            src=Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(decoded.pixels.unsafe_ptr())
+            ),
+            count=n,
         )
-        for i in range(n):
-            self.cover_pixels.value()[unsafe_offset=i] = decoded.pixels[i]
+        self.cover_pixels = Optional[Pointer[UInt8, MutUntrackedOrigin]](
+            Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(dst))
+        )
 
         self.has_cover = True
 
@@ -659,7 +687,7 @@ struct PlayerScreen:
     def stop_and_unload_stream(mut self):
         """Stop the backend stream, terminate ffmpeg, and unload cover art."""
         self.is_playing = False
-        self._sync_progress()
+        self._sync_progress(force=True)
 
         self._stop_stream()
 
@@ -672,31 +700,6 @@ struct PlayerScreen:
             )
             self.has_cover = False
         self.cover_loaded = False
-
-    def handle_mouse_click(
-        mut self, mouse_pos: Vec2, mut screen: Screen
-    ) raises:
-        # IMUI handles clicks inside draw() — no-op for main-loop contract.
-        pass
-
-    def handle_mouse_drag(mut self, mouse_pos: Vec2):
-        """Handle progress bar and volume slider dragging.
-
-        Drag state is retained here (progress_dragging/volume_dragging).
-        The actual slider geometry is recomputed in draw() via IMUI, so
-        we must mirror the same design-pixel layout to compute new values.
-        """
-        # Layout constants (design px — must match draw())
-        var right_col_x = 500.0
-        var right_col_w = 200.0  # placeholder; actual width depends on screen
-
-        # We need the screen width to compute right_col_w. Since handle_mouse_drag
-        # is called from main.mojo without screen dims, we read from the music
-        # stream's stored screen size... but we removed screen_w/screen_h fields.
-        # Instead, we handle drag inside draw() where we have the UIContext.
-        # This method is kept as a no-op; drag is processed in draw() via
-        # ui.mouse_down + slider hover detection.
-        pass
 
     def handle_scroll(mut self, wheel_delta: Float32):
         """Scroll the chapter list (design-pixel space)."""
@@ -818,17 +821,23 @@ struct PlayerScreen:
                     self.audio_backend.pause()
                 except:
                     pass
-        self._sync_progress()
+        # A play/pause press is a deliberate state change — flush the
+        # position now instead of waiting out the 15s timer.
+        self._sync_progress(force=True)
 
-    def _sync_progress(mut self):
-        """Report playback progress to the Plex server (best-effort)."""
+    def _sync_progress(mut self, force: Bool = False):
+        """Report playback progress to the Plex server (best-effort).
+
+        force=True bypasses the 15s timer — used when the player is being
+        torn down (screen exit), so the final position always lands."""
         if self.server_url.byte_length() == 0 or self.token.byte_length() == 0:
             return
         if self.current_track_rating_key.byte_length() == 0:
             return
-        if self.progress_sync_timer < self.progress_sync_interval:
+        if not force and self.progress_sync_timer < self.progress_sync_interval:
             return
 
+        var pushed = False
         try:
             # Compute offset relative to the current track, not the whole book.
             # Plex expects `time` as the position within the specific track
@@ -857,7 +866,7 @@ struct PlayerScreen:
 
             var track_key = "/library/metadata/" + self.current_track_rating_key
 
-            _ = report_progress(
+            pushed = report_progress(
                 self.server_url,
                 self.token,
                 self.current_track_rating_key,
@@ -871,7 +880,10 @@ struct PlayerScreen:
         except:
             pass
 
-        self.progress_sync_timer = 0.0
+        # Only reset the timer on success — a failed push (server hiccup)
+        # retries next frame instead of going dark for another 15s.
+        if pushed:
+            self.progress_sync_timer = 0.0
 
     def _mark_track_watched(mut self):
         """Mark the current track as watched on the Plex server (best-effort).
@@ -890,6 +902,89 @@ struct PlayerScreen:
             )
         except:
             pass
+
+    def reset_progress(mut self) raises:
+        """Reset the whole book's progress and push it to Plex.
+
+        Unscrobbles every track (clears the watched flags) and reports a
+        zero position on the current track, so the album-level progress
+        (viewOffset/viewedLeafCount) returns to Not Started. Local state
+        rewinds to 0:00 — but playback is NOT started here; the caller
+        decides whether to resume playing.
+        """
+        if self.server_url.byte_length() == 0 or self.token.byte_length() == 0:
+            return
+
+        # Stop feeding audio first — a live ffmpeg stream would keep
+        # advancing current_time and the next _sync_progress would push
+        # the old position right back.
+        var was_playing = self.is_playing
+        self.is_playing = False
+        if self.has_stream:
+            try:
+                self.audio_backend.pause()
+            except:
+                pass
+
+        # 1) Clear watched on every track (unscrobble is idempotent — a
+        #    track that was never watched just no-ops).
+        for i in range(len(self.tracks)):
+            try:
+                _ = mark_unwatched(
+                    self.server_url,
+                    self.token,
+                    self.tracks[i].rating_key,
+                    self.client_id,
+                )
+            except:
+                pass
+
+        # 2) Zero the position on the current track so the album-level
+        #    viewOffset clears too.
+        if self.current_track_rating_key.byte_length() > 0:
+            var track_idx = self._find_current_track_index()
+            var track_duration_ms = Int(self.duration * 1000.0)
+            if track_idx >= 0 and track_idx < len(self.tracks):
+                track_duration_ms = self.tracks[track_idx].duration_ms
+            var track_key = "/library/metadata/" + self.current_track_rating_key
+            var pq_item_id = self.play_queue_items.get(
+                self.current_track_rating_key, 0
+            )
+            try:
+                _ = report_progress(
+                    self.server_url,
+                    self.token,
+                    self.current_track_rating_key,
+                    track_key,
+                    0,  # time: back to the start
+                    track_duration_ms,
+                    "stopped",
+                    pq_item_id,
+                    self.client_id,
+                )
+            except:
+                pass
+
+        # 3) Rewind local state.
+        self.current_time = 0.0
+        self.frames_fed_since_restart = 0
+        self.progress_sync_timer = 0.0
+        self._update_current_chapter()
+
+        # Rewind the local mirror of track progress so a same-session
+        # re-open of this book resumes from 0 without a server round-trip.
+        for i in range(len(self.tracks)):
+            self.tracks[i].view_offset_ms = 0
+
+        # If the user was listening, restart the stream at 0:00.
+        if was_playing and self.has_stream:
+            var ok = self._restart_stream_at(0.0)
+            if ok:
+                try:
+                    self.audio_backend.play()
+                    self.is_playing = True
+                except:
+                    pass
 
     def _previous_chapter(mut self):
         """Go to the previous chapter, or restart current if >3s in."""
@@ -1014,24 +1109,20 @@ struct PlayerScreen:
         # room for another chunk. When needs_data() returns False, the writer
         # thread still has a chunk's worth of PCM queued.
         if self.audio_backend.needs_data():
-            # Pull one chunk of PCM from the native pipe. read_chunk() returns
-            # a ChunkResult (address, frame_count); address is the C address
-            # of the pipe's persistent heap buffer.
-            var chunk = ChunkResult(0, 0)
+            # Pull one chunk of PCM from the native pipe. read_chunk()
+            # returns typed f32 samples + frame count; has_data() gates use
+            # (AudioPipe owns the memory).
+            var chunk = ChunkResult()
             try:
                 chunk = self.pipe.read_chunk()
             except:
-                chunk = ChunkResult(0, 0)
+                chunk = ChunkResult()
 
-            if chunk.address != 0 and chunk.frame_count > 0:
-                # Construct a void pointer from the buffer address and copy
-                # it into the backend ring — zero-copy until the ring
-                # (AudioPipe owns the memory).
-                var pcm_ptr = Pointer[NoneType, MutUntrackedOrigin](
-                    unsafe_from_address=chunk.address
-                )
+            if chunk.has_data():
                 try:
-                    self.audio_backend.write_pcm(pcm_ptr, chunk.frame_count)
+                    self.audio_backend.write_pcm(
+                        chunk.samples, chunk.frame_count
+                    )
                 except:
                     pass
                 # Advance normalized time by the frames actually fed. This is
@@ -1051,9 +1142,23 @@ struct PlayerScreen:
         except:
             reached_end = False
         if reached_end and not self.progress_dragging:
-            self.is_playing = False
-            self.current_time = self.duration
-            self._mark_track_watched()
+            if self.frames_fed_since_restart > 0:
+                # Real end of audio: snap to the book's end and mark watched.
+                self.is_playing = False
+                self.current_time = self.duration
+                self._mark_track_watched()
+            else:
+                # ffmpeg exited without producing ANY audio (seek past EOF,
+                # dead URL, bad container). Treating that as "finished" is
+                # how a book got permanently stuck at the end. Fail loud:
+                # keep the position, stop, and surface the error.
+                self.is_playing = False
+                self.has_stream = False
+                print(
+                    "[player] stream ended with no audio at "
+                    + String(self.current_time)
+                    + "s — source likely bad; not marking watched"
+                )
 
         self._update_current_chapter()
 
@@ -1339,7 +1444,9 @@ struct PlayerScreen:
             chap_remaining = 0.0
         var chap_rem_str = "-" + format_time(chap_remaining)
         var chap_rem_meas = ui._measure_text(chap_rem_str, 12)
-        var chap_rem_x = player_x + player_w - ui.text_w_design(chap_rem_meas.x + 20)
+        var chap_rem_x = (
+            player_x + player_w - ui.text_w_design(chap_rem_meas.x + 20)
+        )
         ui.move_to(chap_rem_x, chap_time_y)
         ui.label(chap_rem_str, 18, TEXT_DIM)
 
@@ -1363,7 +1470,7 @@ struct PlayerScreen:
         var ctrl_btn_h = 120.0
         var ctrl_gap = 80.0
         var total_btns = 5
-        var total_gap_w = Float64(total_btns-1) * ctrl_gap
+        var total_gap_w = Float64(total_btns - 1) * ctrl_gap
         var ctrl_btn_w = (player_w - total_gap_w) / Float64(total_btns)
 
         # Prev chapter
@@ -1490,7 +1597,9 @@ struct PlayerScreen:
         ui.move_to(speed_lbl_x, vol_y + 8.0)
         ui.label(speed_lbl, 18, TEXT_BRIGHT)
 
-        var speed_plus_x = player_x + speed_btn_w_minus + 10.0 + speed_lbl_slot + 10.0
+        var speed_plus_x = (
+            player_x + speed_btn_w_minus + 10.0 + speed_lbl_slot + 10.0
+        )
         var speed_btn_w_plus = ui.fitted_button_w("+", 22, speed_btn_w)
         var speed_plus_result = ui.button_at(
             "+",
@@ -1542,6 +1651,26 @@ struct PlayerScreen:
         var vol_pct_str = String(vol_pct) + "%"
         ui.move_to(vol_slider_x + vol_slider_w + 8.0, vol_y + 6.0)
         ui.label(vol_pct_str, 20, TEXT_DIM)
+
+        # Reset progress: unscrobbles every track + zeroes the position
+        # on Plex, then rewinds locally. Destructive to server state, so
+        # it sits at the row's far edge with a red tint.
+        # var reset_btn_w = 72.0
+        # var reset_fit_w = ui.fitted_button_w("RESET", 20, reset_btn_w)
+        # var reset_x = player_x + player_w - reset_fit_w
+        # var reset_result = ui.button_at(
+        #     "RESET",
+        #     reset_x,
+        #     vol_y,
+        #     reset_btn_w,
+        #     52.0,
+        #     Color(150, 60, 60, 255),
+        #     TEXT_LIGHT,
+        #     Color(190, 84, 84, 255),
+        #     action="reset_progress",
+        # )
+        # if reset_result.clicked:
+        #     self.reset_progress()
 
         # --- Chapter list (scrollable) ---
         if len(self.chapters) > 0:

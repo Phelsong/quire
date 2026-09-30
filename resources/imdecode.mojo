@@ -399,20 +399,20 @@ def _fixed_tables() raises -> Tuple[Huffman, Huffman]:
     # Literal/length: 0-143 => 8, 144-255 => 9, 256-279 => 7, 280-287 => 8.
     var lengths = List[UInt8]()
     lengths.reserve(288)
-    for i in range(144):
+    for _ in range(144):
         lengths.append(8)
-    for i in range(256 - 144):
+    for _ in range(256 - 144):
         lengths.append(9)
-    for i in range(280 - 256):
+    for _ in range(280 - 256):
         lengths.append(7)
-    for i in range(288 - 280):
+    for _ in range(288 - 280):
         lengths.append(8)
     var lit = Huffman.build(lengths^)
 
     # Fixed distance table: 32 codes of 5 bits.
     var dist_lengths = List[UInt8]()
     dist_lengths.reserve(30)
-    for i in range(30):
+    for _ in range(30):
         dist_lengths.append(5)
     var dist = Huffman.build(dist_lengths^)
     return (lit^, dist^)
@@ -475,6 +475,12 @@ def _dynamic_tables(mut br: LsbBitReader) raises -> Tuple[Huffman, Huffman]:
 def _inflate_blocks(mut br: LsbBitReader) raises -> List[UInt8]:
     var out = List[UInt8]()
     var final = False
+    # Fixed Huffman tables are constant — build once for ALL btype==1
+    # blocks, not per block (the tables are pure functions of the RFC 1951
+    # code-length spec).
+    var fixed_lit_dist = _fixed_tables()
+    var fixed_lit = fixed_lit_dist[0].copy()
+    var fixed_dist = fixed_lit_dist[1].copy()
     while not final:
         final = br.get_bits(1) == 1
         var btype = br.get_bits(2)
@@ -502,10 +508,7 @@ def _inflate_blocks(mut br: LsbBitReader) raises -> List[UInt8]:
             br.bit_buf = 0
             br.bit_cnt = 0
         elif btype == 1:
-            var lit_dist = _fixed_tables()
-            var lit_t = lit_dist[0].copy()
-            var dist_t = lit_dist[1].copy()
-            _inflate_block_huffman(br, lit_t, dist_t, out)
+            _inflate_block_huffman(br, fixed_lit, fixed_dist, out)
         elif btype == 2:
             var lit_dist = _dynamic_tables(br)
             var lit_t = lit_dist[0].copy()
@@ -861,15 +864,17 @@ def imdecode_png(data: List[UInt8]) raises -> DecodedImage:
 # =====================================================
 
 
-def imdecode(data: List[UInt8]) raises -> DecodedImage:
+def imdecode(var data: List[UInt8]) raises -> DecodedImage:
     """Detect the image format and decode to RGBA pixels.
 
-    Dispatches on magic bytes: PNG signature or JPEG SOI marker.
+    Dispatches on magic bytes: PNG signature or JPEG SOI marker. Consumes
+    `data` (callers move a freshly-owned buffer with `^`); the format
+    decoders receive it by move, not by copy.
     """
     if len(data) >= 8 and Int(data[0]) == 0x89 and Int(data[1]) == 0x50:
-        return imdecode_png(data.copy())
+        return imdecode_png(data^)
     if len(data) >= 2 and Int(data[0]) == 0xFF and Int(data[1]) == 0xD8:
-        return imdecode_jpeg(data.copy())
+        return imdecode_jpeg(data^)
     raise "imdecode: unsupported format (need PNG or JPEG)"
 
 
@@ -1055,7 +1060,11 @@ def _jpeg_decode_block(
     dc_pred: Int,
 ) raises -> Tuple[List[Int], Int]:
     """Decode one 8x8 block: Huffman → coefficients → dequantize. Returns
-    the block and stores nothing; DC prediction update is caller's job."""
+    the block and stores nothing; DC prediction update is caller's job.
+
+    `dc`/`ac`/`quant` arrive as per-component owned copies (caller hoisted
+    them out of the 8×8 block loop) — the decode takes them by value.
+    """
     var mut_dc = dc.copy()
     var mut_ac = ac.copy()
     var block = List[Int]()
@@ -1319,11 +1328,15 @@ def imdecode_jpeg(data: List[UInt8]) raises -> DecodedImage:
         var mcu_y = mcu_index // mcus_x
         for comp_idx in range(len(comps)):
             var c = comps[comp_idx].copy()
+            # Per-component tables, hoisted out of the 8×8 block loop (the
+            # copies are per MCU row component, not per block).
+            var quant_t = quant[c.quant_table].copy()
+            var dc_t = dc_tables[dc_ids[comp_idx]].copy()
+            var ac_t = ac_tables[ac_ids[comp_idx]].copy()
+            var plane = planes[comp_idx].copy()
+            var plane_stride = plane_strides[comp_idx]
             for by in range(c.v_sampling):
                 for bx in range(c.h_sampling):
-                    var quant_t = quant[c.quant_table].copy()
-                    var dc_t = dc_tables[dc_ids[comp_idx]].copy()
-                    var ac_t = ac_tables[ac_ids[comp_idx]].copy()
                     var decoded = _jpeg_decode_block(
                         br, dc_t, ac_t, quant_t, dc_preds[comp_idx]
                     )
@@ -1331,8 +1344,6 @@ def imdecode_jpeg(data: List[UInt8]) raises -> DecodedImage:
                     dc_preds[comp_idx] = decoded[1]
                     var pixels = _idct_2d(block)
                     # Blit the level-shifted block into the component plane.
-                    var plane = planes[comp_idx].copy()
-                    var plane_stride = plane_strides[comp_idx]
                     var origin_x = (mcu_x * c.h_sampling + bx) * 8
                     var origin_y = (mcu_y * c.v_sampling + by) * 8
                     for py in range(8):
@@ -1341,7 +1352,7 @@ def imdecode_jpeg(data: List[UInt8]) raises -> DecodedImage:
                             plane[row + px] = Int(
                                 _clamp8(pixels[py * 8 + px] + 128)
                             )
-                    planes[comp_idx] = plane^
+            planes[comp_idx] = plane^
         mcu_index += 1
 
     return _jpeg_planes_to_rgba(

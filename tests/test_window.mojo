@@ -3,7 +3,7 @@
 #   -> create surface -> xdg surface -> toplevel -> wait configure -> ack
 #   -> memfd + wl_shm pool -> ARGB8888 gradient buffer -> attach/damage/commit
 #   -> dispatch loop (answers xdg ping) until closed by compositor.
-from std.ffi import external_call, CStringSlice
+from std.ffi import external_call, CStringSpan
 
 from platform.ffi import heap_malloc as _malloc
 
@@ -95,9 +95,9 @@ comptime POOL_SIZE = STRIDE * HEIGHT
 
 def str_to_cptr(s: String) -> Pointer[Int8, MutAnyOrigin]:
     """NUL-terminated heap copy of a Mojo String (leaked — test lifetime)."""
-    # copy into a mutable local so as_c_string_slice is usable
+    # copy into a mutable local so as_c_string_span is usable
     var tmp: String = s
-    var cs = tmp.as_c_string_slice()
+    var cs = tmp.as_c_string_span()
     var n = len(cs)
     var buf = Pointer[Int8, MutAnyOrigin](
         unsafe_from_address=Int(_malloc(Int(n) + 1))
@@ -118,7 +118,7 @@ def arg_as_string(a: WLArgument) -> String:
     for i in range(8):
         addr = addr | (Int(a.raw[i]) << (8 * i))
     var ptr = Pointer[Int8, MutAnyOrigin](unsafe_from_address=addr)
-    return String(CStringSlice(unsafe_from_ptr=ptr))
+    return String(CStringSpan(unsafe_from_ptr=ptr))
 
 
 def arg_as_cptr(a: WLArgument) -> Pointer[Byte, MutAnyOrigin]:

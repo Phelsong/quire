@@ -1,16 +1,8 @@
 from resources.color import Color
 from std.collections import Dict, Optional
-from std.memory import alloc, Layout
+from std.memory import alloc, Layout, unsafe_memcpy
 from std.memory.unsafe_pointer import Pointer
-from resources.imdecode import imdecode
-from resources.keys import (
-    KEY_BACKSPACE,
-    KEY_TAB,
-    KEY_ENTER,
-    KEY_DELETE,
-    KEY_ESCAPE,
-)
-from ui.imui import UIContext, UIResult, Vec2, Rect
+
 from functions.helpers import (
     format_time,
     truncate_string,
@@ -32,15 +24,15 @@ from functions.plex_bridge import (
     report_progress,
     mark_watched,
 )
-
-from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
-from ui.font import FontSet
-from ui import Screen
-from ui.plex_objects import PlexTrack, PlexChapter, LibraryItem, ServerItem
-from ui.icons import ICON_PLAY, ICON_PAUSE, ICON_SETTINGS
-from ui.player_screen import PlayerScreen
-
-
+from render.imui import UIContext, UIResult, Vec2, Rect
+from resources.imdecode import imdecode
+from resources.keys import (
+    KEY_BACKSPACE,
+    KEY_TAB,
+    KEY_ENTER,
+    KEY_DELETE,
+    KEY_ESCAPE,
+)
 from resources.palette import (
     WHITE,
     LOGIN_BG,
@@ -73,6 +65,18 @@ from resources.palette import (
     BULLET,
     CHECKMARK,
 )
+from resources.plex_objects import (
+    PlexTrack,
+    PlexChapter,
+    LibraryItem,
+    ServerItem,
+)
+from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
+from ui.font import FontSet
+from ui import Screen
+from ui.icons import ICON_PLAY, ICON_PAUSE, ICON_SETTINGS
+from ui.player_screen import PlayerScreen
+
 
 # ---------------------------------------------------------------------------
 # Library screen — browse audiobooks (immediate-mode UI)
@@ -209,9 +213,10 @@ struct LibraryScreen:
                 )
                 self.status_color = ERROR_COLOR
             else:
-                self.books = List[PlexBookCard]()
-                for i in range(len(result.items)):
-                    self.books.append(result.items[i].copy())
+                # COW transfer: List.copy() is shallow copy-on-write, so the
+                # 25 cards share storage with result.items until either side
+                # mutates — no per-card copy loop.
+                self.books = result.items.copy()
 
                 self.total_size = result.total_size
                 self.library_name = app_state.library_name
@@ -281,9 +286,7 @@ struct LibraryScreen:
                 self.status_message = "Search failed (server error)"
                 self.status_color = ERROR_COLOR
                 return
-            self.books = List[PlexBookCard]()
-            for i in range(len(result.items)):
-                self.books.append(result.items[i].copy())
+            self.books = result.items.copy()
             self.active_search = query
             self.status_message = (
                 'Search "'
@@ -301,34 +304,34 @@ struct LibraryScreen:
         # New book list: drop stale cover queue (same as load_data).
         self.cover_queue = List[String]()
 
-    def handle_mouse_click(
-        mut self,
-        mouse_pos: Vec2,
-        mut app_state: PlexSession,
-        mut screen: Screen,
-        screen_w: Int,
-        screen_h: Int,
-    ) raises:
-        # IMUI handles clicks inside draw() — no-op for main-loop contract.
-        pass
-
     def _decode_cover(
-        mut self, rating_key: String, image_data: List[UInt8]
+        mut self, rating_key: String, var image_data: List[UInt8]
     ) raises:
-        """Decode thumbnail bytes and cache the RGBA pixels for blitting."""
+        """Decode thumbnail bytes and cache the RGBA pixels for blitting.
+
+        Consumes `image_data` (the caller moves its fetch temp with `^` —
+        the compressed buffer is never duplicated).
+        """
         if image_data.byte_length() == 0:
             return
 
-        var decoded = imdecode(image_data)
+        var decoded = imdecode(image_data^)
         var n = decoded.width * decoded.height * 4
         var layout = Layout[UInt8](count=n)
+        var dst = alloc(layout).unsafe_leak()
+        # Bulk-copy the decoded RGBA buffer (one memcpy, not n byte stores).
+        unsafe_memcpy(
+            dest=Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(dst)
+            ),
+            src=Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(decoded.pixels.unsafe_ptr())
+            ),
+            count=n,
+        )
         self.cover_pixels[rating_key] = Optional[
             Pointer[UInt8, MutUntrackedOrigin]
-        ](alloc(layout).unsafe_leak())
-        for i in range(n):
-            self.cover_pixels[rating_key].value()[
-                unsafe_offset=i
-            ] = decoded.pixels[i]
+        ](Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(dst)))
         self.cover_sizes[rating_key] = decoded.width * 1000000 + decoded.height
 
     def _fetch_next_cover(mut self, app_state: PlexSession) raises:
@@ -379,7 +382,10 @@ struct LibraryScreen:
             image_data = fetch_thumbnail(thumb_url)
             save_cached_cover(rating_key, 160, 160, image_data)
 
-        self._decode_cover(rating_key, image_data)
+        # Move the fetch temp into the decoder — the compressed buffer is
+        # never copied (imdecode takes ownership and the format decoders
+        # consume it by move).
+        self._decode_cover(rating_key, image_data^)
 
     def handle_keyboard(mut self, mut ui: UIContext, ascii: AsciiTable):
         """Route keyboard input to the search bar when it has focus.
@@ -398,8 +404,8 @@ struct LibraryScreen:
 
         if ui.key_pressed(KEY_BACKSPACE):
             self.search_input.handle_backspace()
-        elif ui.key_pressed(KEY_DELETE):
-            self.search_input.handle_delete()
+        # elif ui.key_pressed(KEY_DELETE):
+        # self.search_input.handle_delete()
 
     def handle_scroll(mut self, wheel_delta: Float32, screen_h: Int):
         """Handle mouse wheel scrolling."""

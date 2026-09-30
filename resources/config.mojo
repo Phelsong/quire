@@ -7,16 +7,23 @@ get_or_create_client_id from here.
 
 from std.os import makedirs, path
 from std.pathlib import Path
-from std.io.file import open
 from std.logger import Logger, Level
-from std.python import Python
+from std.random import random_ui64, seed
+from std.time import perf_counter_ns
 
-from emberjson import try_deserialize, serialize
+from emberjson import try_from_json, to_json
+from emberserde.serialize import serialize
+from emberserde.deserialize import (
+    deserialize,
+    Deserializer,
+    SelfDescribingDeserializer,
+)
 
 
 comptime _CONFIG_FILE = "~/.config/quire/config.json"
 
 comptime LOG_LEVEL = Level(Int(30))
+
 
 struct Config(Copyable, Defaultable, Deinitable, Movable, Writable):
     var client_identifier: String
@@ -110,6 +117,41 @@ def _ensure_config_dir() raises:
     )
 
 
+def _hex_digit(v: Int) -> String:
+    """One lowercase hex digit (0..15)."""
+    var digits = "0123456789abcdef"
+    return String(digits[byte=v])
+
+
+def uuid4() -> String:
+    """Basic UUIDv4,
+    The client identifier needs uniqueness, not crypto strength.
+    Sets version 4 and the RFC-4122 variant, format 8-4-4-4-12.
+    """
+    seed(perf_counter_ns())
+    var lo = random_ui64(0, UInt64.MAX)
+    var hi = random_ui64(0, UInt64.MAX)
+    # 16 bytes, big-endian: bytes[6] version nibble, bytes[8] variant bits.
+    var bytes = List[UInt8]()
+    bytes.reserve(16)
+    var i = 15
+    while i >= 8:
+        bytes.append(UInt8((hi >> UInt64(8 * (i - 8))) & UInt64(0xFF)))
+        i -= 1
+    while i >= 0:
+        bytes.append(UInt8((lo >> UInt64(8 * i)) & UInt64(0xFF)))
+        i -= 1
+    bytes[6] = (bytes[6] & 0x0F) | 0x40
+    bytes[8] = (bytes[8] & 0x3F) | 0x80
+    var out = String()
+    for i in range(16):
+        if i == 4 or i == 6 or i == 8 or i == 10:
+            out += "-"
+        out += _hex_digit(Int(bytes[i]) >> 4)
+        out += _hex_digit(Int(bytes[i]) & 0xF)
+    return out
+
+
 def get_or_create_client_id() raises -> String:
     """Return a persistent UUID for X-Plex-Client-Identifier.
 
@@ -119,20 +161,22 @@ def get_or_create_client_id() raises -> String:
     if config.client_identifier.byte_length() == 36:
         return config.client_identifier
 
-    # UUIDv4 via Python's uuid module ( Mojo uuid conda package ships a
-    # stale 1.0.0b1 mojopkg — unusable under 1.0.0).
-    var uuid_mod = Python.import_module("uuid")
-    config.client_identifier = String(uuid_mod.uuid4().__str__())
+    config.client_identifier = uuid4()
     save_config(config)
     return config.client_identifier
 
 
 def save_config(config: Config) raises:
-    """Save config struct to config file."""
+    """Save config struct to config file.
+
+    Writes via native Path.write_bytes() — no Python file object (the
+    config is a few KB; the `with open` round-trip cost a file-object
+    dance on every save, and saves happen on every settings change).
+    """
     _ensure_config_dir()
     var config_path = Path(path.expanduser(_CONFIG_FILE))
-    with open(config_path, "w") as f:
-        f.write(serialize[pretty=True](config))
+    var payload = to_json[pretty=True](config)
+    config_path.write_bytes(Span[UInt8](payload.as_bytes()))
 
 
 def load_config() raises -> Config:
@@ -141,11 +185,14 @@ def load_config() raises -> Config:
     var config_path = Path(path.expanduser(_CONFIG_FILE))
     if path.exists(config_path):
         try:
-            with open(config_path, "r") as f:
-                var data = f.read()
-                var cfg: Optional[Config] = try_deserialize[Config](data)
-                if cfg:
-                    return cfg.take()
+            var raw = config_path.read_bytes()
+            # bytes -> String for the JSON parser (config files are small)
+            var data = String()
+            for i in range(len(raw)):
+                data += String(chr(Int(raw[i])))
+            var cfg: Optional[Config] = try_from_json[Config](data)
+            if cfg:
+                return cfg.take()
         except:
             pass
     return Config()

@@ -1,24 +1,29 @@
 """
 environment access via std.os.getenv, file rename via libc rename(2),
-executable checks via libc access(2), and subprocess spawning via
-popen/pclose.
+executable checks via std.os.fstat mode bits.
 """
 
-from std.os import getenv
-from std.sys._libc import popen, pclose
+from std.os import getenv, fstat
 from std.ffi import external_call, c_int
-from std.collections import List
-
-from platform.ffi import cstr
 
 
 def _is_executable(filepath: String) raises -> Bool:
-    """Check if a file exists and is executable (access X_OK)."""
-    var mut_path = filepath
-    var result = external_call["access", c_int](
-        cstr(mut_path), c_int(1)  # X_OK = 1 on Linux
-    )
-    return result == 0
+    """Check if a file exists and is executable.
+
+    Safe Mojo: std.os.fstat.stat + mode bits replace libc access(X_OK).
+    Linux st_mode: low 9 bits are rwxrwxrwx; any execute bit set + regular
+    file == executable by someone. access(X_OK) under our uid means "owner,
+    group, or other x-bit" — the union of the three x-bits is the faithful
+    check for a single-user desktop app.
+    """
+    try:
+        var st = fstat.stat(filepath)
+        # S_IFMT check: must be a regular file (or symlink-resolved regular).
+        if st.st_mode & 0o170000 != 0o100000:
+            return False
+        return st.st_mode & 0o111 != 0
+    except:
+        return False
 
 
 def _which(binary: String) raises -> String:
@@ -69,48 +74,17 @@ def _shell_quote(s: String) -> String:
 def _mojo_rename(src: String, dst: String) raises:
     """Rename a file via libc rename(2).
 
-    Mojo 1.0's std.os has no rename() wrapper, so we call libc directly
-    through std.ffi.external_call. Returns 0 on success; non-zero raises.
+    std.os has no rename() wrapper on this toolchain, so we call libc
+    directly through std.ffi.external_call. Raises on failure.
     """
     var mut_src = src
     var mut_dst = dst
     var rc = external_call["rename", c_int](
-        mut_src.as_c_string_slice().unsafe_ptr(),
-        mut_dst.as_c_string_slice().unsafe_ptr(),
+        mut_src.as_c_string_span().ptr(),
+        mut_dst.as_c_string_span().ptr(),
     )
     if rc != 0:
         raise Error("rename failed: " + src + " -> " + dst)
-
-
-# ---------------------------------------------------------------------------
-# Subprocess spawning (popen/pclose)
-# ---------------------------------------------------------------------------
-
-
-def _run_ffmpeg(args: List[String]) raises -> Int:
-    """Spawn ffmpeg via popen and wait for completion. Returns exit code.
-
-    Replaces Python `subprocess.run(args, capture_output=True)`. We build a
-    single shell command string (popen invokes /bin/sh), shell-quote every
-    argument, run it with stdout/stderr discarded, and read the exit status
-    from pclose(). ffmpeg writes its conversion output to a file path passed
-    in args, so we don't need to capture stdout.
-    """
-    var cmd = String()
-    for i in range(len(args)):
-        if i > 0:
-            cmd += " "
-        cmd += _shell_quote(args[i])
-    # Redirect stderr to /dev/null to match capture_output behavior (we
-    # don't parse ffmpeg's stderr here; the caller logs a failure summary).
-    cmd += " 2>/dev/null"
-    var mode = String("w")
-    var fp = popen(cstr(cmd), cstr(mode))
-    if not fp:
-        return -1
-    var status = pclose(fp)
-    # pclose returns the raw wait(2) status; extract the exit code.
-    return Int(status)
 
 
 def format_time(seconds: Float64) -> String:

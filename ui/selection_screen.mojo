@@ -6,7 +6,7 @@ from resources.keys import (
     KEY_DELETE,
     KEY_ESCAPE,
 )
-from ui.imui import UIContext, UIResult, Vec2, Rect
+from render.imui import UIContext, UIResult, Vec2, Rect
 
 from functions.helpers import (
     format_time,
@@ -25,6 +25,7 @@ from functions.plex_bridge import (
     mark_watched,
 )
 
+from render.imui import UIContext, UIResult
 from resources.palette import (
     WHITE,
     LOGIN_BG,
@@ -60,8 +61,12 @@ from resources.palette import (
 
 from ui import Screen
 from ui.font import FontSet
-from ui.imui import UIContext, UIResult
-from ui.plex_objects import PlexTrack, PlexChapter, LibraryItem, ServerItem
+from resources.plex_objects import (
+    PlexTrack,
+    PlexChapter,
+    LibraryItem,
+    ServerItem,
+)
 from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
 
 
@@ -105,7 +110,7 @@ struct SelectionScreen:
         """Receive pre-tested server list, populate selection."""
         self.account_token = account_token
         self.client_id = client_id
-        self.servers = servers.copy()
+        self.servers = servers.copy()  # COW: shares until one side mutates
         self.status_message = "Select a server"
         self.status_color = TEXT_DIM
 
@@ -141,7 +146,7 @@ struct SelectionScreen:
             server.token,
             self.client_id,
         )
-        self.libraries = libraries.copy()
+        self.libraries = libraries.copy()  # COW: shares until one side mutates
 
         # Guard: no libraries
         if len(self.libraries) == 0:
@@ -177,17 +182,6 @@ struct SelectionScreen:
         self.status_message = "Selected: " + server.name + " / " + library.title
         self.status_color = GREEN
         self.selection_complete = True
-
-    def handle_mouse_click(
-        mut self,
-        mouse_pos: Vec2,
-        mut app_state: PlexSession,
-        mut screen: Screen,
-        screen_w: Int,
-        screen_h: Int,
-    ) raises:
-        # IMUI handles clicks inside draw() — no-op for main-loop contract.
-        pass
 
     def handle_scroll(mut self, wheel_delta: Float32, screen_h: Int):
         """Adjust scroll offset for the card list."""

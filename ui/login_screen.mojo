@@ -1,11 +1,11 @@
 from resources.color import Color
-from ui.imui import Vec2
 
 from functions.ascii import AsciiTable
 from functions.helpers import format_time
 from functions.plex_bridge import PlexSession
 from functions.plex_oauth import start_oauth, open_browser, wait_for_auth
 
+from render.imui import Vec2, UIContext, UIResult
 from resources.palette import (
     WHITE,
     LOGIN_BG,
@@ -41,7 +41,6 @@ from resources.palette import (
 
 from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
 from ui.font import FontSet
-from ui.imui import UIContext, UIResult
 from ui import Screen
 
 # ---------------------------------------------------------------------------
@@ -59,14 +58,6 @@ struct LoginScreen:
         self.status_message = ""
         self.status_color = TEXT_LIGHT
         self.auth_complete = False
-
-    def handle_mouse_click(
-        mut self, mouse_pos: Vec2, mut app_state: PlexSession
-    ) raises:
-        # IMUI handles clicks inside draw() — this is a no-op kept for the
-        # main-loop dispatch contract. The actual connect click is processed
-        # in draw() via ui.button(...).clicked.
-        pass
 
     def handle_keyboard(
         mut self, enter_pressed: Bool, mut app_state: PlexSession

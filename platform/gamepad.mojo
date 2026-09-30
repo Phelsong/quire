@@ -17,12 +17,14 @@ Design (proven pthread pattern from functions/audio_backend.mojo):
 - last_button records the most recent press for the settings rebinder.
 """
 from std.ffi import external_call
-from std.python import Python
 from std.memory import stack_allocation, alloc, Layout
 from std.memory.unsafe_pointer import Pointer
 from std.collections import List, Optional
+from std.pathlib import Path
+from std.os import path
 
 from functions.mutex import Mutex
+from platform.ffi import c_read, c_close, pthread_create, pthread_join, c_null
 
 # --- joystick (js0) structs / constants -------------------------------------
 # hhd's virtual "Xbox Elite" is SILENT on the evdev EV_KEY layer; it only
@@ -45,37 +47,12 @@ comptime DPAD_LEFT_CODE = 9003
 comptime DPAD_RIGHT_CODE = 9004
 
 
-from platform.ffi import c_null as _null
-
-
 # libc file calls: external_call["open"] / ["read"] collide with symbols
 # predeclared in std.ffi ('existing function with conflicting signature'
 # at legalize time when linked from main). glibc exports __-prefixed
 # aliases of the same syscalls — different symbol names, same behavior.
 def _open_evdev(path: Pointer[Int8, MutAnyOrigin], flags: Int32) -> Int32:
     return external_call["open64", Int32](path, Int(flags))
-
-
-def _read(fd: Int32, buf: Pointer[NoneType, MutUntrackedOrigin], n: Int) -> Int:
-    return external_call["__read", Int](fd, buf, n)
-
-
-def _close(fd: Int32):
-    _ = external_call["close", Int32](fd)
-
-
-def _pthread_create(
-    tid: Pointer[UInt64, MutUntrackedOrigin],
-    entry_fn: Pointer[NoneType, MutUntrackedOrigin],
-    arg: Pointer[NoneType, MutUntrackedOrigin],
-) -> Int32:
-    return external_call["pthread_create", Int32](
-        tid, _null[NoneType](), entry_fn, arg
-    )
-
-
-def _pthread_join(tid: UInt64):
-    _ = external_call["pthread_join", Int32](tid, _null[NoneType]())
 
 
 # --- reader thread shared state ----------------------------------------------
@@ -145,7 +122,7 @@ def pad_reader_entry(
     var ev = stack_allocation[1, JoystickEvent]()
     var ev_bytes = rebind[Pointer[NoneType, MutUntrackedOrigin]](ev)
     while sh[unsafe_offset=0].running == 1:
-        var got = _read(sh[unsafe_offset=0].fd, ev_bytes, JS_EVENT_BYTES)
+        var got = c_read(sh[unsafe_offset=0].fd, ev_bytes, JS_EVENT_BYTES)
         if got < Int(JS_EVENT_BYTES):
             continue
 
@@ -180,7 +157,7 @@ def pad_reader_entry(
                     p[unsafe_offset=0].hat_x = Int32(jval)
                 elif jnum == JS_AXIS_HAT_Y:
                     p[unsafe_offset=0].hat_y = Int32(jval)
-    return _null[NoneType]()
+    return c_null[NoneType]()
 
 
 # --- code translation --------------------------------------------------------
@@ -220,12 +197,26 @@ def _js_to_gamepad(js_num: Int) -> Int32:
 
 def _gamepad_to_js_num(gamepad_code: Int) -> Int:
     """Inverse of _js_to_gamepad; -1 = not a KEY button (dpad is hat)."""
-    inv = {7: 0, 6: 1, 8: 2, 5: 3, 9: 4, 11: 5, 13: 6, 14: 7, 16: 8, 17: 9}
-    try:
-        var v = inv[gamepad_code]
-        return v
-    except:
-        pass
+    if gamepad_code == 7:
+        return 0
+    if gamepad_code == 6:
+        return 1
+    if gamepad_code == 8:
+        return 2
+    if gamepad_code == 5:
+        return 3
+    if gamepad_code == 9:
+        return 4
+    if gamepad_code == 11:
+        return 5
+    if gamepad_code == 13:
+        return 6
+    if gamepad_code == 14:
+        return 7
+    if gamepad_code == 16:
+        return 8
+    if gamepad_code == 17:
+        return 9
     return Int(-1)
 
 
@@ -271,7 +262,7 @@ struct Gamepad(Copyable, Deinitable, Movable):
         if node.byte_length() == 0:
             return False
         var mutnode = String(node)
-        var cs = mutnode.as_c_string_slice()
+        var cs = mutnode.as_c_string_span()
         var fd = _open_evdev(rebind[Pointer[Int8, MutAnyOrigin]](cs), 0)
         if fd < 0:
             return False
@@ -296,7 +287,7 @@ struct Gamepad(Copyable, Deinitable, Movable):
         tid_mem.unsafe_write(0)
         var rc = external_call["pthread_create", Int32](
             tid_mem,
-            _null[NoneType](),
+            c_null[NoneType](),
             pad_reader_entry,
             rebind[Pointer[NoneType, MutUntrackedOrigin]](sh_ptr),
         )
@@ -308,9 +299,12 @@ struct Gamepad(Copyable, Deinitable, Movable):
             edge_mem.unsafe_free()
             sh_ptr.unsafe_free()
             tid_mem.unsafe_free()
-            _close(fd)
+            c_close(fd)
             return False
         self.tid = tid_mem[unsafe_offset=0]
+        # tid was copied by value; the heap cell was only needed across the
+        # pthread_create call (which writes through the pointer).
+        tid_mem.unsafe_free()
         self.running = True
         self.open_ok = True
         return True
@@ -321,7 +315,7 @@ struct Gamepad(Copyable, Deinitable, Movable):
             return
         var sh_mem = self.shared.value()
         sh_mem[unsafe_offset=0].running = 0
-        _pthread_join(self.tid)
+        pthread_join(self.tid)
         # Reader is joined: free the bitmap allocations under the lock, then
         # tear the mutex down.
         with sh_mem[unsafe_offset=0].state.lock() as p:
@@ -329,7 +323,7 @@ struct Gamepad(Copyable, Deinitable, Movable):
             p[unsafe_offset=0].edge.unsafe_free()
         sh_mem[unsafe_offset=0].state.close()
         sh_mem.unsafe_free()
-        _close(self.fd)
+        c_close(self.fd)
         self.fd = -1
         self.tid = 0
         self.running = False
@@ -364,7 +358,7 @@ struct Gamepad(Copyable, Deinitable, Movable):
             return bit != 0
 
     def was_pressed(mut self, gamepad_code: Int) -> Bool:
-        """enum -> pressed-since-last-end_frame edge.
+        """Enum code -> pressed-since-last-end_frame edge.
 
         The reader writes the edge mask in ENUM space, so read it
         back with the same index (no _gamepad_to_js_num roundtrip — that
@@ -423,32 +417,36 @@ def _find_pad_event_node() raises -> String:
        from its Handlers line (same line that lists eventNN).
     2. Fallback: plain /dev/input/js0 when present.
     Returns "" when nothing usable is found.
+
+    Native implementation: Path.read_bytes() + String scanning — the old
+    path booted the Python interpreter just to read /proc.
     """
-    var builtins = Python.import_module("builtins")
     try:
-        var text = builtins.open("/proc/bus/input/devices").read()
-        var blocks = text.split("\n\n")
-        for i in range(len(blocks)):
-            var blk = String(blocks[i])
-            if blk.find(GAMEPAD_NAME) >= 0:
-                # find the "H: Handlers=... js0 ..." line in this block
-                var lines = blk.split("\n")
-                for j in range(len(lines)):
-                    var ln = lines[j]
-                    if ln.find("H: Handlers=") >= 0:
-                        var words = ln.split(" ")
-                        for k in range(len(words)):
-                            var w = words[k]
-                            if w.find("js") == 0 and w.byte_length() > 2:
-                                return String("/dev/input/") + w
+        var proc_path = Path("/proc/bus/input/devices")
+        if path.exists(proc_path):
+            var raw = proc_path.read_bytes()
+            var text = String()
+            for i in range(len(raw)):
+                text += String(chr(Int(raw[i])))
+            var blocks = text.split("\n\n")
+            for i in range(len(blocks)):
+                var blk = blocks[i]
+                if blk.find(GAMEPAD_NAME) >= 0:
+                    # find the "H: Handlers=... js0 ..." line in this block
+                    var lines = blk.split("\n")
+                    for j in range(len(lines)):
+                        var ln = lines[j]
+                        if ln.find("H: Handlers=") >= 0:
+                            var words = ln.split(" ")
+                            for k in range(len(words)):
+                                var w = words[k]
+                                if w.find("js") == 0 and w.byte_length() > 2:
+                                    return String("/dev/input/") + w
     except e:
         pass
     # Fallback: first default joystick node.
-    try:
-        if builtins.os.path.exists("/dev/input/js0"):
-            return String("/dev/input/js0")
-    except e:
-        pass
+    if path.exists(Path("/dev/input/js0")):
+        return String("/dev/input/js0")
     return String("")
 
 

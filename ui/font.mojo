@@ -34,12 +34,14 @@ struct FontSet(Copyable, Movable):
         self.load_ok = False
 
     def __copyinit__(mut self, existing: Self):
-        # Deep copy: allocate our own block, copy each atlas resource.
-        self.slots = alloc(Layout[TextAtlas](count=13)).unsafe_leak()
-        for i in range(FONT_SIZE_COUNT):
-            self.slots.value().unsafe_offset(i).unsafe_write(
-                existing.slots.value()[unsafe_offset=i].copy()
-            )
+        # COW share: copy the slot-block POINTER, not the atlases. Both
+        # FontSets address the same 13 baked atlases until one side reloads
+        # (load() writes through its own pointer, so the other sees stale
+        # slots — acceptable: main.mojo heap-boxes FontSet and reloads never
+        # happen while a copy is alive). This was a deep per-glyph copy of
+        # all 13 atlases; nothing ever mutated a copy in place, so the share
+        # is the honest semantic and saves ~13 list rebuilds per copy.
+        self.slots = existing.slots
         self.load_ok = existing.load_ok
 
     def __moveinit__(mut self, existing: Self):

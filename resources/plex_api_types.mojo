@@ -1,11 +1,4 @@
-# ---------------------------------------------------------------------------
-# Native Mojo return types for Plex API functions
-# ---------------------------------------------------------------------------
-# These structs replace PythonObject dict returns, providing type safety
-# and eliminating the String(PythonObject) garbling bug at the boundary.
-# ---------------------------------------------------------------------------
-
-from ui.plex_objects import PlexBookCard, PlexChapter
+from resources.plex_objects import PlexBookCard, PlexChapter
 
 
 struct CollectionItem(Copyable, ImplicitlyCopyable, Movable):

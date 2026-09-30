@@ -6,16 +6,21 @@ Dict[String, String] headers); browser launch and timing use Mojo stdlib.
 """
 
 from std.python import Python, PythonObject
-from std.sys._libc import popen, pclose
+from std.os import Process
 from std.time import perf_counter, sleep
 from functions.plex_bridge import (
     plex_headers,
     _http_get,
     _http_post_form,
+    _vint,
+    _vstr,
+    _vtruthy,
+    _vitems,
     get_or_create_client_id,
 )
 from platform.ffi import cstr
-from ui.plex_api_types import (
+from std.collections import List
+from resources.plex_api_types import (
     OAuthPin,
     AuthResult,
     ManagedUser,
@@ -48,8 +53,8 @@ def start_oauth(client_id: String = "") raises -> OAuthPin:
         var data = _http_post_form(url, headers, Dict[String, String](), 30.0)
 
         var result = OAuthPin()
-        result.id = Int(py=data.get("id", 0))
-        result.code = String(data.get("code", ""))
+        result.id = _vint(data, "id")
+        result.code = _vstr(data, "code")
         result.client_identifier = cid
         return result^
     except e:
@@ -83,14 +88,15 @@ def get_auth_url(pin_code: String, client_id: String = "") raises -> String:
 def open_browser(pin_code: String, client_id: String = "") raises -> Bool:
     """Open the Plex auth page in the user's default browser.
 
-    Launches `xdg-open` via popen (native libc) instead of Python's
-    `webbrowser` module. Returns True if the subprocess started.
+    Launches `xdg-open` via `Process.run` (native Mojo, no shell) instead of
+    Python's `webbrowser` module. Returns True if the subprocess started.
     """
     var url = get_auth_url(pin_code, client_id)
-    var cmd = "xdg-open '" + url + "'"
-    var mode = String("r")
-    var fp = popen(cstr(cmd), cstr(mode))
-    _ = pclose(fp)
+    var argv: List[String] = [url]
+    var proc = Process.run("xdg-open", argv)
+    # Fire-and-forget: don't block the UI on the browser process. poll()
+    # harvests it once it exits (xdg-open returns immediately after spawn).
+    _ = proc.poll()
     return True
 
 
@@ -112,7 +118,7 @@ def poll_pin(pin_id: Int, client_id: String = "") raises -> AuthResult:
         var data = _http_get(url, headers, 15.0)
 
         var result = AuthResult()
-        result.auth_token = String(data.get("authToken", ""))
+        result.auth_token = _vstr(data, "authToken")
         result.expired = False
         return result^
     except e:
@@ -187,32 +193,21 @@ def get_managed_users(
     try:
         var data = _http_get(url, headers, 15.0)
 
-        var users = data.get("users", "")
-        var user_list: PythonObject
-        if Bool(py=users == PythonObject("")):
-            user_list = data.get("User", Python.list())
-        else:
-            user_list = users
-
-        if String(user_list.__class__.__name__) == "dict":
-            user_list = Python.list(user_list)
+        var user_list = _vitems(
+            data, "users", default_items=_vitems(data, "User")
+        )
 
         var result = List[ManagedUser]()
-        for u in user_list:
+        for i in range(len(user_list)):
+            ref u = user_list[i]
             var user = ManagedUser()
-            user.id = Int(py=u.get("id", 0))
-            user.uuid = String(u.get("uuid", ""))
-            user.title = String(u.get("title", ""))
-            user.username = String(u.get("username", ""))
-
-            var admin_val = u.get("admin", False)
-            var is_admin = Bool(py=admin_val)
-            if String(admin_val.__class__.__name__) == "str":
-                is_admin = String(admin_val) == "1"
-            user.is_admin = is_admin
-
-            user.thumb = String(u.get("thumb", ""))
-            user.auth_token = String(u.get("authToken", ""))
+            user.id = _vint(u, "id")
+            user.uuid = _vstr(u, "uuid")
+            user.title = _vstr(u, "title")
+            user.username = _vstr(u, "username")
+            user.is_admin = _vtruthy(u, "admin")
+            user.thumb = _vstr(u, "thumb")
+            user.auth_token = _vstr(u, "authToken")
             result.append(user)
         return result^
     except e:
@@ -244,9 +239,9 @@ def switch_user(
         var data = _http_post_form(url, headers, body, 15.0)
 
         var result = SwitchUserResult()
-        result.auth_token = String(data.get("authToken", ""))
-        result.username = String(data.get("username", ""))
-        result.title = String(data.get("title", ""))
+        result.auth_token = _vstr(data, "authToken")
+        result.username = _vstr(data, "username")
+        result.title = _vstr(data, "title")
         return result^
     except e:
         var err_result = SwitchUserResult()

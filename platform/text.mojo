@@ -26,9 +26,65 @@ from std.collections import Optional
 from std.memory import stack_allocation
 from std.memory.unsafe_pointer import Pointer
 
-from platform.ffi import c_null as _null
-from platform.ffi import cstr as _cstr
-from platform.ffi import heap_malloc as _malloc
+from platform.ffi import c_null, cstr, heap_malloc
+
+
+# ---------------------------------------------------------------------------
+# UTF-8 codepoint decoding (shared by draw_text / measure_text / text_width)
+# ---------------------------------------------------------------------------
+
+
+struct CodepointInfo(Copyable, Movable):
+    """One decoded UTF-8 codepoint plus the byte length of its sequence."""
+
+    var cp: Int32
+    var seq: Int
+
+    def __init__(out self, cp: Int32, seq: Int):
+        self.cp = cp
+        self.seq = seq
+
+
+def decode_utf8[
+    origin: Origin
+](bytes: Span[UInt8, origin=origin], i: Int, n: Int) -> CodepointInfo:
+    """Decode the UTF-8 sequence starting at bytes[i].
+
+    Returns the codepoint and its sequence length (malformed bytes decode as
+    a 1-byte Latin-1 codepoint — identical behavior for all callers).
+
+    Widen to Int32 BEFORE shifting: UInt8 shift-or wraps 8-bit and destroys
+    multi-byte codepoints (3 << 18 == 0 in 8-bit).
+    """
+    var b = bytes[i]
+    var cp = Int32(b)
+    var seq = 1
+    if b >= 0xF0:
+        # 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+        cp = Int32(b & 0x07)
+        cp <<= 18
+        if i + 1 < n:
+            cp |= Int32(bytes[i + 1] & 0x3F) << 12
+        if i + 2 < n:
+            cp |= Int32(bytes[i + 2] & 0x3F) << 6
+        if i + 3 < n:
+            cp |= Int32(bytes[i + 3] & 0x3F)
+        seq = 4
+    elif b >= 0xE0:
+        cp = Int32(b & 0x0F)
+        cp <<= 12
+        if i + 1 < n:
+            cp |= Int32(bytes[i + 1] & 0x3F) << 6
+        if i + 2 < n:
+            cp |= Int32(bytes[i + 2] & 0x3F)
+        seq = 3
+    elif b >= 0xC0:
+        cp = Int32(b & 0x1F)
+        cp <<= 6
+        if i + 1 < n:
+            cp |= Int32(bytes[i + 1] & 0x3F)
+        seq = 2
+    return CodepointInfo(cp, seq)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +127,7 @@ def ft_init() -> Pointer[NoneType, MutUntrackedOrigin]:
     var lib_ptr = stack_allocation[1, Pointer[NoneType, MutUntrackedOrigin]]()
     var rc = external_call["FT_Init_FreeType", Int32](lib_ptr)
     if rc != 0:
-        return _null[NoneType]()
+        return c_null[NoneType]()
     return lib_ptr[unsafe_offset=0]
 
 
@@ -80,10 +136,10 @@ def ft_new_face(
 ) -> Pointer[NoneType, MutUntrackedOrigin]:
     var face_ptr = stack_allocation[1, Pointer[NoneType, MutUntrackedOrigin]]()
     var rc = external_call["FT_New_Face", Int32](
-        lib, _cstr(path), UInt64(0), face_ptr
+        lib, cstr(path), UInt64(0), face_ptr
     )
     if rc != 0:
-        return _null[NoneType]()
+        return c_null[NoneType]()
     return face_ptr[unsafe_offset=0]
 
 
@@ -198,7 +254,7 @@ struct TextAtlas(Copyable, Movable):
     def __init__(out self):
         self.codepoints = List[Int32]()
         self.glyphs = List[GlyphInfo]()
-        self.mask = _null[UInt8]()
+        self.mask = c_null[UInt8]()
         self.atlas_w = 0
         self.atlas_h = 0
         self.pixel_size = 0
@@ -227,7 +283,7 @@ struct TextAtlas(Copyable, Movable):
             external_call["free", NoneType](self.mask.value())
         self.mask = Optional[Pointer[UInt8, MutUntrackedOrigin]]()
 
-    def find_glyph(mut self, codepoint: Int32) -> Int:
+    def find_glyph(self, codepoint: Int32) -> Int:
         """Index into glyphs or -1 if not baked."""
         var n = self.codepoints.__len__()
         for i in range(n):
@@ -235,51 +291,23 @@ struct TextAtlas(Copyable, Movable):
                 return i
         return -1
 
-    def text_width(mut self, mut text: String) -> Int:
+    def text_width(self, text: String) -> Int:
         """Advance-width in pixels. Walks UTF-8 CODEPOINTS (not bytes) so
         multi-byte glyphs (Nerd Font PUA icons) measure as one glyph."""
         var total = 0
         var bytes = text.as_bytes()
-        var i = 0
         var n = len(bytes)
+        var i = 0
         while i < n:
-            var b = bytes[i]
-            # Widen to Int32 BEFORE shifting: UInt8 shift-or wraps 8-bit and
-            # destroys multi-byte codepoints (3 << 18 == 0 in 8-bit).
-            var cp = Int32(b)
-            var seq = 1
-            if b >= 0xF0:
-                cp = Int32(b & 0x07)
-                cp <<= 18
-                if i + 1 < n:
-                    cp |= Int32(bytes[i + 1] & 0x3F) << 12
-                if i + 2 < n:
-                    cp |= Int32(bytes[i + 2] & 0x3F) << 6
-                if i + 3 < n:
-                    cp |= Int32(bytes[i + 3] & 0x3F)
-                seq = 4
-            elif b >= 0xE0:
-                cp = Int32(b & 0x0F)
-                cp <<= 12
-                if i + 1 < n:
-                    cp |= Int32(bytes[i + 1] & 0x3F) << 6
-                if i + 2 < n:
-                    cp |= Int32(bytes[i + 2] & 0x3F)
-                seq = 3
-            elif b >= 0xC0:
-                cp = Int32(b & 0x1F)
-                cp <<= 6
-                if i + 1 < n:
-                    cp |= Int32(bytes[i + 1] & 0x3F)
-                seq = 2
-            var idx = self.find_glyph(cp)
+            var info = decode_utf8(bytes, i, n)
+            var idx = self.find_glyph(info.cp)
             if idx >= 0:
                 var g = self.glyphs[idx].copy()
                 total += g_advance(g)
             else:
                 # fallback: ~half advance of 'M' or 12px
                 total += Int(self.pixel_size) // 2
-            i += seq
+            i += info.seq
         return total
 
     def text_height(mut self) -> Int:
@@ -430,7 +458,7 @@ struct TextEngine(Copyable, Movable):
         if mask_size > 0:
             atlas.mask = Optional[Pointer[UInt8, MutUntrackedOrigin]](
                 Pointer[UInt8, MutUntrackedOrigin](
-                    unsafe_from_address=Int(_malloc(mask_size))
+                    unsafe_from_address=Int(heap_malloc(mask_size))
                 )
             )
             # zero

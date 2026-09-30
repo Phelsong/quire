@@ -1,11 +1,11 @@
 """Quire — Plex API Bridge.
 
-HTTP calls go through Python httpx (Mojo has no native HTTP client yet), but
-the Python boundary is narrow: every public function converts PythonObject
-responses into native Mojo structs before returning, so the UI stays pure
-Mojo. Headers live in the native PlexHeaders struct and only cross into
-Python at the httpx call sites; only _http_get and _xml_to_dict otherwise
-touch PythonObject.
+HTTP calls go through Python httpx (Mojo has no native HTTP client yet),
+but the Python boundary is narrow: _http_get and _http_post_form are the
+only functions that touch PythonObject, and they return a parsed emberjson
+Value — every endpoint downstream is pure Mojo working on checked JSON
+accessors. Headers live in the native PlexHeaders struct and only cross
+into Python at the httpx call sites.
 """
 
 from std.logger import Logger, Level
@@ -14,14 +14,12 @@ from std.python.conversions import ConvertibleToPython
 from std.os import makedirs, path, remove, getenv
 from std.pathlib import Path
 
-from ui.plex_objects import (
-    PlexTrack,
-    PlexChapter,
-    ServerItem,
-    LibraryItem,
-    PlexBookCard,
-)
-from ui.plex_api_types import (
+from emberjson import from_json, Value, Object
+from emberjson.array import Array as JsonArray
+
+from functions.helpers import _mojo_rename
+from resources.xmlparse import parse_xml, XmlElement
+from resources.plex_api_types import (
     ServerTestResult,
     AccountInfo,
     AudiobookResult,
@@ -31,7 +29,13 @@ from ui.plex_api_types import (
     PlaybackDecision,
     CollectionItem,
 )
-from functions.helpers import _mojo_rename
+from resources.plex_objects import (
+    PlexTrack,
+    PlexChapter,
+    ServerItem,
+    LibraryItem,
+    PlexBookCard,
+)
 from resources.config import (
     Config,
     load_config,
@@ -136,6 +140,22 @@ struct PlexHeaders(ConvertibleToPython, Copyable, Movable):
         return py
 
 
+def gethostname() -> String:
+    """The machine's hostname, read from /proc/sys/kernel/hostname.
+    the header is optional — an empty X-Plex-Device-Name is valid).
+    """
+    try:
+        var raw = Path("/proc/sys/kernel/hostname").read_bytes()
+        var name = String()
+        for i in range(len(raw)):
+            if raw[i] == UInt8(10):  # '\n'
+                break
+            name += String(chr(Int(raw[i])))
+        return name
+    except:
+        return ""
+
+
 def plex_headers(
     token: String = "", client_id: String = ""
 ) raises -> PlexHeaders:
@@ -144,7 +164,6 @@ def plex_headers(
     Returns native PlexHeaders — headers are pure Mojo state until the
     httpx call converts them.
     """
-    var os = Python.import_module("os")
     var cid = client_id
     if cid.byte_length() == 0:
         cid = get_or_create_client_id()
@@ -156,7 +175,7 @@ def plex_headers(
     headers["X-Plex-Client-Identifier"] = cid
     headers["X-Plex-Platform"] = "Linux"
     headers["X-Plex-Device"] = PRODUCT_NAME + " Linux"
-    headers["X-Plex-Device-Name"] = String(os.uname().nodename)
+    headers["X-Plex-Device-Name"] = gethostname()
     headers["X-Plex-Client-Name"] = PRODUCT_NAME
     headers["X-Plex-Provides"] = "player"
     headers["X-Plex-Client-Profile-Extra"] = (
@@ -181,11 +200,12 @@ def plex_headers(
 
 def _http_get(
     url: String, headers: PlexHeaders, timeout: Float64 = 30.0
-) raises -> PythonObject:
-    """GET request via httpx, parse JSON or XML response to dict.
+) raises -> Value:
+    """GET via httpx, parse the body into an emberjson Value.
 
-    This is the Python boundary: callers get a PythonObject payload back,
-    which they immediately convert into native Mojo structs.
+    The Python boundary: httpx runs here, and the response text crosses
+    back as a String exactly once. Callers get a parsed Value — checked,
+    native Mojo from here down.
     """
     var httpx = Python.import_module("httpx")
 
@@ -208,15 +228,7 @@ def _http_get(
 
     var content_type = String(resp.headers.get("content-type", ""))
     var text = String(resp.text)
-    var stripped = text.strip()
-
-    if content_type.find("json") >= 0 or stripped.startswith("{"):
-        return resp.json()
-    elif content_type.find("xml") >= 0 or stripped.startswith("<"):
-        return _xml_to_dict(text)
-    else:
-        var result: PythonObject = {"raw": text}
-        return result
+    return _parse_payload(text, content_type)
 
 
 def _http_post_form(
@@ -224,8 +236,8 @@ def _http_post_form(
     headers: PlexHeaders,
     body: Dict[String, String],
     timeout: Float64 = 30.0,
-) raises -> PythonObject:
-    """POST request with urlencoded form body, parse JSON or XML response.
+) raises -> Value:
+    """POST with urlencoded form body, parse the response into a Value.
 
     Companion to _http_get — same Python boundary, native Mojo inputs.
     """
@@ -259,79 +271,61 @@ def _http_post_form(
 
     var content_type = String(resp.headers.get("content-type", ""))
     var text = String(resp.text)
+    return _parse_payload(text, content_type)
+
+
+def _parse_payload(text: String, content_type: String) raises -> Value:
+    """Parse a response body into a Value by sniffing JSON vs XML vs raw.
+
+    Both JSON (emberjson) and XML (resources.xmlparse) parse in pure
+    Mojo — the only Python left in this module is httpx itself.
+    Anything non-JSON/XML wraps as {"raw": text}.
+    """
     var stripped = text.strip()
 
-    if content_type.find("json") >= 0 or stripped.startswith("{"):
-        return resp.json()
+    if (
+        content_type.find("json") >= 0
+        or stripped.startswith("{")
+        or stripped.startswith("[")
+    ):
+        return from_json[Value](text)
     elif content_type.find("xml") >= 0 or stripped.startswith("<"):
-        return _xml_to_dict(text)
+        return _xml_element_to_value(parse_xml(text))
     else:
-        var result: PythonObject = {"raw": text}
-        return result
+        var raw = Object()
+        raw["raw"] = Value(text)
+        return Value(raw^)
 
 
 # ---------------------------------------------------------------------------
-# XML parsing helper (implemented in Python via evaluate, compiled once)
+# XML parsing (pure Mojo — resources.xmlparse)
 # ---------------------------------------------------------------------------
 
 
-comptime _XML_MOD_KEY = "_QUIRE_XML_PARSER_MODULE"
-
-
-def _xml_module() raises -> PythonObject:
-    """Compile the XML-to-dict Python helper once, lazily.
-
-    Mojo 1.0.0 forbids module-level `var` state and a comptime struct
-    singleton cannot be materialized mutably, so the compiled module is
-    stashed as an attribute on the Python `builtins` module — a process-
-    live cache visible across calls (probed: survives and round-trips).
-    """
-    var builtins = Python.import_module("builtins")
-    try:
-        var cached = builtins._QUIRE_XML_PARSER_MODULE
-        if Bool(cached):
-            return cached
-    except:
-        pass
-    var mod = Python.evaluate(
-        """
-import defusedxml.ElementTree as ET
-
-def xml_to_dict(xml_str):
-    root = ET.fromstring(xml_str)
-
-    def element_to_dict(element):
-        result = dict(element.attrib)
-        children = list(element)
-        if children:
-            for child in children:
-                tag = child.tag
-                child_dict = element_to_dict(child)
-                if tag in result:
-                    existing = result[tag]
-                    if isinstance(existing, list):
-                        existing.append(child_dict)
-                    else:
-                        result[tag] = [existing, child_dict]
-                else:
-                    result[tag] = child_dict
-        return result
-
-    result = element_to_dict(root)
-    if isinstance(result, dict):
-        return result
-    return {"value": result}
-""",
-        file=True,
-    )
-    builtins._QUIRE_XML_PARSER_MODULE = mod
-    return mod
-
-
-def _xml_to_dict(xml_str: String) raises -> PythonObject:
-    """Parse Plex XML response to a dict (simplified)."""
-    var mod = _xml_module()
-    return mod.xml_to_dict(xml_str)
+def _xml_element_to_value(elem: XmlElement) raises -> Value:
+    """XmlElement -> emberjson Value, reproducing the old element_to_dict:
+    attributes ride the same map as children; a tag appearing once is a
+    single object, twice becomes an array (first occurrence hoisted)."""
+    var obj = Object()
+    # Attributes first — a colliding child tag overwrites, matching the
+    # old dict-attrib-then-child-insertion order.
+    for entry in elem.attrs.items():
+        obj[entry.key] = Value(entry.value)
+    for i in range(len(elem.children)):
+        ref child = elem.children[i]
+        if child.tag in obj:
+            var existing = obj[child.tag].copy()
+            if existing.is_array():
+                existing.array().append(_xml_element_to_value(child))
+                obj[child.tag] = existing^
+            else:
+                var both = JsonArray()
+                both.append(existing^)
+                both.append(_xml_element_to_value(child))
+                obj[child.tag] = Value(both^)
+        else:
+            obj[child.tag] = _xml_element_to_value(child)
+    return Value(obj^)
 
 
 # ---------------------------------------------------------------------------
@@ -345,11 +339,10 @@ comptime _DOWNLOADER_MOD_KEY = "_QUIRE_DOWNLOADER_MODULE"
 def _downloader_module() raises -> PythonObject:
     """Compile the streaming file-download helper once, lazily.
 
-    Same process-live cache trick as _xml_module: the compiled module is
-    stashed on `builtins`. The download runs entirely in Python (httpx
-    client.stream → iter_bytes → file.write), so a multi-hundred-MB
-    audiobook never enters Mojo memory — Mojo only sees the returned
-    content-type string.
+    The compiled module is stashed on `builtins` (process-live cache).
+    The download runs entirely in Python (httpx client.stream →
+    iter_bytes → file.write), so a multi-hundred-MB audiobook never
+    enters Mojo memory — Mojo only sees the returned content-type string.
     """
     var builtins = Python.import_module("builtins")
     try:
@@ -394,17 +387,12 @@ def get_account_info(
     var headers = plex_headers(token=account_token, client_id=client_id)
     try:
         var data = _http_get("https://plex.tv/users/account.json", headers)
-        var user = data.get("user", data)
+        var user = _container_of(data^, key="user")
         var result = AccountInfo()
-        result.username = String(user["username"])
-        result.email = String(user["email"])
-        result.title = String(
-            user.get(
-                "title",
-                user.get("friendlyName", ""),
-            )
-        )
-        result.id = String(user["id"])
+        result.username = _vstr(user, "username")
+        result.email = _vstr(user, "email")
+        result.title = _vstr(user, "title", _vstr(user, "friendlyName"))
+        result.id = _vstr(user, "id")
         return result^
     except:
         return AccountInfo()
@@ -415,16 +403,116 @@ def get_account_info(
 # ---------------------------------------------------------------------------
 
 
-def _as_list(value: PythonObject) raises -> PythonObject:
-    """Normalize a single dict to a one-item list; pass lists through."""
-    var type_name = String(value.__class__.__name__)
-    if type_name == "list":
-        return value
-    if type_name == "dict":
-        var lst = Python.list()
-        lst.append(value)
-        return lst
-    return Python.list()
+# ---------------------------------------------------------------------------
+# Value accessors — Plex's JSON typing is loose (XML-origin fields arrive as
+# strings, JSON-origin as numbers/bools), so every field read goes through
+# these guards instead of trusting the wire type.
+# ---------------------------------------------------------------------------
+
+
+def _has(v: Value, key: String) -> Bool:
+    """True when v is an object containing key."""
+    return v.is_object() and key in v.object()
+
+
+def _vstr(v: Value, key: String, default: String = "") raises -> String:
+    """Field as String. Numbers stringify (XML attrs arrive as strings;
+    JSON ints/floats coerce the same way Python's str() did)."""
+    if not _has(v, key):
+        return default
+    ref field = v[key]
+    if field.is_string():
+        return String(field.string())
+    if field.is_int() or field.is_uint():
+        return String(field.int())
+    if field.is_float():
+        return String(field.float())
+    return default
+
+
+def _vint(v: Value, key: String, default: Int = 0) raises -> Int:
+    """Field as Int. Accepts int/uint, float (truncates, matching Python's
+    int()), and numeric strings (XML-origin fields)."""
+    if not _has(v, key):
+        return default
+    ref field = v[key]
+    if field.is_int() or field.is_uint():
+        return Int(field.int())
+    if field.is_float():
+        return Int(field.float())
+    if field.is_string():
+        try:
+            return Int(field.string())
+        except:
+            return default
+    return default
+
+
+def _vtruthy(v: Value, key: String, default: Bool = False) raises -> Bool:
+    """Field as Bool. Accepts bool, "1"/"0" strings (XML origin), and
+    nonzero ints."""
+    if not _has(v, key):
+        return default
+    ref field = v[key]
+    if field.is_bool():
+        return field.bool()
+    if field.is_string():
+        return field.string() == "1"
+    if field.is_int() or field.is_uint():
+        return field.int() != 0
+    return default
+
+
+def _container_of(
+    var data: Value, key: String = "MediaContainer"
+) raises -> Value:
+    """Unwrap the MediaContainer envelope; pass through when absent."""
+    if _has(data, key):
+        return data[key].copy()
+    return data^
+
+
+def _as_items(var v: Value) raises -> List[Value]:
+    """Normalize a single object to a one-item list; pass arrays through."""
+    var out = List[Value]()
+    if v.is_array():
+        var n = len(v.array())
+        for i in range(n):
+            out.append(v[i].copy())
+    elif v.is_object():
+        out.append(v^)
+    return out^
+
+
+def _vitems(
+    v: Value,
+    key: String,
+    var default_items: List[Value] = List[Value](),
+) raises -> List[Value]:
+    """Field as a list of Values, normalized from object-or-array. Missing
+    field yields default_items."""
+    if not _has(v, key):
+        return default_items^
+    var field = v[key].copy()
+    return _as_items(field^)
+
+
+def _card_from_metadata(v: Value) raises -> PlexBookCard:
+    """One PlexBookCard from a Metadata element. Shared by every listing
+    path (library browse, search, collection members)."""
+    var card = PlexBookCard()
+    card.rating_key = _vstr(v, "ratingKey")
+    card.title = _vstr(v, "title")
+    card.author = _vstr(v, "parentTitle")
+    card.thumb = _vstr(v, "thumb")
+    card.duration_ms = _vint(v, "duration")
+    card.view_offset_ms = _vint(v, "viewOffset")
+    card.leaf_count = _vint(v, "leafCount")
+    card.viewed_leaf_count = _vint(v, "viewedLeafCount")
+    var year = _vint(v, "year")
+    if year != 0:
+        card.year = year
+    return card^
 
 
 def get_servers(
@@ -441,31 +529,27 @@ def get_servers(
     )
     var servers = List[ServerItem]()
 
-    # Normalize single server dict into a list
-    var server_list: PythonObject
-    if String(data.__class__.__name__) == "list":
-        server_list = data
-    elif String(data.__class__.__name__) == "dict" and Bool(py="name" in data):
-        server_list = Python.list(data)
-    else:
+    # Normalize: array root is the server list; a single server object is
+    # the one-item case.
+    var server_list = _as_items(data^)
+    if len(server_list) == 1 and not _has(server_list[0], "name"):
         return servers^
 
     var count = len(server_list)
     for i in range(count):
-        var s = server_list[i]
+        ref s = server_list[i]
         var item = ServerItem()
-        item.name = String(s["name"])
-        item.token = String(s["accessToken"])
-        item.machine_id = String(s["clientIdentifier"])
-        item.is_owned = Bool(py=s["owned"])
+        item.name = _vstr(s, "name")
+        item.token = _vstr(s, "accessToken")
+        item.machine_id = _vstr(s, "clientIdentifier")
+        item.is_owned = _vtruthy(s, "owned")
 
         # Extract best connection URL
-        var connections = s["connections"]
+        var connections = _vitems(s, "connections")
         var conn_count = len(connections)
         var best_url = String()
         for j in range(conn_count):
-            var conn = connections[j]
-            var conn_url = String(conn["uri"])
+            var conn_url = _vstr(connections[j], "uri")
             # Prefer HTTPS connections
             if conn_url.startswith("https"):
                 best_url = conn_url
@@ -476,8 +560,7 @@ def get_servers(
         if best_url.byte_length() == 0:
             # Fallback: test each connection
             for j in range(conn_count):
-                var conn = connections[j]
-                var candidate_url = String(conn["uri"])
+                var candidate_url = _vstr(connections[j], "uri")
                 var test_result = test_server(
                     candidate_url, item.token, client_id
                 )
@@ -502,17 +585,11 @@ def test_server(
     var headers = plex_headers(token=token, client_id=client_id)
     try:
         var data = _http_get(server_url + "/identity", headers)
-        if "MediaContainer" in data:
-            data = data["MediaContainer"]
+        var container = _container_of(data^)
         var result = ServerTestResult()
         result.ok = True
-        result.name = String(
-            data.get(
-                "friendlyName",
-                data.get("name", ""),
-            )
-        )
-        result.machine_id = String(data["machineIdentifier"])
+        result.name = _vstr(container, "friendlyName", _vstr(container, "name"))
+        result.machine_id = _vstr(container, "machineIdentifier")
         return result^
     except e:
         var error_msg = String(e)
@@ -554,18 +631,17 @@ def get_libraries(
     """
     var headers = plex_headers(token=token, client_id=client_id)
     var data = _http_get(server_url + "/library/sections", headers)
-    var container = data.get("MediaContainer", data)
-    var dirs = container.get("Directory", Python.list())
-    dirs = _as_list(dirs)
+    var container = _container_of(data^)
+    var dirs = _vitems(container, "Directory")
 
     var libraries = List[LibraryItem]()
     var count = len(dirs)
     for i in range(count):
-        var d = dirs[i]
+        ref d = dirs[i]
         var item = LibraryItem()
-        item.key = String(d["key"])
-        item.title = String(d["title"])
-        item.lib_type = String(d["type"])
+        item.key = _vstr(d, "key")
+        item.title = _vstr(d, "title")
+        item.lib_type = _vstr(d, "type")
         libraries.append(item)
     return libraries^
 
@@ -587,7 +663,7 @@ def get_audiobooks(
     headers["X-Plex-Container-Size"] = String(size)
 
     var url = "{}/library/sections/{}/all?type=9".format(server_url, library_id)
-    var data: PythonObject
+    var data: Value
 
     try:
         data = _http_get(url, headers)
@@ -607,32 +683,17 @@ def get_audiobooks(
             return err_result^
 
     try:
-        var container = data.get("MediaContainer", data)
-        var total_size_val = Int(
-            py=container.get(
-                "totalSize",
-                container.get("size", 0),
-            )
+        var container = _container_of(data^)
+        var total_size_val = _vint(
+            container, "totalSize", _vint(container, "size")
         )
-        var metadata = container.get("Metadata", Python.list())
-        metadata = _as_list(metadata)
+        var metadata = _vitems(container, "Metadata")
 
         var items = List[PlexBookCard]()
         var count = len(metadata)
         for i in range(count):
-            var m = metadata[i]
-            var card = PlexBookCard()
-            card.rating_key = String(m["ratingKey"])
-            card.title = String(m["title"])
-            card.author = String(m["parentTitle"])
-            card.thumb = String(m.get("thumb", ""))
-            card.duration_ms = Int(py=m.get("duration", 0))
-            card.view_offset_ms = Int(py=m.get("viewOffset", 0))
-            card.leaf_count = Int(py=m.get("leafCount", 0))
-            card.viewed_leaf_count = Int(py=m.get("viewedLeafCount", 0))
-            var year_obj = m.get("year", 0)
-            if Int(py=year_obj) != 0:
-                card.year = Int(py=year_obj)
+            ref m = metadata[i]
+            var card = _card_from_metadata(m)
             items.append(card)
 
         var result = AudiobookResult()
@@ -678,7 +739,7 @@ def search_audiobooks(
         server_url, library_id, encoded_query
     )
 
-    var data: PythonObject
+    var data: Value
     try:
         data = _http_get(url, headers)
     except e:
@@ -694,15 +755,11 @@ def search_audiobooks(
             return result^
 
     try:
-        var container = data.get("MediaContainer", data)
-        var total_size_val = Int(
-            py=container.get(
-                "totalSize",
-                container.get("size", 0),
-            )
+        var container = _container_of(data^)
+        var total_size_val = _vint(
+            container, "totalSize", _vint(container, "size")
         )
-        var metadata = container.get("Metadata", Python.list())
-        metadata = _as_list(metadata)
+        var metadata = _vitems(container, "Metadata")
 
         # Client-side author fallback: if title= returned nothing, try
         # fetching a larger batch and filtering on title+author locally.
@@ -715,20 +772,7 @@ def search_audiobooks(
 
         var items = List[PlexBookCard]()
         for i in range(count):
-            var m = metadata[i]
-            var card = PlexBookCard()
-            card.rating_key = String(m["ratingKey"])
-            card.title = String(m["title"])
-            card.author = String(m["parentTitle"])
-            card.thumb = String(m.get("thumb", ""))
-            card.duration_ms = Int(py=m.get("duration", 0))
-            card.view_offset_ms = Int(py=m.get("viewOffset", 0))
-            card.leaf_count = Int(py=m.get("leafCount", 0))
-            card.viewed_leaf_count = Int(py=m.get("viewedLeafCount", 0))
-            var year_obj = m.get("year", 0)
-            if Int(py=year_obj) != 0:
-                card.year = Int(py=year_obj)
-            items.append(card)
+            items.append(_card_from_metadata(metadata[i]))
 
         result.total_size = total_size_val
         result.items = items^
@@ -761,7 +805,7 @@ def _search_by_author(
     headers["X-Plex-Container-Size"] = "500"
     var url = "{}/library/sections/{}/all?type=9".format(server_url, library_id)
 
-    var data: PythonObject
+    var data: Value
     try:
         data = _http_get(url, headers)
     except e:
@@ -773,12 +817,8 @@ def _search_by_author(
             return result^
 
     try:
-        var container = data.get("MediaContainer", data)
-        var metadata = container.get(
-            "Metadata",
-            Python.list(),
-        )
-        metadata = _as_list(metadata)
+        var container = _container_of(data^)
+        var metadata = _vitems(container, "Metadata")
 
         # Lowercase the query once (Mojo String.lower, no Python needed).
         var query_lower = query.lower()
@@ -786,9 +826,9 @@ def _search_by_author(
         var items = List[PlexBookCard]()
         var count = len(metadata)
         for i in range(count):
-            var m = metadata[i]
-            var title = String(m["title"])
-            var author = String(m["parentTitle"])
+            ref m = metadata[i]
+            var title = _vstr(m, "title")
+            var author = _vstr(m, "parentTitle")
             var title_lower = title.lower()
             var author_lower = author.lower()
             if (
@@ -796,18 +836,7 @@ def _search_by_author(
                 and author_lower.find(query_lower) < 0
             ):
                 continue
-            var card = PlexBookCard()
-            card.rating_key = String(m["ratingKey"])
-            card.title = title
-            card.author = author
-            card.thumb = String(m.get("thumb", ""))
-            card.duration_ms = Int(py=m.get("duration", 0))
-            card.view_offset_ms = Int(py=m.get("viewOffset", 0))
-            card.leaf_count = Int(py=m.get("leafCount", 0))
-            card.viewed_leaf_count = Int(py=m.get("viewedLeafCount", 0))
-            var year_obj = m.get("year", 0)
-            if Int(py=year_obj) != 0:
-                card.year = Int(py=year_obj)
+            var card = _card_from_metadata(m)
             items.append(card)
 
         result.total_size = len(items)
@@ -832,39 +861,31 @@ def get_book_detail(
     )
     var data = _http_get(url, headers)
 
-    var container = data.get("MediaContainer", data)
-    var metadata_list = container.get("Metadata", Python.list())
-    metadata_list = _as_list(metadata_list)
+    var container = _container_of(data^)
+    var metadata_list = _vitems(container, "Metadata")
     if len(metadata_list) == 0:
         return BookDetail()
 
-    var m = metadata_list[0]
+    ref m = metadata_list[0]
     var result = BookDetail()
-    result.rating_key = String(m["ratingKey"])
-    result.title = String(m["title"])
-    result.author = String(
-        m.get(
-            "parentTitle",
-            m.get("grandparentTitle", ""),
-        )
-    )
-    result.thumb = String(m.get("thumb", ""))
-    result.duration_ms = Int(py=m.get("duration", 0))
-    result.view_offset_ms = Int(py=m.get("viewOffset", 0))
-    result.leaf_count = Int(py=m.get("leafCount", 0))
-    result.viewed_leaf_count = Int(py=m.get("viewedLeafCount", 0))
-    var year_obj = m.get("year", 0)
-    if Int(py=year_obj) != 0:
-        result.year = Int(py=year_obj)
-    result.summary = String(m.get("summary", ""))
+    result.rating_key = _vstr(m, "ratingKey")
+    result.title = _vstr(m, "title")
+    result.author = _vstr(m, "parentTitle", _vstr(m, "grandparentTitle"))
+    result.thumb = _vstr(m, "thumb")
+    result.duration_ms = _vint(m, "duration")
+    result.view_offset_ms = _vint(m, "viewOffset")
+    result.leaf_count = _vint(m, "leafCount")
+    result.viewed_leaf_count = _vint(m, "viewedLeafCount")
+    var year = _vint(m, "year")
+    if year != 0:
+        result.year = year
+    result.summary = _vstr(m, "summary")
 
     # Genres
-    var genre_list = m.get("Genre", Python.list())
-    genre_list = _as_list(genre_list)
+    var genre_list = _vitems(m, "Genre")
     var gcount = len(genre_list)
     for i in range(gcount):
-        var g = genre_list[i]
-        result.genres.append(String(g.get("tag", "")))
+        result.genres.append(_vstr(genre_list[i], "tag"))
 
     # Chapters (from detail level — may be empty, filled later by get_track_chapters)
     result.chapters = List[PlexChapter]()
@@ -883,30 +904,27 @@ def get_book_tracks(
     var url = "{}/library/metadata/{}/children".format(server_url, book_id)
     var data = _http_get(url, headers)
 
-    var container = data.get("MediaContainer", data)
-    var metadata = container.get("Metadata", Python.list())
-    metadata = _as_list(metadata)
+    var container = _container_of(data^)
+    var metadata = _vitems(container, "Metadata")
 
     var tracks = List[PlexTrack]()
     var count = len(metadata)
     for i in range(count):
-        var m = metadata[i]
+        ref m = metadata[i]
         var track = PlexTrack()
-        track.rating_key = String(m["ratingKey"])
-        track.title = String(m["title"])
-        track.index = Int(py=m.get("index", 0))
-        track.duration_ms = Int(py=m.get("duration", 0))
-        track.view_offset_ms = Int(py=m.get("viewOffset", 0))
+        track.rating_key = _vstr(m, "ratingKey")
+        track.title = _vstr(m, "title")
+        track.index = _vint(m, "index")
+        track.duration_ms = _vint(m, "duration")
+        track.view_offset_ms = _vint(m, "viewOffset")
 
         # Extract file_key from Media > Part
         var file_key = ""
-        var media_list = m.get("Media", Python.list())
-        media_list = _as_list(media_list)
+        var media_list = _vitems(m, "Media")
         if len(media_list) > 0:
-            var parts = media_list[0].get("Part", Python.list())
-            parts = _as_list(parts)
+            var parts = _vitems(media_list[0], "Part")
             if len(parts) > 0:
-                file_key = String(parts[0]["key"])
+                file_key = _vstr(parts[0], "key")
         track.file_key = file_key
         tracks.append(track)
 
@@ -926,29 +944,26 @@ def get_track_chapters(
     )
     var data = _http_get(url, headers)
 
-    var container = data.get("MediaContainer", data)
-    var metadata_list = container.get("Metadata", Python.list())
-    metadata_list = _as_list(metadata_list)
+    var container = _container_of(data^)
+    var metadata_list = _vitems(container, "Metadata")
     if len(metadata_list) == 0:
         return List[PlexChapter]()
 
-    var m = metadata_list[0]
-    var chapters_raw = m.get(
-        "Chapter",
-        m.get("Chapters", Python.list()),
+    ref m = metadata_list[0]
+    var chapters_raw = _vitems(
+        m, "Chapter", default_items=_vitems(m, "Chapters")
     )
-    chapters_raw = _as_list(chapters_raw)
 
     var chapters = List[PlexChapter]()
     var count = len(chapters_raw)
     for i in range(count):
-        var c = chapters_raw[i]
+        ref c = chapters_raw[i]
         var chapter = PlexChapter()
-        chapter.id = Int(py=c.get("id", 0))
-        chapter.index = Int(py=c.get("index", 0))
-        chapter.tag = String(c.get("tag", ""))
-        chapter.start_time_ms = Int(py=c.get("startTimeOffset", 0))
-        chapter.end_time_ms = Int(py=c.get("endTimeOffset", 0))
+        chapter.id = _vint(c, "id")
+        chapter.index = _vint(c, "index")
+        chapter.tag = _vstr(c, "tag")
+        chapter.start_time_ms = _vint(c, "startTimeOffset")
+        chapter.end_time_ms = _vint(c, "endTimeOffset")
         chapter.is_current = False
         chapters.append(chapter)
     return chapters^
@@ -980,21 +995,19 @@ def get_collections(
     )
     var data = _http_get(url, headers)
 
-    var container = data.get("MediaContainer", data)
-    var directories = container.get(
-        "Directory",
-        container.get("Metadata", Python.list()),
+    var container = _container_of(data^)
+    var directories = _vitems(
+        container, "Directory", default_items=_vitems(container, "Metadata")
     )
-    directories = _as_list(directories)
 
     var collections = List[CollectionItem]()
     var count = len(directories)
     for i in range(count):
-        var d = directories[i]
+        ref d = directories[i]
         var item = CollectionItem()
-        item.rating_key = String(d["ratingKey"])
-        item.title = String(d["title"])
-        item.child_count = Int(py=d.get("childCount", 0))
+        item.rating_key = _vstr(d, "ratingKey")
+        item.title = _vstr(d, "title")
+        item.child_count = _vint(d, "childCount")
         collections.append(item)
     return collections^
 
@@ -1015,27 +1028,13 @@ def get_collection_books(
     )
     var data = _http_get(url, headers)
 
-    var container = data.get("MediaContainer", data)
-    var metadata = container.get("Metadata", Python.list())
-    metadata = _as_list(metadata)
+    var container = _container_of(data^)
+    var metadata = _vitems(container, "Metadata")
 
     var items = List[PlexBookCard]()
     var count = len(metadata)
     for i in range(count):
-        var m = metadata[i]
-        var card = PlexBookCard()
-        card.rating_key = String(m["ratingKey"])
-        card.title = String(m["title"])
-        card.author = String(m["parentTitle"])
-        card.thumb = String(m.get("thumb", ""))
-        card.duration_ms = Int(py=m.get("duration", 0))
-        card.view_offset_ms = Int(py=m.get("viewOffset", 0))
-        card.leaf_count = Int(py=m.get("leafCount", 0))
-        card.viewed_leaf_count = Int(py=m.get("viewedLeafCount", 0))
-        var year_obj = m.get("year", 0)
-        if Int(py=year_obj) != 0:
-            card.year = Int(py=year_obj)
-        items.append(card)
+        items.append(_card_from_metadata(metadata[i]))
     return items^
 
 
@@ -1058,6 +1057,13 @@ def get_playback_decision(
     """
     var headers = plex_headers(token=token, client_id=client_id)
 
+    # The universal decision endpoint only resolves when the request maps to
+    # a built-in server client profile (Chrome, Windows, Firefox, Safari...).
+    # Custom platform names (e.g. "Linux", "Quire") match no profile and PMS
+    # answers 400 "unable to find a matching profile". Override the platform
+    # for this request only — verified against PMS 1.43.3.
+    headers["X-Plex-Platform"] = "Chrome"
+
     # Native Mojo query params → URL query string (percent-encoded).
     var params = Dict[String, String]()
     params["path"] = track_path
@@ -1069,6 +1075,10 @@ def get_playback_decision(
     params["directStreamAudio"] = "1"
     params["musicBitrate"] = "256"
     params["peakBitrate"] = "256"
+    # mediaIndex/partIndex are required for the decision to resolve at all;
+    # without them PMS 400s regardless of headers.
+    params["mediaIndex"] = "0"
+    params["partIndex"] = "0"
     var query = String()
     var first = True
     for entry in params.items():
@@ -1077,66 +1087,50 @@ def get_playback_decision(
         first = False
         query += entry.key + "=" + _percent_encode(entry.value)
 
-    var url = (
-        server_url + "/audio/:/transcode/universal/decision?" + query + extra
-    )
+    var url = server_url + "/audio/:/transcode/universal/decision?" + query
 
-    var data: PythonObject
+    var data: Value
     try:
         data = _http_get(url, headers)
     except:
         return PlaybackDecision()
 
-    var container = data.get("MediaContainer", data)
-    var general_code = Int(py=container.get("generalDecisionCode", 0))
-    var direct_play_code = Int(py=container.get("directPlayDecisionCode", 0))
-    var transcode_code = Int(py=container.get("transcodeDecisionCode", 0))
+    var container = _container_of(data^)
+    var general_code = _vint(container, "generalDecisionCode")
+    var direct_play_code = _vint(container, "directPlayDecisionCode")
+    var transcode_code = _vint(container, "transcodeDecisionCode")
 
     var stream_url = ""
     var is_direct = direct_play_code == 1000
 
-    var metadata_list = container.get(
-        "Metadata",
-        container.get("Track", Python.list()),
+    var metadata_list = _vitems(
+        container, "Metadata", default_items=_vitems(container, "Track")
     )
-    metadata_list = _as_list(metadata_list)
 
     if len(metadata_list) > 0:
-        var media_list = metadata_list[0].get("Media", Python.list())
-        media_list = _as_list(media_list)
+        var media_list = _vitems(metadata_list[0], "Media")
         if len(media_list) > 0:
-            var selected_media = Python.none()
-            var mcount = len(media_list)
-            for i in range(mcount):
-                var media = media_list[i]
-                var sel = media.get("selected", 0)
-                if String(sel) == "1" or Bool(py=sel):
-                    selected_media = media
+            # First media flagged selected, else the first media.
+            var selected_media = media_list[0].copy()
+            for i in range(len(media_list)):
+                if _vtruthy(media_list[i], "selected"):
+                    selected_media = media_list[i].copy()
                     break
-            if not (selected_media == Python.none()):
-                selected_media = media_list[0]
 
-            if not (selected_media == Python.none()):
-                var parts = selected_media.get("Part", Python.list())
-                parts = _as_list(parts)
-                if len(parts) > 0:
-                    var selected_part = Python.none()
-                    var pcount = len(parts)
-                    for i in range(pcount):
-                        var part = parts[i]
-                        var sel = part.get("selected", 0)
-                        if String(sel) == "1" or Bool(py=sel):
-                            selected_part = part
-                            break
-                    if selected_part == Python.none():
-                        selected_part = parts[0]
+            var parts = _vitems(selected_media, "Part")
+            if len(parts) > 0:
+                # First part flagged selected, else the first part.
+                var selected_part = parts[0].copy()
+                for i in range(len(parts)):
+                    if _vtruthy(parts[i], "selected"):
+                        selected_part = parts[i].copy()
+                        break
 
-                    stream_url = String(selected_part["key"])
-                    if (
-                        stream_url.byte_length() > 0
-                        and not stream_url.startswith("http")
-                    ):
-                        stream_url = server_url + stream_url
+                stream_url = _vstr(selected_part, "key")
+                if stream_url.byte_length() > 0 and not stream_url.startswith(
+                    "http"
+                ):
+                    stream_url = server_url + stream_url
 
     var decision_code = general_code
     if decision_code == 0:
@@ -1201,7 +1195,7 @@ def start_play_queue(
         query += _percent_encode(entry.key) + "=" + _percent_encode(entry.value)
 
     var url = server_url + "/playQueues?" + query
-    var data: PythonObject
+    var data: Value
     try:
         data = _http_post_form(
             url, headers, Dict[String, String](), timeout=30.0
@@ -1209,24 +1203,22 @@ def start_play_queue(
     except:
         return PlayQueueResult()
 
-    var container = data.get("MediaContainer", data)
-    var pq_id = Int(py=container.get("playQueueID", 0))
-    var selected_item_id = Int(py=container.get("playQueueSelectedItemID", 0))
+    var container = _container_of(data^)
+    var pq_id = _vint(container, "playQueueID")
+    var selected_item_id = _vint(container, "playQueueSelectedItemID")
 
-    var metadata = container.get(
-        "Metadata",
-        container.get("PlayQueueItem", Python.list()),
+    var metadata = _vitems(
+        container, "Metadata", default_items=_vitems(container, "PlayQueueItem")
     )
-    metadata = _as_list(metadata)
 
     var items = List[PlayQueueItem]()
     var count = len(metadata)
     for i in range(count):
-        var m = metadata[i]
+        ref m = metadata[i]
         var item = PlayQueueItem()
-        item.rating_key = String(m["ratingKey"])
-        item.play_queue_item_id = Int(py=m.get("playQueueItemID", 0))
-        item.title = String(m["title"])
+        item.rating_key = _vstr(m, "ratingKey")
+        item.play_queue_item_id = _vint(m, "playQueueItemID")
+        item.title = _vstr(m, "title")
         items.append(item)
 
     var result = PlayQueueResult()
@@ -1349,13 +1341,22 @@ def load_cached_cover(
 
     Cache misses are normal (first view); errors are swallowed so a broken
     cache file can never block rendering — we just re-fetch.
+
+    Reads via native Path.read_bytes() — no Python file IO on the draw
+    path (the file may be tens of KB; the Python `open` round-trip cost a
+    full interpreter bootstrapping per call).
     """
     var path_str = _cover_cache_path(rating_key, width, height)
-    if not path.exists(Path(path_str)):
+    var p = Path(path_str)
+    if not path.exists(p):
         return List[UInt8]()
     try:
-        with open(path_str, "r") as f:
-            return f.read_bytes()
+        var raw = p.read_bytes()
+        var out = List[UInt8]()
+        out.reserve(len(raw))
+        for i in range(len(raw)):
+            out.append(raw[i])
+        return out^
     except e:
         print("[Quire] load_cached_cover error: " + String(e))
         return List[UInt8]()
@@ -1365,13 +1366,16 @@ def save_cached_cover(
     rating_key: String, width: Int, height: Int, data: List[UInt8]
 ) -> None:
     """Persist raw cover bytes to the cache. Best-effort: failures print
-    but never raise — a failed cache write just means a re-fetch later."""
+    but never raise — a failed cache write just means a re-fetch later.
+
+    Writes via native Path.write_bytes() (one syscall-shaped call, no
+    Python file object)."""
     if data.byte_length() == 0:
         return
     try:
         makedirs(Path(get_cover_cache_dir()), exist_ok=True)
-        with open(_cover_cache_path(rating_key, width, height), "w") as out:
-            out.write_bytes(Span[UInt8](data))
+        var out_path = Path(_cover_cache_path(rating_key, width, height))
+        out_path.write_bytes(Span[UInt8](data))
     except e:
         print("[Quire] save_cached_cover error: " + String(e))
 
@@ -1486,8 +1490,13 @@ def get_thumbnail_url(
 def fetch_thumbnail(url: String) raises -> List[UInt8]:
     """Fetch thumbnail image bytes from a URL.
 
-    Returns the raw response payload as a Python bytes object (JPEG or PNG —
-    the caller decodes with resources.imdecode), or None on error.
+    Returns the raw response payload (JPEG or PNG — the caller decodes with
+    resources.imdecode), or an empty list on error.
+
+    Byte transfer uses the bulk hex path: resp.content.hex() crosses the
+    Python boundary ONCE as a String, then Mojo parses 2 hex chars per byte
+    — ~10x faster than per-byte UInt8(py=resp.content[i]) round-trips, and
+    deterministic (the ctypes from_buffer route races the GC).
     """
     try:
         var httpx = Python.import_module("httpx")
@@ -1505,9 +1514,15 @@ def fetch_thumbnail(url: String) raises -> List[UInt8]:
         var data_len = Int(py=len(resp.content))
         if data_len == 0:
             return List[UInt8]()
-        var bytes_data: List[UInt8] = []
+        var hex_str = String(resp.content.hex())
+        var bytes_data = List[UInt8]()
+        bytes_data.reserve(data_len)
         for i in range(data_len):
-            bytes_data.append(UInt8(py=resp.content[i]))
+            var hi_code = ord(hex_str[byte=i * 2])
+            var lo_code = ord(hex_str[byte=i * 2 + 1])
+            var hi = hi_code - 48 if hi_code <= 57 else hi_code - 87
+            var lo = lo_code - 48 if lo_code <= 57 else lo_code - 87
+            bytes_data.append(UInt8(hi * 16 + lo))
         return bytes_data^
     except e:
         # DIAGNOSTIC: surface why thumbnail fetches fail.

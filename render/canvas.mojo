@@ -8,38 +8,48 @@
 #   fill_rect(x, y, w, h, color)       — draw_rectangle_rec
 #   fill_rect_rounded(..., roundness)  — draw_rectangle_rounded (AA edges)
 #   outline_rect_rounded(..., thick)   — draw_rectangle_rounded_lines_ex
-#   blit(pixels, src_w, src_h, dx, dy, dw, dh) — cover art scaled blit
+#   blit_rgba(...)                     — cover art scaled blit
 #   begin_clip / end_clip              — scissor stack
-#   blit_mask (glyphs, todo: text)     — alpha-masked color fill from 8-bit
+#   blit_mask (glyphs)                 — alpha-masked color fill from 8-bit
+#   draw_text / measure_text           — atlas text (borrowed atlas, no copies)
 #
-# Design: per-pixel span fills row-major with SIMD-friendly inner loops.
-# Colors arrive as Color (RGBA u8); stored as 4 bytes B,G,R,X per pixel.
+# Design: per-pixel span fills row-major. Colors arrive as Color (RGBA u8);
+# stored as 4 bytes B,G,R,X per pixel. Aligned span tails splat the color
+# word with one SIMD store per 16 pixels instead of a per-pixel store loop.
 
-from std.memory import stack_allocation
+from std.math import sqrt
 from std.memory.unsafe_pointer import Pointer
 
 from resources.color import Color
 
 # Text bridge types (glyph info + baked atlas from the FreeType shim).
-from platform.text import TextAtlas, GlyphInfo
+from platform.text import TextAtlas, CodepointInfo, decode_utf8
+
+# BGRX pixel word splat width: 16 UInt32 lanes = 16 px per SIMD store.
+comptime FILL_LANES = 16
+
 
 # ---------------------------------------------------------------------------
 # Color → bytes helpers
 # ---------------------------------------------------------------------------
 
 
-def _bgrx(c: Color) -> Int:
+def _bgrx(c: Color) -> UInt32:
     """Pack RGBA Color into the 4-byte BGRX little-endian word used by
     ARGB8888 shm buffers on x86_64."""
-    var b = Int(c.b) & 0xFF
-    var g = Int(c.g) & 0xFF
-    var r = Int(c.r) & 0xFF
+    var b = UInt32(c.b) & 0xFF
+    var g = UInt32(c.g) & 0xFF
+    var r = UInt32(c.r) & 0xFF
     # X = alpha channel slot; keep 0xFF so downstream tooling sees opaque
     return b | (g << 8) | (r << 16) | (0xFF << 24)
 
 
-def _alpha_channel(c: Color) -> Int:
-    return Int(c.a) & 0xFF
+def _splat(word: UInt32) -> SIMD[DType.uint32, FILL_LANES]:
+    """One color word replicated across the SIMD fill width."""
+    var splat = SIMD[DType.uint32, FILL_LANES]()
+    for lane in range(FILL_LANES):
+        splat[lane] = word
+    return splat
 
 
 # ---------------------------------------------------------------------------
@@ -47,27 +57,7 @@ def _alpha_channel(c: Color) -> Int:
 # ---------------------------------------------------------------------------
 
 
-def corner_dy_half(h: Float64, radius: Float64) -> Float64:
-    """Vertical distance from center Y to the top/bottom straight section."""
-    return h * 0.5 - radius
-
-
-def sqrt_approx(v: Float64) -> Float64:
-    """Newton-Raphson sqrt (no std.math.sqrt dependency check needed; this
-    converges in ~6 iterations for our range)."""
-    if v <= 0.0:
-        return 0.0
-    var x = v
-    var prev = 0.0
-    for _ in range(24):
-        prev = x
-        x = 0.5 * (x + v / x)
-        if (x - prev) < 0.000001 and (prev - x) < 0.000001:
-            break
-    return x
-
-
-struct ScissorEntry(Copyable, Movable):
+struct ScissorEntry(Copyable, ImplicitlyCopyable, Movable):
     var x: Int
     var y: Int
     var w: Int
@@ -78,12 +68,6 @@ struct ScissorEntry(Copyable, Movable):
         self.y = 0
         self.w = 0
         self.h = 0
-
-    def __copyinit__(mut self, existing: Self):
-        self.x = existing.x
-        self.y = existing.y
-        self.w = existing.w
-        self.h = existing.h
 
 
 struct Canvas(Copyable, Movable):
@@ -96,11 +80,9 @@ struct Canvas(Copyable, Movable):
     var height: Int
     var stride: Int
 
-    # clip stack (fixed depth — imui nesting is shallow: screens + panels)
-    var clip_x: List[Int]
-    var clip_y: List[Int]
-    var clip_w: List[Int]
-    var clip_h: List[Int]
+    # scissor clip stack — one List of ScissorEntry instead of four parallel
+    # Int lists, so a Canvas copy is one shallow COW List copy (not 4 rebuilds)
+    var clip_stack: List[ScissorEntry]
 
     def __init__(
         out self,
@@ -113,26 +95,15 @@ struct Canvas(Copyable, Movable):
         self.width = width
         self.height = height
         self.stride = stride
-        self.clip_x = List[Int]()
-        self.clip_y = List[Int]()
-        self.clip_w = List[Int]()
-        self.clip_h = List[Int]()
+        self.clip_stack = List[ScissorEntry]()
 
     def __copyinit__(mut self, existing: Self):
         self.buf = existing.buf
         self.width = existing.width
         self.height = existing.height
         self.stride = existing.stride
-        # Lists need rebuilds (they don't own the clipboard semantics we need)
-        self.clip_x = List[Int]()
-        self.clip_y = List[Int]()
-        self.clip_w = List[Int]()
-        self.clip_h = List[Int]()
-        for i in range(len(existing.clip_x)):
-            self.clip_x.append(existing.clip_x[i])
-            self.clip_y.append(existing.clip_y[i])
-            self.clip_w.append(existing.clip_w[i])
-            self.clip_h.append(existing.clip_h[i])
+        # COW shallow copy: entries are shared until one side mutates.
+        self.clip_stack = existing.clip_stack.copy()
 
     # ------------------------------------------------------------------
     # clipping
@@ -144,16 +115,17 @@ struct Canvas(Copyable, Movable):
         var cy = y
         var cw = w
         var ch = h
-        if len(self.clip_x) > 0:
-            var px = self.clip_x[len(self.clip_x) - 1]
-            var py = self.clip_y[len(self.clip_y) - 1]
-            var pw = self.clip_w[len(self.clip_w) - 1]
-            var ph = self.clip_h[len(self.clip_h) - 1]
+        if len(self.clip_stack) > 0:
+            var top = self.clip_stack[len(self.clip_stack) - 1]
             # intersect
-            var nx = cx if cx > px else px
-            var ny = cy if cy > py else py
-            var nx2 = (cx + cw) if (cx + cw) < (px + pw) else (px + pw)
-            var ny2 = (cy + ch) if (cy + ch) < (py + ph) else (py + ph)
+            var nx = cx if cx > top.x else top.x
+            var ny = cy if cy > top.y else top.y
+            var nx2 = (cx + cw) if (cx + cw) < (top.x + top.w) else (
+                top.x + top.w
+            )
+            var ny2 = (cy + ch) if (cy + ch) < (top.y + top.h) else (
+                top.y + top.h
+            )
             cx = nx
             cy = ny
             cw = nx2 - nx
@@ -162,43 +134,25 @@ struct Canvas(Copyable, Movable):
                 cw = 0
             if ch < 0:
                 ch = 0
-        self.clip_x.append(cx)
-        self.clip_y.append(cy)
-        self.clip_w.append(cw)
-        self.clip_h.append(ch)
+        var entry = ScissorEntry()
+        entry.x = cx
+        entry.y = cy
+        entry.w = cw
+        entry.h = ch
+        self.clip_stack.append(entry^)
 
     def end_clip(mut self):
-        if len(self.clip_x) > 0:
-            _ = self.clip_x.pop()
-            _ = self.clip_y.pop()
-            _ = self.clip_w.pop()
-            _ = self.clip_h.pop()
+        if len(self.clip_stack) > 0:
+            _ = self.clip_stack.pop()
 
-    def _clip_x(mut self) -> Int:
-        if len(self.clip_x) == 0:
-            return 0
-        return self.clip_x[len(self.clip_x) - 1]
-
-    def _clip_y(mut self) -> Int:
-        if len(self.clip_y) == 0:
-            return 0
-        return self.clip_y[len(self.clip_y) - 1]
-
-    def _clip_x2(mut self) -> Int:
-        if len(self.clip_w) == 0:
-            return self.width
-        return (
-            self.clip_x[len(self.clip_x) - 1]
-            + self.clip_w[len(self.clip_w) - 1]
-        )
-
-    def _clip_y2(mut self) -> Int:
-        if len(self.clip_h) == 0:
-            return self.height
-        return (
-            self.clip_y[len(self.clip_y) - 1]
-            + self.clip_h[len(self.clip_h) - 1]
-        )
+    def _clip(mut self) -> ScissorEntry:
+        """Current scissor rect; full canvas when the stack is empty."""
+        if len(self.clip_stack) == 0:
+            var full = ScissorEntry()
+            full.w = self.width
+            full.h = self.height
+            return full
+        return self.clip_stack[len(self.clip_stack) - 1]
 
     # ------------------------------------------------------------------
     # fills
@@ -224,52 +178,68 @@ struct Canvas(Copyable, Movable):
         var x1 = Int(fx + fw)
         var y1 = Int(fy + fh)
         # clip to window + scissor
-        if x0 < self._clip_x():
-            x0 = self._clip_x()
-        if y0 < self._clip_y():
-            y0 = self._clip_y()
-        if x1 > self._clip_x2():
-            x1 = self._clip_x2()
-        if y1 > self._clip_y2():
-            y1 = self._clip_y2()
+        var clip = self._clip()
+        if x0 < clip.x:
+            x0 = clip.x
+        if y0 < clip.y:
+            y0 = clip.y
+        if x1 > clip.x + clip.w:
+            x1 = clip.x + clip.w
+        if y1 > clip.y + clip.h:
+            y1 = clip.y + clip.h
         if x1 <= x0 or y1 <= y0:
             return
+        self._fill_rows(x0, x1, y0, y1, c)
 
+    def _fill_rows(mut self, x0: Int, x1: Int, y0: Int, y1: Int, c: Color):
+        """[x0, x1) × [y0, y1) solid fill, pre-clipped. Head pixels (until the
+        row address is 4-aligned) store byte-wise; the aligned tail splats
+        the color word 16 px per SIMD store."""
+        if x1 <= x0 or y1 <= y0:
+            return
         var word = _bgrx(c)
         var base_addr = Int(self.buf)
+        var splat = _splat(word)
+
         for yy in range(y0, y1):
             var row_addr = base_addr + self.stride * yy
-            # head: unaligned pixels until the address is 4-aligned
             var px = x0
-            var addr = row_addr + px * 4
-            var misalign = addr % 4
+            # head: unaligned pixels until the address is 4-aligned
+            var misalign = (row_addr + px * 4) % 4
             if misalign != 0:
-                var head = (4 - misalign) // 1  # bytes until aligned == pixels
+                # bytes until aligned == pixels (4 bytes per pixel)
+                var head = 4 - misalign
                 if head > (x1 - px):
                     head = x1 - px
-                for hh in range(head):
-                    self._store_px(px + hh, yy, word)
+                self._fill_span_bytes(px, px + head, yy, word)
                 px += head
-            # aligned word fill (UInt32 = exactly one BGRX pixel per store;
-            # Mojo Int is 8 bytes and would stomp the NEXT pixel's alpha to 0)
-            var uword = UInt32(word & 0xFFFFFFFF)
-            if px < x1:
+            # aligned 16-px SIMD fill, then scalar remainder
+            var remaining = x1 - px
+            if remaining > 0:
                 var wp = Pointer[UInt32, MutUntrackedOrigin](
                     unsafe_from_address=row_addr + px * 4
                 )
+                var bulk = remaining // FILL_LANES
+                for _b in range(bulk):
+                    wp.unsafe_store(offset=0, val=splat)
+                    wp = wp.unsafe_offset(FILL_LANES)
+                px += bulk * FILL_LANES
                 while px < x1:
-                    wp[unsafe_offset=0] = uword
+                    wp[unsafe_offset=0] = word
                     wp = wp.unsafe_offset(1)
                     px += 1
 
-    def _store_px(mut self, x: Int, y: Int, bgrx: Int):
-        """Single pixel store (caller ensures bounds). Word-safe split store."""
-        var addr = Int(self.buf) + self.stride * y + x * 4
-        var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)
-        p[unsafe_offset=0] = UInt8(bgrx & 0xFF)
-        p[unsafe_offset=1] = UInt8((bgrx >> 8) & 0xFF)
-        p[unsafe_offset=2] = UInt8((bgrx >> 16) & 0xFF)
-        p[unsafe_offset=3] = UInt8((bgrx >> 24) & 0xFF)
+    def _fill_span_bytes(mut self, x0: Int, x1: Int, y: Int, word: UInt32):
+        """Byte-wise store of a BGRX word for [x0, x1) on row y. Used for the
+        unaligned head of a span (caller ensures bounds)."""
+        var base_addr = Int(self.buf) + self.stride * y
+        for px in range(x0, x1):
+            var addr = base_addr + px * 4
+            var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)
+            p[unsafe_offset=0] = UInt8(word & 0xFF)
+            p[unsafe_offset=1] = UInt8((word >> 8) & 0xFF)
+            p[unsafe_offset=2] = UInt8((word >> 16) & 0xFF)
+            p[unsafe_offset=3] = UInt8((word >> 24) & 0xFF)
 
     def fill_rect_gradient(
         mut self,
@@ -281,8 +251,8 @@ struct Canvas(Copyable, Movable):
         bottom: Color,
     ):
         """Axis-aligned vertical gradient rect: `top` color at fy, `bottom`
-        at fy+fh, linearly interpolated per row. Not word-optimized (one
-        blend per row is negligible vs the per-pixel fill cost)."""
+        at fy+fh, linearly interpolated per row. One row-span fill per row
+        (no per-pixel fill_rect round-trip)."""
         if fw <= 0.0 or fh <= 0.0:
             return
         var x0 = Int(fx)
@@ -290,14 +260,15 @@ struct Canvas(Copyable, Movable):
         var x1 = Int(fx + fw)
         var y1 = Int(fy + fh)
         # clip to window + scissor
-        if x0 < self._clip_x():
-            x0 = self._clip_x()
-        if y0 < self._clip_y():
-            y0 = self._clip_y()
-        if x1 > self._clip_x2():
-            x1 = self._clip_x2()
-        if y1 > self._clip_y2():
-            y1 = self._clip_y2()
+        var clip = self._clip()
+        if x0 < clip.x:
+            x0 = clip.x
+        if y0 < clip.y:
+            y0 = clip.y
+        if x1 > clip.x + clip.w:
+            x1 = clip.x + clip.w
+        if y1 > clip.y + clip.h:
+            y1 = clip.y + clip.h
         if x1 <= x0 or y1 <= y0:
             return
 
@@ -310,18 +281,10 @@ struct Canvas(Copyable, Movable):
         var db = (Float64(bottom.b) - tb) / denom
         for yy in range(y0, y1):
             var t = Float64(yy - y0)
-            self.fill_rect(
-                Float64(x0),
-                Float64(yy),
-                Float64(x1 - x0),
-                1.0,
-                Color(
-                    UInt8(tr + dr * t),
-                    UInt8(tg + dg * t),
-                    UInt8(tb + db * t),
-                    255,
-                ),
+            var row_color = Color(
+                UInt8(tr + dr * t), UInt8(tg + dg * t), UInt8(tb + db * t), 255
             )
+            self._fill_rows(x0, x1, yy, yy + 1, row_color)
 
     # ------------------------------------------------------------------
     # rounded rects (solid + outline)
@@ -341,9 +304,7 @@ struct Canvas(Copyable, Movable):
         coverage feather on the corner arcs."""
         if fw <= 0.0 or fh <= 0.0:
             return
-        var x0 = Int(fx)
         var y0 = Int(fy)
-        var x1 = Int(fx + fw)
         var y1 = Int(fy + fh)
         var radius = roundness * 0.5 * (fw if fw < fh else fh)
         if radius <= 0.5:
@@ -356,60 +317,38 @@ struct Canvas(Copyable, Movable):
 
         var cx = fx + fw * 0.5
         var cy = fy + fh * 0.5
+        var half_w = fw * 0.5
+        var corner_dy = fh * 0.5 - radius
+        var clip = self._clip()
         for yy in range(y0, y1):
             # Per-row span: [row_x0, row_x1) inside the rounded shape
             var dy = (Float64(yy) + 0.5) - cy
-            var half_w = fw * 0.5
-            var corner_dy = (fh * 0.5) - radius
             var abs_dy = dy if dy >= 0.0 else -dy
             var inset = 0.0
-            if abs_dy > corner_dy_half(fh, radius):
+            if abs_dy > corner_dy:
                 # inside the vertical range governed by corner arcs
-                var dz = abs_dy - corner_dy_half(fh, radius)
+                var dz = abs_dy - corner_dy
                 var disc = radius * radius - dz * dz
                 if disc > 0.0:
-                    inset = radius - sqrt_approx(disc)
+                    inset = radius - sqrt(disc)
                 else:
                     continue  # row entirely outside the arcs
             var rx0 = Int(cx - half_w + inset)
             var rx1 = Int(cx + half_w - inset)
-            # clip row span, then reuse fill_rect for the span
-            if rx0 < self._clip_x():
-                rx0 = self._clip_x()
-            if rx1 > self._clip_x2():
-                rx1 = self._clip_x2()
-            if yy < self._clip_y() or yy >= self._clip_y2():
+            # clip row span, then fill it
+            if rx0 < clip.x:
+                rx0 = clip.x
+            if rx1 > clip.x + clip.w:
+                rx1 = clip.x + clip.w
+            if yy < clip.y or yy >= clip.y + clip.h:
                 continue
             if rx1 <= rx0:
                 continue
-            # inline span fill (fill_rect would re-clip rows — fine, call it)
-            self.fill_span(rx0, rx1, yy, c)
+            self._fill_rows(rx0, rx1, yy, yy + 1, c)
 
     def fill_span(mut self, x0: Int, x1: Int, y: Int, c: Color):
         """[x0, x1) solid span on row y, pre-clipped coords."""
-        if x1 <= x0 or y < 0 or y >= self.height:
-            return
-        var word = _bgrx(c)
-        var base_addr = Int(self.buf) + self.stride * y
-        var px = x0
-        var addr = base_addr + px * 4
-        var misalign = addr % 4
-        if misalign != 0:
-            var head = 4 - misalign
-            if head > (x1 - px):
-                head = x1 - px
-            for hh in range(head):
-                self._store_px(px + hh, y, word)
-            px += head
-        if px < x1:
-            var uword = UInt32(word & 0xFFFFFFFF)
-            var wp = Pointer[UInt32, MutUntrackedOrigin](
-                unsafe_from_address=base_addr + px * 4
-            )
-            while px < x1:
-                wp[unsafe_offset=0] = uword
-                wp = wp.unsafe_offset(1)
-                px += 1
+        self._fill_rows(x0, x1, y, y + 1, c)
 
     def outline_rect_rounded(
         mut self,
@@ -441,10 +380,11 @@ struct Canvas(Copyable, Movable):
 
         var y0 = Int(fy)
         var y1 = Int(fy + fh)
-        if y0 < self._clip_y():
-            y0 = self._clip_y()
-        if y1 > self._clip_y2():
-            y1 = self._clip_y2()
+        var clip = self._clip()
+        if y0 < clip.y:
+            y0 = clip.y
+        if y1 > clip.y + clip.h:
+            y1 = clip.y + clip.h
         var cx = fx + fw * 0.5
         var cy = fy + fh * 0.5
         var inner_left = fx + thickness
@@ -452,6 +392,8 @@ struct Canvas(Copyable, Movable):
         var inner_top = fy + thickness
         var inner_bottom = fy + fh - thickness
         var half_inner_h = inner_h * 0.5
+        var half_w = fw * 0.5
+        var corner_dy = fh * 0.5 - radius
 
         for yy in range(y0, y1):
             var dy = (Float64(yy) + 0.5) - cy
@@ -459,12 +401,12 @@ struct Canvas(Copyable, Movable):
 
             # outer span inset
             var outer_inset = 0.0
-            if abs_dy > (fh * 0.5) - radius:
-                var dz = abs_dy - ((fh * 0.5) - radius)
+            if abs_dy > corner_dy:
+                var dz = abs_dy - corner_dy
                 var disc = radius * radius - dz * dz
                 if disc <= 0.0:
                     continue
-                outer_inset = radius - sqrt_approx(disc)
+                outer_inset = radius - sqrt(disc)
 
             # inner hole span
             var in_hole = False
@@ -479,7 +421,7 @@ struct Canvas(Copyable, Movable):
                         var dz2 = abs_idy - (half_inner_h - inner_radius)
                         var disc2 = inner_radius * inner_radius - dz2 * dz2
                         if disc2 > 0.0:
-                            var inset_i = inner_radius - sqrt_approx(disc2)
+                            var inset_i = inner_radius - sqrt(disc2)
                             hole_x0 = Int(inner_left + inset_i)
                             hole_x1 = Int(inner_right - inset_i)
                             in_hole = True
@@ -493,22 +435,21 @@ struct Canvas(Copyable, Movable):
                     in_hole = True
 
             # outer row extent
-            var half_w = fw * 0.5
             var rx0 = Int(cx - half_w + outer_inset)
             var rx1 = Int(cx + half_w - outer_inset)
-            if rx0 < self._clip_x():
-                rx0 = self._clip_x()
-            if rx1 > self._clip_x2():
-                rx1 = self._clip_x2()
+            if rx0 < clip.x:
+                rx0 = clip.x
+            if rx1 > clip.x + clip.w:
+                rx1 = clip.x + clip.w
             if rx1 <= rx0:
                 continue
             if not in_hole:
-                self.fill_span(rx0, rx1, yy, c)
+                self._fill_rows(rx0, rx1, yy, yy + 1, c)
             else:
                 if hole_x0 > rx0:
-                    self.fill_span(rx0, hole_x0, yy, c)
+                    self._fill_rows(rx0, hole_x0, yy, yy + 1, c)
                 if rx1 > hole_x1:
-                    self.fill_span(hole_x1, rx1, yy, c)
+                    self._fill_rows(hole_x1, rx1, yy, yy + 1, c)
 
     # ------------------------------------------------------------------
     # blits
@@ -537,20 +478,23 @@ struct Canvas(Copyable, Movable):
         var dy0 = Int(dy)
         var dx1 = Int(dx + dw)
         var dy1 = Int(dy + dh)
-        if dx0 < self._clip_x():
-            dx0 = self._clip_x()
-        if dy0 < self._clip_y():
-            dy0 = self._clip_y()
-        if dx1 > self._clip_x2():
-            dx1 = self._clip_x2()
-        if dy1 > self._clip_y2():
-            dy1 = self._clip_y2()
+        var clip = self._clip()
+        if dx0 < clip.x:
+            dx0 = clip.x
+        if dy0 < clip.y:
+            dy0 = clip.y
+        if dx1 > clip.x + clip.w:
+            dx1 = clip.x + clip.w
+        if dy1 > clip.y + clip.h:
+            dy1 = clip.y + clip.h
         if dx1 <= dx0 or dy1 <= dy0:
             return
         var x_ratio = Float64(src_w) / dw
         var y_ratio = Float64(src_h) / dh
+        var dx_int = Int(dx)
+        var dy_int = Int(dy)
         for yy in range(dy0, dy1):
-            var sy = Int((Float64(yy - Int(dy)) + 0.5) * y_ratio)
+            var sy = Int((Float64(yy - dy_int) + 0.5) * y_ratio)
             if sy >= src_h:
                 sy = src_h - 1
             if sy < 0:
@@ -558,7 +502,7 @@ struct Canvas(Copyable, Movable):
             var src_row = src.unsafe_offset(sy * src_stride)
             var dst_row = self.buf.unsafe_offset(yy * self.stride)
             for xx in range(dx0, dx1):
-                var sx = Int((Float64(xx - Int(dx)) + 0.5) * x_ratio)
+                var sx = Int((Float64(xx - dx_int) + 0.5) * x_ratio)
                 if sx >= src_w:
                     sx = src_w - 1
                 if sx < 0:
@@ -580,44 +524,63 @@ struct Canvas(Copyable, Movable):
         c: Color,
     ):
         """Glyph blit: mask = 1 byte per pixel coverage (0..255), blended
-        over the destination with the tint color."""
+        over the destination with the tint color.
+
+        Rows and spans are pre-clipped once per row (not per pixel): fully
+        clipped rows are skipped, partially clipped rows narrow their span
+        and advance the mask pointer past the clipped columns."""
+        if mw <= 0 or mh <= 0:
+            return
+        var clip = self._clip()
+        # word of the tint color + its byte lanes (B, G, R)
         var word = _bgrx(c)
-        var cr = UInt8(word & 0xFF)
-        var cg = UInt8((word >> 8) & 0xFF)
-        var cb = UInt8((word >> 16) & 0xFF)
+        var cb = Int(word & 0xFF)
+        var cg = Int((word >> 8) & 0xFF)
+        var cr = Int((word >> 16) & 0xFF)
+        # horizontal pre-clip: narrow [sx0, sx1) and shift the mask origin
+        var sx0 = dx if dx > clip.x else clip.x
+        var sx1 = (dx + mw) if (dx + mw) < (clip.x + clip.w) else (
+            clip.x + clip.w
+        )
+        if sx1 <= sx0:
+            return
+        var mask_skip = sx0 - dx
         for yy in range(mh):
             var py = dy + yy
-            if py < self._clip_y() or py >= self._clip_y2():
+            if py < clip.y or py >= clip.y + clip.h:
                 continue
-            for xx in range(mw):
-                var px = dx + xx
-                if px < self._clip_x() or px >= self._clip_x2():
-                    continue
-                var cov = Int(mask[unsafe_offset=yy * mw + xx])
+            var dst_addr = Int(self.buf) + self.stride * py + sx0 * 4
+            var dp = Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=dst_addr
+            )
+            var mp = mask.unsafe_offset(yy * mw + mask_skip)
+            for _ in range(sx0, sx1):
+                var cov = Int(mp[unsafe_offset=0])
+                mp = mp.unsafe_offset(1)
                 if cov == 0:
+                    dp = dp.unsafe_offset(4)
                     continue
                 if cov >= 255:
-                    self._store_px(px, py, word)
+                    dp[unsafe_offset=0] = UInt8(cb)
+                    dp[unsafe_offset=1] = UInt8(cg)
+                    dp[unsafe_offset=2] = UInt8(cr)
                 else:
                     # blend: dst = src*cov + dst*(1-cov) per channel
-                    var addr = Int(self.buf) + self.stride * py + px * 4
-                    var dp = Pointer[UInt8, MutUntrackedOrigin](
-                        unsafe_from_address=addr
-                    )
                     var inv = 255 - cov
                     dp[unsafe_offset=0] = UInt8(
-                        (Int(cr) * cov + Int(dp[unsafe_offset=0]) * inv) // 255
+                        (cb * cov + Int(dp[unsafe_offset=0]) * inv) // 255
                     )
                     dp[unsafe_offset=1] = UInt8(
-                        (Int(cg) * cov + Int(dp[unsafe_offset=1]) * inv) // 255
+                        (cg * cov + Int(dp[unsafe_offset=1]) * inv) // 255
                     )
                     dp[unsafe_offset=2] = UInt8(
-                        (Int(cb) * cov + Int(dp[unsafe_offset=2]) * inv) // 255
+                        (cr * cov + Int(dp[unsafe_offset=2]) * inv) // 255
                     )
+                dp = dp.unsafe_offset(4)
 
     def draw_text(
         mut self,
-        mut atlas: TextAtlas,
+        atlas: Pointer[TextAtlas, MutUntrackedOrigin],
         text: String,
         fx: Float64,
         fy: Float64,
@@ -626,74 +589,50 @@ struct Canvas(Copyable, Movable):
         """Draw text with a baked atlas. (fx, fy) is the BASELINE origin in
         pixels — the caller positions baselines; metrics live in the atlas.
 
+        The atlas is BORROWED through a pointer (no per-call struct copy).
         Iterates UTF-8 CODEPOINTS, not bytes: multi-byte glyphs (Nerd Font
         PUA icons at U+F0000+) must resolve as one glyph, not per byte."""
         var pen_x = Int(fx)
         var baseline = Int(fy)
-        var text_mut = String(text)
-        var bytes = text_mut.as_bytes()
-        var i = 0
+        var bytes = text.as_bytes()
         var n = len(bytes)
+        var i = 0
         while i < n:
-            var b = bytes[i]
-            # Widen to Int32 BEFORE shifting: UInt8 shift-or wraps 8-bit and
-            # destroys multi-byte codepoints (3 << 18 == 0 in 8-bit).
-            var cp = Int32(b)
-            var seq = 1
-            if b >= 0xF0:
-                # 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-                cp = Int32(b & 0x07)
-                cp <<= 18
-                if i + 1 < n:
-                    cp |= Int32(bytes[i + 1] & 0x3F) << 12
-                if i + 2 < n:
-                    cp |= Int32(bytes[i + 2] & 0x3F) << 6
-                if i + 3 < n:
-                    cp |= Int32(bytes[i + 3] & 0x3F)
-                seq = 4
-            elif b >= 0xE0:
-                cp = Int32(b & 0x0F)
-                cp <<= 12
-                if i + 1 < n:
-                    cp |= Int32(bytes[i + 1] & 0x3F) << 6
-                if i + 2 < n:
-                    cp |= Int32(bytes[i + 2] & 0x3F)
-                seq = 3
-            elif b >= 0xC0:
-                cp = Int32(b & 0x1F)
-                cp <<= 6
-                if i + 1 < n:
-                    cp |= Int32(bytes[i + 1] & 0x3F)
-                seq = 2
-            # else: ASCII, cp = b, seq = 1
-
-            var advance: Int = Int(atlas.pixel_size // 2)
+            var info = decode_utf8(bytes, i, n)
+            var cp = info.cp
+            var advance: Int = Int(atlas[unsafe_offset=0].pixel_size // 2)
             if cp == 32:
-                advance = Int(atlas.pixel_size // 3)
+                advance = Int(atlas[unsafe_offset=0].pixel_size // 3)
             else:
-                var idx = atlas.find_glyph(cp)
+                var idx = atlas[unsafe_offset=0].find_glyph(cp)
                 if idx >= 0:
-                    var g = atlas.glyphs[idx].copy()
+                    var g = atlas[unsafe_offset=0].glyphs[idx].copy()
                     advance = Int(g.advance_px)
                     if g.bitmap_w > 0 and g.bitmap_h > 0:
+                        # glyph mask rows live inside the atlas mask buffer;
+                        # address them directly — no per-row pointer churn
+                        var mask_base = Int(atlas[unsafe_offset=0].mask.value())
+                        var row_origin = (
+                            mask_base
+                            + Int(g.bitmap_x)
+                            + Int(g.bitmap_y)
+                            * Int(atlas[unsafe_offset=0].atlas_w)
+                        )
+                        var gx = pen_x + Int(g.bearing_x)
+                        var gy = baseline - Int(g.bearing_y)
+                        var glyph_w = Int(g.bitmap_w)
+                        var atlas_stride = Int(atlas[unsafe_offset=0].atlas_w)
                         for yy in range(Int(g.bitmap_h)):
                             var row_ptr = Pointer[UInt8, MutUntrackedOrigin](
-                                unsafe_from_address=Int(atlas.mask.value())
-                                + Int(g.bitmap_x)
-                                + (Int(g.bitmap_y) + yy) * Int(atlas.atlas_w)
+                                unsafe_from_address=row_origin
+                                + yy * atlas_stride
                             )
-                            self.blit_mask(
-                                row_ptr,
-                                Int(g.bitmap_w),
-                                1,
-                                pen_x + Int(g.bearing_x),
-                                baseline - Int(g.bearing_y) + yy,
-                                c,
-                            )
+                            self.blit_mask(row_ptr, glyph_w, 1, gx, gy + yy, c)
             pen_x += advance
-            i += seq
+            i += info.seq
 
-    def measure_text(mut self, mut atlas: TextAtlas, text: String) -> Int:
+    def measure_text(
+        mut self, atlas: Pointer[TextAtlas, MutUntrackedOrigin], text: String
+    ) -> Int:
         """Advance-width of text in pixels (mirrors atlas.text_width)."""
-        var text_mut = String(text)
-        return atlas.text_width(text_mut)
+        return atlas[unsafe_offset=0].text_width(text)

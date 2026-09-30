@@ -2,7 +2,7 @@
 # Flow: connect -> wl_display_get_registry -> registry_listen ->
 #       dispatch -> pop REGISTRY_GLOBAL_OP events -> print globals ->
 #       roundtrip -> disconnect
-from std.ffi import CStringSlice
+from std.ffi import CStringSpan
 from wayland.core import (
     WLPtr,
     WLArgument,
@@ -33,7 +33,7 @@ def arg_as_string(a: WLArgument) -> String:
     for i in range(8):
         addr = addr | (Int(a.raw[i]) << (8 * i))
     var ptr = Pointer[Int8, MutAnyOrigin](unsafe_from_address=addr)
-    return String(CStringSlice(unsafe_from_ptr=ptr))
+    return String(CStringSpan(unsafe_from_ptr=ptr))
 
 
 def arg_as_cptr(a: WLArgument) -> Pointer[Int8, MutAnyOrigin]:

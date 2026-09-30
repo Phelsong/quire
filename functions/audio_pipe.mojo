@@ -25,7 +25,6 @@ from std.memory.unsafe_pointer import Pointer
 from std.collections import List
 
 from functions.helpers import _is_executable, _which, _shell_quote
-from platform.ffi import cstr
 
 # Must match load_audio_stream() args on the player side.
 comptime SAMPLE_RATE = 44100
@@ -68,25 +67,35 @@ struct HttpHeader(Copyable, ImplicitlyCopyable, Movable):
 
 
 struct ChunkResult(Copyable, ImplicitlyCopyable, Movable):
-    """Result of read_chunk(): buffer address + frames filled.
+    """Result of read_chunk(): PCM bytes + frames filled.
 
-    address==0 / frame_count==0 means no data ready (EAGAIN) or pipe stopped.
+    The buffer pointer is typed (Float32 stereo-interleaved PCM) — callers
+    can't forge an address or lose the type across module boundaries.
+    has_data() is the guard: a no-data result carries a dangling pointer
+    that MUST NOT be read, and has_data() is the only correct way to check.
     """
 
-    var address: Int
+    var samples: Pointer[Float32, MutUntrackedOrigin]  # f32 stereo PCM
     var frame_count: Int
 
     def __init__(out self):
-        self.address = 0
+        self.samples = Pointer[Float32, MutUntrackedOrigin].unsafe_dangling()
         self.frame_count = 0
 
     def __init__(out self, *, copy: Self):
-        self.address = copy.address
+        self.samples = copy.samples
         self.frame_count = copy.frame_count
 
-    def __init__(out self, address: Int, frame_count: Int):
-        self.address = address
+    def __init__(
+        out self,
+        samples: Pointer[Float32, MutUntrackedOrigin],
+        frame_count: Int,
+    ):
+        self.samples = samples
         self.frame_count = frame_count
+
+    def has_data(self) -> Bool:
+        return self.frame_count > 0
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +197,7 @@ struct AudioPipe:
       start(source, seek_s, speed, is_local, headers) -> Bool
       read_chunk() -> ChunkResult
           Reads one chunk of PCM into the persistent buffer and returns
-          (address, frames). address==0 / frames==0 means no data ready.
+          typed samples + frames. has_data()==False means no data ready.
       restart(seek_s, speed) -> Bool
           Kill + respawn (for speed/seek changes; atempo needs a fresh proc).
       stop()
@@ -302,7 +311,7 @@ struct AudioPipe:
           - n == 0, ferror == 1, feof == 0: EAGAIN, no data this frame.
         """
         if not self.running:
-            return ChunkResult(0, 0)
+            return ChunkResult()
 
         # Clear any sticky error/EOF flag from a previous EAGAIN so this read
         # can surface fresh state.
@@ -327,15 +336,14 @@ struct AudioPipe:
                     n_bytes = CHUNK_BYTES
                 var frame_count = n_bytes // (CHANNELS * (SAMPLE_SIZE // 8))
                 self.frames_output += frame_count
-                var addr = Int(self.buffer)
-                return ChunkResult(addr, frame_count)
-            return ChunkResult(0, 0)
+                return ChunkResult(self.pcm_samples(), frame_count)
+            return ChunkResult()
 
         # EAGAIN (or transient error) with no data — retry next frame.
         if n_bytes == 0:
             # ferror is set from the non-blocking probe hitting EAGAIN; the
             # next read_chunk clears it via clearerr above.
-            return ChunkResult(0, 0)
+            return ChunkResult()
 
         # Got data (ferror may also be 1 from a trailing EAGAIN probe — harmless).
         if n_bytes > CHUNK_BYTES:
@@ -343,8 +351,11 @@ struct AudioPipe:
 
         var frame_count = n_bytes // (CHANNELS * (SAMPLE_SIZE // 8))
         self.frames_output += frame_count
-        var addr = Int(self.buffer)
-        return ChunkResult(addr, frame_count)
+        return ChunkResult(self.pcm_samples(), frame_count)
+
+    def pcm_samples(self) -> Pointer[Float32, MutUntrackedOrigin]:
+        """The persistent buffer, typed as f32 stereo-interleaved samples."""
+        return self.buffer.unsafe_bitcast[Float32]()
 
     def get_buffer_address(self) -> Int:
         """Return the persistent buffer's C address (for diagnostics)."""
@@ -421,7 +432,7 @@ struct AudioPipe:
         var cmd = String(cmd_str)
         var mode = String("r")
         try:
-            self.fp = popen(cstr(cmd), cstr(mode))
+            self.fp = popen(cmd.as_c_string_span(), mode.as_c_string_span())
         except:
             self.running = False
             self.fd = -1

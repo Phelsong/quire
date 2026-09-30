@@ -1,4 +1,3 @@
-from std.python import Python
 from std.time import perf_counter
 from std.memory import alloc, Layout
 from std.logger import Logger, Level
@@ -29,14 +28,13 @@ from resources.palette import (
     GREEN,
     ERROR_COLOR,
 )
-
+from resources.plex_objects import LibraryItem, ServerItem
+from render.imui import UIContext
 from ui import Screen
 from ui.font import FontSet
-from ui.imui import UIContext
 from ui.library_screen import LibraryScreen
 from ui.login_screen import LoginScreen
 from ui.player_screen import PlayerScreen
-from ui.plex_objects import LibraryItem, ServerItem
 from ui.selection_screen import SelectionScreen
 from ui.settings_screen import SettingsScreen
 
@@ -48,6 +46,7 @@ comptime SCREEN_H = 1000  # Default window height (logical pixels)
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def main() raises:
     # Audio is handled by the native AudioBackend (pa_simple via libpulse);
@@ -61,13 +60,6 @@ def main() raises:
     logger.info("window opened")
     var cur_w = win.frame.width
     var cur_h = win.frame.height
-
-    # Suppress urllib3 InsecureRequestWarning (we verify=False for self-hosted servers)
-    try:
-        var urllib3 = Python.import_module("urllib3")
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    except:
-        pass  # Non-critical — warning just clutters output
 
     # Build ASCII lookup table for character input
     var ascii = AsciiTable()

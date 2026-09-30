@@ -8,11 +8,18 @@
 #   - window.poll() -> Bool               : dispatch events; False = close
 #   - window.close()                      : munmap + disconnect
 #
-from std.ffi import external_call, CStringSlice
+from std.ffi import external_call, CStringSpan
 from std.ffi import c_int
+from std.memory import Layout
+from std.memory.unsafe_pointer import Pointer
 
-from platform.ffi import c_null as _null
-from platform.ffi import heap_malloc as _malloc
+from platform.ffi import (
+    c_null as _null,
+    heap_malloc as _malloc,
+    c_close,
+    c_munmap,
+    c_ftruncate,
+)
 
 from wayland.core import (
     WLPtr,
@@ -116,18 +123,6 @@ def _mmap(
     )
 
 
-def _munmap(addr: WLPtr, length: Int):
-    _ = external_call["munmap", Int32](addr, UInt64(length))
-
-
-def _close(fd: Int32):
-    _ = external_call["close", Int32](fd)
-
-
-def _ftruncate(fd: Int32, length: Int) -> Int32:
-    return external_call["ftruncate", Int32](fd, Int64(length))
-
-
 struct PollFd(Copyable, ImplicitlyCopyable, Movable):
     """libc struct pollfd (linux x86_64: int fd; short events; short revents).
     """
@@ -143,12 +138,17 @@ struct PollFd(Copyable, ImplicitlyCopyable, Movable):
 
 
 def _cptr(s: String) -> Pointer[Int8, MutUntrackedOrigin]:
-    """NUL-terminated heap copy of a Mojo String (leaked — process lifetime)."""
+    """NUL-terminated heap copy of a Mojo String (leaked — process lifetime).
+
+    Uses alloc() rather than malloc: the copy is never freed, so its
+    allocator just has to fail-fast on OOM (alloc aborts) — and this keeps
+    the helper non-raising for its Int32-returning callers.
+    """
     var tmp: String = s
-    var cs = tmp.as_c_string_slice()
+    var cs = tmp.as_c_string_span()
     var n = len(cs)
     var buf = Pointer[Int8, MutUntrackedOrigin](
-        unsafe_from_address=Int(_malloc(Int(n) + 1))
+        unsafe_from_address=Int(alloc(Layout[UInt8](count=n + 1)).unsafe_leak())
     )
     var bytes = tmp.as_bytes()
     for i in range(len(bytes)):
@@ -166,7 +166,7 @@ def _arg_as_string(a: WLArgument) -> String:
     for i in range(8):
         addr = addr | (Int(a.raw[i]) << (8 * i))
     var ptr = Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=addr)
-    return String(CStringSlice(unsafe_from_ptr=ptr))
+    return String(CStringSpan(unsafe_from_ptr=ptr))
 
 
 def _arg_as_u32(a: WLArgument) -> UInt32:
@@ -401,9 +401,15 @@ struct Frame(Copyable, Movable):
             raise Error("wayland: memfd_create failed")
         var stride = width * 4
         var size = stride * height
-        _ = _ftruncate(fd, size)
+        _ = c_ftruncate(fd, size)
         var pixels = _mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-        if Int(pixels) == 0:
+        # mmap signals failure with MAP_FAILED = (void*)-1, NOT a null
+        # pointer — the null check everyone reaches for here never fires
+        # and a failed mmap would segfault on the first pixel write.
+        if Int(pixels) == -1:
+            # mmap failed: the memfd is still ours — close it before raising,
+            # or every failed resize leaks an fd.
+            c_close(fd)
             raise Error("wayland: mmap failed")
         var pool = wl_shm_create_pool(shm, fd, Int32(size))
         var buffer = wl_shm_pool_create_buffer(
@@ -414,7 +420,7 @@ struct Frame(Copyable, Movable):
             Int32(stride),
             SHM_FORMAT_ARGB8888,
         )
-        _close(fd)
+        c_close(fd)
         var frame = Frame()
         frame.fd = -1  # fd consumed by the pool; munmap data on close only
         frame.pool = pool
@@ -663,7 +669,7 @@ struct Window(Copyable, Movable):
         # the client: "attached a buffer before configure event").
         var sargs = stack_allocation[MAX_EVENT_ARGS, WLArgument]()
         var serial: UInt32 = 0
-        for round in range(50):
+        for _ in range(50):
             while xdg_surface_next_configure(xs_queue, sargs):
                 serial = _arg_as_u32(sargs[unsafe_offset=0])
             if serial != 0:
@@ -761,7 +767,7 @@ struct Window(Copyable, Movable):
         # that set pending_resize — roundtrip-wait for the serial (attaching
         # before the surface configure is a fatal xdg-shell error).
         var sargs = stack_allocation[MAX_EVENT_ARGS, WLArgument]()
-        for round in range(50):
+        for _ in range(50):
             while xdg_surface_next_configure(self.xs_queue, sargs):
                 self.xdg_ack_configure_serial = _arg_as_u32(
                     sargs[unsafe_offset=0]
@@ -953,10 +959,10 @@ struct Window(Copyable, Movable):
 
     def close(mut self):
         if Int(self.frame.data) != 0:
-            _munmap(self.frame.data, self.frame.size)
+            c_munmap(self.frame.data, self.frame.size)
             self.frame.data = _null[NoneType]()
         if Int(self.back.data) != 0:
-            _munmap(self.back.data, self.back.size)
+            c_munmap(self.back.data, self.back.size)
             self.back.data = _null[NoneType]()
         if Int(self.display) != 0:
             wl_display_disconnect(self.display)

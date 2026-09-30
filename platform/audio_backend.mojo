@@ -19,10 +19,7 @@ from std.time import sleep
 
 from functions.mutex import Mutex
 
-from platform.ffi import c_null as _null
-from platform.ffi import cstr
-from platform.ffi import heap_malloc
-from platform.ffi import heap_free_byte
+from platform.ffi import c_null as _null, cstr, heap_malloc, heap_free_byte
 
 # --- PulseAudio constants (pulse/def.h, sample.h) ---
 comptime PA_STREAM_PLAYBACK = 1
@@ -243,7 +240,12 @@ struct AudioBackend(Copyable, Movable):
         # pa_simple_new expects a POINTER to pa_sample_spec; passing by-value
         # pushes struct bytes into the arg register where libpulse
         # dereferences it (pa_sample_spec_valid segfault — see ab_smoke saga).
-        var spec_mem = heap_malloc(12).unsafe_bitcast[PaSampleSpec]()
+        var spec_mem: Pointer[PaSampleSpec, MutUntrackedOrigin]
+        try:
+            spec_mem = heap_malloc(12).unsafe_bitcast[PaSampleSpec]()
+        except e:
+            # OOM in a 12-byte malloc: nothing to tear down yet.
+            return False
         spec_mem.unsafe_write(
             PaSampleSpec(PA_SAMPLE_FLOAT32LE, SAMPLE_RATE, CHANNELS)
         )
@@ -263,26 +265,40 @@ struct AudioBackend(Copyable, Movable):
             _null[NoneType](),  # error
         )
         if Int(stream) == 0:
+            heap_free_byte(spec_mem.unsafe_bitcast[Byte]())
+            return False
+        # libpulse copies the sample spec during pa_simple_new; free our copy.
+        heap_free_byte(spec_mem.unsafe_bitcast[Byte]())
+
+        var ring: Pointer[Byte, MutUntrackedOrigin]
+        var sh_mem: Pointer[BackendShared, MutUntrackedOrigin]
+        var tid: Pointer[UInt64, MutUntrackedOrigin]
+        try:
+            ring = heap_malloc(RING_BYTES).unsafe_bitcast[Byte]()
+
+            # BackendShared owns the mutex; move-construct it onto the heap so
+            # both threads reach it through sh_mem. HEAP-allocation is
+            # mandatory: stack_allocation memory lives in create()'s frame and
+            # is clobbered once create() returns (the original writer-thread
+            # segfault).
+            var shared = BackendShared(stream, ring)
+            sh_mem = heap_malloc(SIZEOF_BACKEND_SHARED).unsafe_bitcast[
+                BackendShared
+            ]()
+            sh_mem.unsafe_write(shared^)
+
+            self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]](
+                sh_mem
+            )
+
+            # pthread_t buffer must outlive create() too (close() joins it).
+            tid = heap_malloc(8).unsafe_bitcast[UInt64]()
+        except e:
+            # OOM: release the pulse stream (the only resource acquired so
+            # far); nothing else has been handed to the writer thread.
+            external_call["pa_simple_free", NoneType](stream)
             return False
 
-        var ring = heap_malloc(RING_BYTES).unsafe_bitcast[Byte]()
-
-        # BackendShared owns the mutex; move-construct it onto the heap so
-        # both threads reach it through sh_mem. HEAP-allocation is mandatory:
-        # stack_allocation memory lives in create()'s frame and is clobbered
-        # once create() returns (the original writer-thread segfault).
-        var shared = BackendShared(stream, ring)
-        var sh_mem = heap_malloc(SIZEOF_BACKEND_SHARED).unsafe_bitcast[
-            BackendShared
-        ]()
-        sh_mem.unsafe_write(shared^)
-
-        self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]](
-            sh_mem
-        )
-
-        # pthread_t buffer must outlive create() too (close() joins it).
-        var tid = heap_malloc(8).unsafe_bitcast[UInt64]()
         var rc = external_call["pthread_create", Int32](
             tid,
             _null[NoneType](),
@@ -294,6 +310,7 @@ struct AudioBackend(Copyable, Movable):
             sh_mem[unsafe_offset=0].state.close()
             heap_free_byte(sh_mem.unsafe_bitcast[Byte]())
             heap_free_byte(ring)
+            heap_free_byte(tid.unsafe_bitcast[Byte]())
             self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]]()
             return False
 
@@ -390,11 +407,9 @@ struct AudioBackend(Copyable, Movable):
             )
             return free >= DRAIN_FRAMES * BYTES_PER_FRAME
 
-    def write_pcm(
-        self, src: Pointer[NoneType, MutUntrackedOrigin], frames: Int
-    ):
+    def write_pcm(self, src: Pointer[Float32, MutUntrackedOrigin], frames: Int):
         """Memcpy a chunk into the ring. Caller guarantees frames <=
-        DRAIN_FRAMES and calls needs_data() first. The initial bytes are
+        DRAIN_FRAMES and calls needs_data() first. The initial samples are
         pre-scaled for volume (cheap: 4096 frames per 16ms tick)."""
         if not self.created or not self.shared:
             return
@@ -409,7 +424,7 @@ struct AudioBackend(Copyable, Movable):
         with sh_mem[unsafe_offset=0].state.lock() as p:
             var sh_vol = p[unsafe_offset=0].volume
             if sh_vol != 1.0:
-                var f = src_bytes.unsafe_bitcast[Float32]()
+                var f = src.unsafe_bitcast[Float32]()
                 for i in range(frames * CHANNELS):
                     f[unsafe_offset=i] = f[unsafe_offset=i] * sh_vol
 

@@ -262,11 +262,11 @@ struct UIContext:
         keycodes. Returns False if the action has no combos.
         """
         try:
-            var combos = self.keybinds[action].copy()
+            ref combos = self.keybinds[action]
             if len(combos) == 0:
                 return False
             for i in range(len(combos)):
-                var combo = combos[i].copy()
+                ref combo = combos[i]
                 if len(combo) == 0:
                     continue
                 # Last key must be pressed this frame.
@@ -458,8 +458,8 @@ struct UIContext:
         var y_top_screen = Float64(Float32(y) * self.ui_scale)
         var atlas = self.font(Int(Float64(size) * Float64(self.font_scale)))
         self.canvas[unsafe_offset=0].draw_text(
-            atlas[unsafe_offset=0],
-            String(text),
+            atlas,
+            text,
             x_screen,
             y_top_screen + Float64(atlas[unsafe_offset=0].ascent),
             color,
@@ -468,8 +468,7 @@ struct UIContext:
     def _measure_text(mut self, text: String, size: Int) -> Vec2:
         """Measured text size at the ladder's native pixels."""
         var atlas = self.font(size)
-        var text_mut = String(text)
-        var w = Float32(atlas[unsafe_offset=0].text_width(text_mut))
+        var w = Float32(atlas[unsafe_offset=0].text_width(text))
         return Vec2(Float64(w), Float64(atlas[unsafe_offset=0].line_height))
 
     # ------------------------------------------------------------------
@@ -512,8 +511,7 @@ struct UIContext:
     def _label_screen_w(mut self, label: String, fsize: Int) -> Float64:
         """Rendered label width in screen px at the ladder's native size."""
         var atlas = self.font(fsize)
-        var label_mut = String(label)
-        return Float64(atlas[unsafe_offset=0].text_width(label_mut))
+        return Float64(atlas[unsafe_offset=0].text_width(label))
 
     def fitted_button_w(
         mut self, label: String, fsize: Int, w: Float64
@@ -525,9 +523,9 @@ struct UIContext:
         from overlapping when button_at widens a rect.
         """
         var pad_screen = Float64(self.s(BUTTON_PAD_X))
-        var needed = (self._label_screen_w(label, fsize) + 2.0 * pad_screen) / Float64(
-            self.ui_scale
-        )
+        var needed = (
+            self._label_screen_w(label, fsize) + 2.0 * pad_screen
+        ) / Float64(self.ui_scale)
         return max(w, needed)
 
     def button(
@@ -678,14 +676,13 @@ struct UIContext:
     ):
         """Center a label inside a button rect at the ladder's native size."""
         var atlas = self.font(fsize)
-        var label_mut = String(label)
-        var tw = Float64(atlas[unsafe_offset=0].text_width(label_mut))
+        var tw = Float64(atlas[unsafe_offset=0].text_width(label))
         var th = Float64(atlas[unsafe_offset=0].line_height)
         var tx = Float64(r.x) + (Float64(r.width) - tw) / 2.0
         var ty = Float64(r.y) + (Float64(r.height) - th) / 2.0
         self.canvas[unsafe_offset=0].draw_text(
-            atlas[unsafe_offset=0],
-            String(label),
+            atlas,
+            label,
             tx,
             ty + Float64(atlas[unsafe_offset=0].ascent),
             fg,
