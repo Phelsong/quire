@@ -61,7 +61,8 @@ struct MutexGuard[T: Movable](Movable):
         pass
 
     def __deinit__(deinit self):
-        self._lock[unsafe_offset=0].unlock(self._owner)
+        _ = self._lock[unsafe_offset=0].unlock(self._owner)
+        
 
 
 struct Mutex[T: Copyable & Deinitable](Movable):

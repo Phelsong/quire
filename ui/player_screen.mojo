@@ -271,10 +271,6 @@ struct PlayerScreen:
             app_state.client_id,
         )
 
-        var thumb_path = ""
-        if detail.thumb.byte_length() > 0:
-            thumb_path = detail.thumb
-
         try:
             self._load_cover(detail.thumb, app_state)
         except e:
@@ -554,18 +550,16 @@ struct PlayerScreen:
 
         # Spawn ffmpeg reading the source at the requested seek + speed.
         var headers = self._build_stream_headers()
-        var started = False
         try:
-            started = self.pipe.start(
+            if not self.pipe.start(
                 self.stream_source,
                 seek_s,
                 self.speed,
                 self.stream_is_local,
                 headers,
-            )
-        except e:
-            started = False
-        if not started:
+            ):
+                return False
+        except:
             return False
 
         # Create the backend stream matching ffmpeg's output format:
@@ -585,12 +579,11 @@ struct PlayerScreen:
         if not self.pipe_loaded or self.stream_source.byte_length() == 0:
             return False
 
-        var restarted = False
         try:
-            restarted = self.pipe.restart(seek_s, self.speed)
+            if not self.pipe.restart(seek_s, self.speed):
+                self.has_stream = False
+                return False
         except:
-            restarted = False
-        if not restarted:
             self.has_stream = False
             return False
 
@@ -607,16 +600,10 @@ struct PlayerScreen:
     def _stop_stream(mut self):
         """Stop the backend stream and terminate the ffmpeg pipe."""
         if self.has_stream:
-            try:
-                self.audio_backend.close()
-            except:
-                pass
+            self.audio_backend.close()
             self.has_stream = False
         if self.pipe_loaded:
-            try:
-                self.pipe.stop()
-            except:
-                pass
+            self.pipe.stop()
         self.frames_fed_since_restart = 0
 
     def _load_cover(
@@ -627,8 +614,6 @@ struct PlayerScreen:
             return
 
         if thumb_path.byte_length() == 0:
-            self.cover_loaded = True
-            return
             self.cover_loaded = True
             return
 
@@ -806,21 +791,12 @@ struct PlayerScreen:
             if not self.has_stream:
                 var ok = self._start_stream(self.current_time)
                 if ok:
-                    try:
-                        self.audio_backend.play()
-                    except:
-                        pass
-            else:
-                try:
                     self.audio_backend.play()
-                except:
-                    pass
+            else:
+                self.audio_backend.play()
         else:
             if self.has_stream:
-                try:
-                    self.audio_backend.pause()
-                except:
-                    pass
+                self.audio_backend.pause()
         # A play/pause press is a deliberate state change — flush the
         # position now instead of waiting out the 15s timer.
         self._sync_progress(force=True)
@@ -921,10 +897,7 @@ struct PlayerScreen:
         var was_playing = self.is_playing
         self.is_playing = False
         if self.has_stream:
-            try:
-                self.audio_backend.pause()
-            except:
-                pass
+            self.audio_backend.pause()
 
         # 1) Clear watched on every track (unscrobble is idempotent — a
         #    track that was never watched just no-ops).
@@ -980,11 +953,8 @@ struct PlayerScreen:
         if was_playing and self.has_stream:
             var ok = self._restart_stream_at(0.0)
             if ok:
-                try:
-                    self.audio_backend.play()
-                    self.is_playing = True
-                except:
-                    pass
+                self.audio_backend.play()
+                self.is_playing = True
 
     def _previous_chapter(mut self):
         """Go to the previous chapter, or restart current if >3s in."""
@@ -1032,16 +1002,10 @@ struct PlayerScreen:
             return
         var was_playing = self.is_playing
         if was_playing:
-            try:
-                self.audio_backend.pause()
-            except:
-                pass
+            self.audio_backend.pause()
         var ok = self._restart_stream_at(self.current_time)
         if ok and was_playing:
-            try:
-                self.audio_backend.play()
-            except:
-                pass
+            self.audio_backend.play()
 
     def _speed_label(self) -> String:
         """Return the display label for the current playback speed.
@@ -1074,17 +1038,11 @@ struct PlayerScreen:
         if self.has_stream and self.pipe_loaded:
             var was_playing = self.is_playing
             if was_playing:
-                try:
-                    self.audio_backend.pause()
-                except:
-                    pass
+                self.audio_backend.pause()
             var ok = self._restart_stream_at(self.current_time)
             if ok and was_playing:
-                try:
-                    self.audio_backend.play()
-                    self.is_playing = True
-                except:
-                    pass
+                self.audio_backend.play()
+                self.is_playing = True
             elif not ok:
                 self.has_stream = False
 
@@ -1112,19 +1070,13 @@ struct PlayerScreen:
             # Pull one chunk of PCM from the native pipe. read_chunk()
             # returns typed f32 samples + frame count; has_data() gates use
             # (AudioPipe owns the memory).
-            var chunk = ChunkResult()
+            var chunk: ChunkResult
             try:
                 chunk = self.pipe.read_chunk()
             except:
                 chunk = ChunkResult()
-
             if chunk.has_data():
-                try:
-                    self.audio_backend.write_pcm(
-                        chunk.samples, chunk.frame_count
-                    )
-                except:
-                    pass
+                self.audio_backend.write_pcm(chunk.samples, chunk.frame_count)
                 # Advance normalized time by the frames actually fed. This is
                 # wall-clock playback time (atempo already resampled the audio).
                 self.frames_fed_since_restart = (
@@ -1136,12 +1088,7 @@ struct PlayerScreen:
                     )
 
         # End-of-stream: ffmpeg exited and the pipe hit EOF.
-        var reached_end = False
-        try:
-            reached_end = self.pipe.reached_end()
-        except:
-            reached_end = False
-        if reached_end and not self.progress_dragging:
+        if self.pipe.reached_end() and not self.progress_dragging:
             if self.frames_fed_since_restart > 0:
                 # Real end of audio: snap to the book's end and mark watched.
                 self.is_playing = False
@@ -1265,7 +1212,6 @@ struct PlayerScreen:
             )
             ui.move_to(icon_x, icon_y)
             ui.label(cover_icon, 64, TEXT_DIM)
-            cover_w = placeholder_w
             cover_h = placeholder_h
 
         # --- Metadata (centered below cover) ---
@@ -1356,16 +1302,10 @@ struct PlayerScreen:
                 # Drag released — restart ffmpeg at the new position.
                 var was_playing = self.is_playing
                 if was_playing:
-                    try:
-                        self.audio_backend.pause()
-                    except:
-                        pass
+                    self.audio_backend.pause()
                 var ok = self._restart_stream_at(self.current_time)
                 if ok and was_playing:
-                    try:
-                        self.audio_backend.play()
-                    except:
-                        pass
+                    self.audio_backend.play()
             self.progress_dragging = False
 
         # Time labels below progress bar
@@ -1421,16 +1361,10 @@ struct PlayerScreen:
             if self.chapter_dragging and self.has_stream and self.pipe_loaded:
                 var was_playing = self.is_playing
                 if was_playing:
-                    try:
-                        self.audio_backend.pause()
-                    except:
-                        pass
+                    self.audio_backend.pause()
                 var ok = self._restart_stream_at(self.current_time)
                 if ok and was_playing:
-                    try:
-                        self.audio_backend.play()
-                    except:
-                        pass
+                    self.audio_backend.play()
             self.chapter_dragging = False
 
         # Chapter time labels

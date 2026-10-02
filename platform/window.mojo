@@ -647,7 +647,7 @@ struct Window(Copyable, Movable):
         var fb_h = height
         var targs = stack_allocation[MAX_EVENT_ARGS, WLArgument]()
         var configured = False
-        for round in range(50):
+        for _ in range(50):
             while xdg_toplevel_next_configure(top_queue, targs):
                 var cw = _arg_as_i32(targs[unsafe_offset=0])
                 var ch = _arg_as_i32(targs[unsafe_offset=1])

@@ -406,11 +406,10 @@ struct TextEngine(Copyable, Movable):
                 continue
 
             # read glyph slot fields (slot is a POINTER field: read ptr value)
-            var slot_addr = 0
             var sp = Pointer[UInt64, MutUntrackedOrigin](
                 unsafe_from_address=Int(face) + OFF_FACE_GLYPH
             )
-            slot_addr = Int(sp[unsafe_offset=0])
+            var slot_addr = Int(sp[unsafe_offset=0])
             if slot_addr == 0:
                 var gi = GlyphInfo()
                 gi.advance_px = pixel_size // 2
@@ -425,7 +424,7 @@ struct TextEngine(Copyable, Movable):
             var bmp_addr = slot_addr + OFF_SLOT_BITMAP
             var rows = read_u32_at(bmp_addr + OFF_BMP_ROWS)
             var width = read_u32_at(bmp_addr + OFF_BMP_WIDTH)
-            var pitch = read_i32_at(bmp_addr + OFF_BMP_PITCH)
+            # var pitch = read_i32_at(bmp_addr + OFF_BMP_PITCH)
 
             var gi = GlyphInfo()
             gi.codepoint = cp_codepoint

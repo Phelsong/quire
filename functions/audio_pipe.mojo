@@ -431,24 +431,12 @@ struct AudioPipe:
         var cmd_str = self._build_command(seek_s, speed)
         var cmd = String(cmd_str)
         var mode = String("r")
-        try:
-            self.fp = popen(cmd.as_c_string_span(), mode.as_c_string_span())
-        except:
-            self.running = False
-            self.fd = -1
-            return False
+        self.fp = popen(cmd.as_c_string_span(), mode.as_c_string_span())
 
         # popen returns a non-null FILE* on success. The libc binding's
         # non-nullable type means we can't null-check directly; rely on
         # fileno succeeding as the liveness probe.
-        try:
-            self.fd = Int(external_call["fileno", c_int](self.fp))
-        except:
-            _ = pclose(self.fp)
-            self.running = False
-            self.fd = -1
-            self.fp = _null_file_ptr()
-            return False
+        self.fd = Int(external_call["fileno", c_int](self.fp))
 
         if self.fd < 0:
             _ = pclose(self.fp)
@@ -459,26 +447,20 @@ struct AudioPipe:
 
         # Set the stdout fd to non-blocking so read() returns EAGAIN instead
         # of blocking the 60fps UI loop when ffmpeg has no data yet.
-        try:
-            _ = external_call["fcntl", c_int](
-                c_int(self.fd), c_int(F_SETFL), c_int(O_NONBLOCK)
-            )
-        except:
-            pass  # non-blocking is best-effort; blocking reads still work
+        _ = external_call["fcntl", c_int](
+            c_int(self.fd), c_int(F_SETFL), c_int(O_NONBLOCK)
+        )
 
         # Set stdio to unbuffered (_IONBF) so fread hits the non-blocking fd
         # directly rather than trying to fill a stdio buffer (which would
         # block). Without this, fread on a non-blocking fd sets ferror on
         # every EAGAIN even when no data was requested.
-        try:
-            _ = external_call["setvbuf", c_int](
-                self.fp,
-                Pointer[Int8, MutUntrackedOrigin].unsafe_dangling(),
-                c_int(_IONBF),
-                c_int(0),
-            )
-        except:
-            pass
+        _ = external_call["setvbuf", c_int](
+            self.fp,
+            Pointer[Int8, MutUntrackedOrigin].unsafe_dangling(),
+            c_int(_IONBF),
+            c_int(0),
+        )
 
         self.running = True
         self.reached_eof = False

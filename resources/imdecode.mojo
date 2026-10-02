@@ -487,7 +487,6 @@ def _inflate_blocks(mut br: LsbBitReader) raises -> List[UInt8]:
         if btype == 0:
             # Stored block: align to byte, read LEN/NLEN, copy verbatim.
             br.align_to_byte()
-            var pos = 0
             # Pull LEN and NLEN directly from the underlying byte stream.
             var base = br.byte_pos - (br.bit_cnt // 8)
             var len_lo = Int(br.data[base])
@@ -498,7 +497,7 @@ def _inflate_blocks(mut br: LsbBitReader) raises -> List[UInt8]:
             var nlen = nlen_lo | (nlen_hi << 8)
             if block_len != (~nlen & 0xFFFF):
                 raise "inflate: stored block length check failed"
-            pos = base + 4
+            var pos = base + 4
             if pos + block_len > len(br.data):
                 raise "inflate: stored block overruns input"
             for i in range(block_len):
@@ -668,9 +667,9 @@ def _png_to_rgba(
     for row in range(height):
         var row_base = row * stride
         for x in range(width):
-            var r: Int = 0
-            var g: Int = 0
-            var b: Int = 0
+            var r: Int
+            var g: Int
+            var b: Int
             var alpha: Int = 255
             if depth == 8:
                 var px = row_base + x * channels_in
@@ -822,7 +821,6 @@ def imdecode_png(data: List[UInt8]) raises -> DecodedImage:
             and ctype[2] == 0x4E
             and ctype[3] == 0x44
         ):  # IEND
-            pos = len(data)
             break
 
         pos = data_start + chunk_len + 4

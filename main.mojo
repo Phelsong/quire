@@ -69,7 +69,7 @@ def main() raises:
     # directly into a heap box. UIContext holds a raw pointer; FontSet
     # value copies double-freed the shared atlas mask/List pointers
     # (TCMalloc crash on frame 1), so copies are avoided entirely.
-    var dpi_scale = 1.0
+    var __ = 1.0
     var dpi_for_bake = 1.0  # wl_shm buffer is physical px; scale == 1 for now
     var fonts_box = alloc(Layout[FontSet](count=1)).unsafe_leak()
     fonts_box.unsafe_write(
@@ -251,7 +251,7 @@ def main() raises:
 
         # Scroll (retained-state paths only; draw() reads ui for the rest)
 
-        # Keyboard (retained-state paths only; draw() reads ui for the rest)
+        # Keyboard (retained-tate paths only; draw() reads ui for the rest)
         if screen.current == 0:
             login.handle_keyboard(
                 win.input.last_key_pressed and win.input.last_key == KEY_ENTER,
@@ -617,3 +617,4 @@ def main() raises:
     pad_box[unsafe_offset=0].close()
     fonts_box[unsafe_offset=0].unload()
     win.close()
+
