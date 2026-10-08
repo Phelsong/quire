@@ -1,0 +1,261 @@
+"""Offline library — per-book metadata sidecars on disk.
+
+Each SAVE (download) writes one JSON sidecar next to the config so the
+library screen can render downloaded books with NO server connection.
+Sidecars live in ~/.config/quire/saved/<rating_key>.json and mirror the
+PlexBookCard listing fields plus a saved_at stamp (ordering).
+
+conversion to/from PlexBookCard
+lives here so callers never touch raw fields.
+"""
+
+from emberjson import try_from_json, to_json
+from std.collections import List
+from std.os import makedirs, path, listdir
+from std.pathlib import Path
+
+from resources.plex_objects import PlexBookCard
+
+
+comptime SAVED_DIR = "~/.config/quire/saved"
+
+
+def _saved_dir() -> String:
+    """Expanded sidecar directory (`~` never auto-expands in Path)."""
+    var expanded = String(SAVED_DIR)
+    try:
+        expanded = String(path.expanduser(SAVED_DIR))
+    except:
+        pass
+    return expanded^
+
+
+@fieldwise_init
+struct SavedBookMetadata(Defaultable, Movable):
+    """One downloaded book's listing metadata (offline PlexBookCard)."""
+
+    var rating_key: String
+    var title: String
+    var author: String
+    var thumb: String
+    var duration_ms: Int
+    var view_offset_ms: Int  # last-known progress (ms), updated on unload
+    var leaf_count: Int
+    var viewed_leaf_count: Int
+    var year: Int
+    var saved_at: Int  # epoch ms when the download completed
+
+    def __init__(out self):
+        self.rating_key = ""
+        self.title = ""
+        self.author = ""
+        self.thumb = ""
+        self.duration_ms = 0
+        self.view_offset_ms = 0
+        self.leaf_count = 0
+        self.viewed_leaf_count = 0
+        self.year = 0
+        self.saved_at = 0
+
+    def to_card(self) -> PlexBookCard:
+        """Convert to the library-screen card type."""
+        var card = PlexBookCard()
+        card.rating_key = self.rating_key
+        card.title = self.title
+        card.author = self.author
+        card.thumb = self.thumb
+        card.duration_ms = self.duration_ms
+        card.view_offset_ms = self.view_offset_ms
+        card.leaf_count = self.leaf_count
+        card.viewed_leaf_count = self.viewed_leaf_count
+        card.year = self.year
+        return card^
+
+
+def from_card(book: PlexBookCard, saved_at_ms: Int) -> SavedBookMetadata:
+    """Build a sidecar record from a library card (the SAVE-time source)."""
+    var meta = SavedBookMetadata()
+    meta.rating_key = book.rating_key
+    meta.title = book.title
+    meta.author = book.author
+    meta.thumb = book.thumb
+    meta.duration_ms = book.duration_ms
+    meta.view_offset_ms = book.view_offset_ms
+    meta.leaf_count = book.leaf_count
+    meta.viewed_leaf_count = book.viewed_leaf_count
+    meta.year = book.year
+    meta.saved_at = saved_at_ms
+    return meta^
+
+
+def get_saved_library_dir() -> String:
+    """Directory holding the per-book metadata sidecars (expanded)."""
+    return String(_saved_dir())
+
+
+def _read_sidecar(file_path: Path) -> Optional[SavedBookMetadata]:
+    """Parse one sidecar file. Corrupt/unknown content returns None."""
+    try:
+        var raw = file_path.read_bytes()
+        var data = String()
+        for b in range(len(raw)):
+            data += String(chr(Int(raw[b])))
+        var parsed: Optional[SavedBookMetadata] = try_from_json[
+            SavedBookMetadata
+        ](data)
+        return parsed^
+    except:
+        return None
+
+
+def save_book_metadata(mut meta: SavedBookMetadata) raises:
+    """Write one book's sidecar JSON (called after a successful download).
+
+    Sidecars are tiny (<1 KB)"""
+    var dir_path = Path(_saved_dir())
+    makedirs(dir_path, exist_ok=True)
+
+    # A fresh download starts unlistened; progress accrues via
+    # update_saved_progress as the user listens.
+    meta.view_offset_ms = 0
+    var payload = to_json[pretty=True](meta)
+    var out_path = dir_path / (meta.rating_key + ".json")
+    out_path.write_bytes(Span[UInt8](payload.as_bytes()))
+
+
+def load_saved_books() -> List[SavedBookMetadata]:
+    """Load every sidecar in the saved dir, newest download first.
+
+    The offline rows must mirror "most recently saved first" so a library
+    opened with no server still leads with what you grabbed last. Corrupt
+    sidecars are skipped silently — one bad file must never take down the
+    offline library. Directory absence (nothing ever saved) is normal and
+    returns an empty list, not an error."""
+    var out = List[SavedBookMetadata]()
+    var dir_path = Path(_saved_dir())
+    if not path.exists(dir_path):
+        return out^
+
+    var names: List[String]
+    try:
+        names = listdir(dir_path)
+    except:
+        return out^
+
+    for i in range(len(names)):
+        var name = String(names[i])
+        # rfind: this String has no ends_with; require the name to end in
+        # ".json" (its last '.' must open that suffix).
+        var json_dot = name.rfind(".json")
+        if json_dot < 0 or name.rfind(".") != json_dot:
+            continue
+        var parsed = _read_sidecar(dir_path / names[i])
+        if parsed:
+            var meta = parsed.take()
+            if meta.rating_key.byte_length() > 0:
+                out.append(meta^)
+
+    var sorted = List[SavedBookMetadata]()
+    var remaining = len(out)
+    for _pass in range(remaining):
+        var best_idx = 0
+        var best_saved = -1
+        for j in range(len(out)):
+            var candidate_used = False
+            for k in range(len(sorted)):
+                if sorted[k].rating_key == out[j].rating_key:
+                    candidate_used = True
+                    break
+            ref candidate = out[j]
+            if not candidate_used and candidate.saved_at > best_saved:
+                best_saved = candidate.saved_at
+                best_idx = j
+
+        ref chosen = out[best_idx]
+        var copy = SavedBookMetadata()
+        copy.rating_key = chosen.rating_key
+        copy.title = chosen.title
+        copy.author = chosen.author
+        copy.thumb = chosen.thumb
+        copy.duration_ms = chosen.duration_ms
+        copy.view_offset_ms = chosen.view_offset_ms
+        copy.leaf_count = chosen.leaf_count
+        copy.viewed_leaf_count = chosen.viewed_leaf_count
+        copy.year = chosen.year
+        copy.saved_at = chosen.saved_at
+        sorted.append(copy^)
+    return sorted^
+
+
+def has_sidecar(rating_key: String) -> Bool:
+    """True if a metadata sidecar exists for this book."""
+    var file_path = Path(_saved_dir()) / (rating_key + ".json")
+    return path.exists(file_path)
+
+
+def downloaded_rating_keys(audio_dir: String) -> List[String]:
+    """Rating keys (file stems) with a cached audio file in `audio_dir`.
+
+    The directory listing is the ground truth for "what can play offline"
+    — it covers downloads made before the sidecar store existed (which
+    have audio but no metadata yet) without asking the server."""
+    var out = List[String]()
+    var dir_path = Path(audio_dir)
+    if not path.exists(dir_path):
+        return out^
+
+    var names: List[String]
+    try:
+        names = listdir(dir_path)
+    except:
+        return out^
+
+    var extensions = List[String]()
+    extensions.append(".mp3")
+    extensions.append(".ogg")
+    extensions.append(".wav")
+    extensions.append(".m4b")
+    extensions.append(".m4a")
+    extensions.append(".aac")
+    extensions.append(".flac")
+
+    for i in range(len(names)):
+        var name = String(names[i])
+        var dot = name.rfind(".")
+        if dot <= 0:
+            continue  # no extension (or dotfile) — not a cache file
+        for e in range(len(extensions)):
+            if name.rfind(extensions[e]) == dot:
+                # Stem = everything before the extension (rating keys are
+                # numeric, so byte index == codepoint index here).
+                var stem = String("")
+                var count = 0
+                for cp_slice in name.codepoint_slices():
+                    if count >= dot:
+                        break
+                    stem += String(cp_slice)
+                    count += 1
+                if stem.byte_length() > 0:
+                    out.append(stem^)
+                break
+    return out^
+
+
+def update_saved_progress(rating_key: String, position_ms: Int) raises:
+    """Refresh one sidecar's view_offset (called when playback stops).
+
+    Keeps the offline library's resume point current without a server.
+    Skips silently when the sidecar doesn't exist (book not downloaded)."""
+    var file_path = Path(_saved_dir()) / (rating_key + ".json")
+    if not path.exists(file_path):
+        return
+
+    var parsed = _read_sidecar(file_path)
+    if not parsed:
+        return
+    var meta = parsed.take()
+    meta.view_offset_ms = position_ms
+    # viewedLeafCount can't be derived from a byte offset offline; leave it.
+
+    var payload = to_json[pretty=True](meta)
+    file_path.write_bytes(Span[UInt8](payload.as_bytes()))

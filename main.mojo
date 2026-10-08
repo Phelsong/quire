@@ -1,6 +1,8 @@
 from std.time import perf_counter
-from std.memory import alloc, Layout
+from std.memory import alloc, Layout, stack_allocation
+from std.ffi import external_call
 from std.logger import Logger, Level
+from std.memory.unsafe_pointer import Pointer
 
 from platform.window import Window, WindowInput
 from platform.gamepad import Gamepad
@@ -29,6 +31,12 @@ from resources.palette import (
     ERROR_COLOR,
 )
 from resources.plex_objects import LibraryItem, ServerItem
+from resources.offline_library import (
+    from_card,
+    save_book_metadata,
+    load_saved_books,
+)
+from functions.offline_sync import sync_saved_sidecars
 from render.imui import UIContext
 from ui import Screen
 from ui.font import FontSet
@@ -46,6 +54,24 @@ comptime SCREEN_H = 1000  # Default window height (logical pixels)
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+
+def _eprint(s: String):
+    """Unbuffered teardown breadcrumb: crash-safe direct write to fd 2.
+
+    print()/logger go through block-buffered stdout; when a segfault kills
+    the process mid-teardown, buffered lines vanish — which made the
+    earlier breadcrumbs lie about how far teardown got. Goes through
+    writev(2): the plain write symbol collides with a stdlib declaration
+    (the same trap as gamepad open→open64); writev is one atomic write.
+    The iovec is a raw (base, len) word pair — struct iovec layout on
+    x86_64 (void* + size_t), built as two stack Ints."""
+    var mut_s = s
+    var addr = Int(mut_s.as_c_string_span().ptr())
+    var iov = stack_allocation[2, Int]()
+    iov[unsafe_offset=0] = addr  # iov_base
+    iov[unsafe_offset=1] = mut_s.byte_length()  # iov_len
+    _ = external_call["writev", Int](2, iov, 1)
 
 
 def main() raises:
@@ -279,6 +305,30 @@ def main() raises:
                     except:
                         pass
 
+            # --- One-time sidecar backfill (offline-library completeness) ---
+            # The library raises sync_requested when the server is online
+            # and backfill hasn't happened this session. Backfilling writes
+            # sidecars for audio-on-disk books the store predates; a reload
+            # then includes them as fully-searchable offline rows.
+            if library.sync_requested:
+                library.sync_requested = False
+                try:
+                    var backfilled = sync_saved_sidecars(app_state)
+                    library.sync_done = True
+                    if backfilled > 0:
+                        print(
+                            "[Quire] sidecar backfill wrote ",
+                            backfilled,
+                            " sidecars",
+                        )
+                        # Bring the new offline rows into this load.
+                        try:
+                            library.load_data(app_state)
+                        except:
+                            pass
+                except e:
+                    print("[Quire] sidecar backfill failed: " + String(e))
+
             # --- Download (SAVE) request from the library screen ---
             # Fetches the book's track list then streams the file into the
             # audio cache. Runs outside the render loop: both network calls
@@ -316,6 +366,37 @@ def main() raises:
                                     "Saved: " + dl_book.title
                                 )
                                 library.status_color = GREEN
+                                # Refresh the badge memo: the row renders
+                                # its DOWNLOADED tag from this dict, and a
+                                # stale False would hide a fresh save.
+                                library.downloaded_cache[
+                                    dl_book.rating_key
+                                ] = True
+                                # Persist the offline sidecar: title/
+                                # author/thumb/etc. so the library can
+                                # show this book with no server at all.
+                                try:
+                                    var now_ms = Int(
+                                        perf_counter()
+                                    )  # monotonic; only ordering matters
+                                    var meta = from_card(dl_book, now_ms)
+                                    save_book_metadata(meta)
+                                    # Pin the fresh download onto the head
+                                    # of the current list right away.
+                                    library.pinned_books.insert(
+                                        0, meta.to_card()
+                                    )
+                                except e:
+                                    print(
+                                        "[Quire] sidecar save failed: ",
+                                        e,
+                                    )
+                                # Hoist the fresh download immediately —
+                                # same ordering pass as a page reload.
+                                try:
+                                    library._sort_books_for_display()
+                                except:
+                                    pass
                             else:
                                 library.status_message = (
                                     "Download failed: " + dl_book.title
@@ -558,6 +639,16 @@ def main() raises:
             BG_GRADIENT_TOP, BG_GRADIENT_BOTTOM
         )
 
+        # Per-frame playback update runs on EVERY screen: the now-playing
+        # bar on the library screen controls playback, so the ffmpeg pipe
+        # must keep being pumped (PCM feed + time advance) even while the
+        # player screen isn't visible — otherwise pressing play there
+        # spawns a stream but no audio ever flows.
+        player.update_playback(dt)
+        if player.is_playing:
+            player.progress_sync_timer = player.progress_sync_timer + dt
+            player._sync_progress()
+
         if screen.current == 0:
             login.draw(ui, app_state)
         elif screen.current == 1:
@@ -576,14 +667,18 @@ def main() raises:
             canvas_box[unsafe_offset=0].clear_gradient(
                 BG_GRADIENT_TOP, BG_GRADIENT_BOTTOM
             )
-            # Per-frame playback update: pulls PCM from the ffmpeg pipe,
-            player.update_playback(dt)
+            # Wheel scroll drives the chapter drawer when it is open
+            # (handle_scroll no-ops otherwise); consume the accumulated delta.
+            if win.input.wheel_delta != 0.0:
+                player.handle_scroll(Float32(win.input.wheel_delta), Int(cur_h))
+                win.input.wheel_delta = 0.0
 
             # Progress sync timer — increment when playing, sync periodically
-            if player.is_playing:
-                player.progress_sync_timer = player.progress_sync_timer + dt
-                player._sync_progress()
-            elif player.current_time > 0.0 and player.duration > 0.0:
+            if (
+                not player.is_playing
+                and player.current_time > 0.0
+                and (player.duration > 0.0)
+            ):
                 # Not playing but has position — check if near end for watched mark
                 var remaining = player.duration - player.current_time
                 if remaining < 1.0:
@@ -614,7 +709,39 @@ def main() raises:
 
     # Cleanup (fonts live in the heap box after the move)
     player.stop_and_unload_stream()
+    _eprint("\n[td] player stopped\n")
     pad_box[unsafe_offset=0].close()
-    fonts_box[unsafe_offset=0].unload()
+    _eprint("[td] gamepad closed\n")
     win.close()
+    _eprint("[td] window closed\n")
+    fonts_box[unsafe_offset=0].unload()
+    _eprint("[td] fonts unloaded\n")
 
+    # Clear the keybind dictionaries BEFORE scope-exit deinits run.
+    #
+    # Their List[String]/List[List[Int]] values share COW storage with
+    # copies held by Config values (save_config) and SettingsScreen
+    # (load_from_config). Letting the implicit deinits release that shared
+    # storage on this toolchain segfaults in List.__deinit__ at scope exit
+    # (X-button close → same crash every time). Explicitly emptying the
+    # dicts here releases main's references first, leaving a single owner
+    # per allocation — the same "control the teardown" rule the heap-boxed
+    # Canvas/FontSet already follow above.
+    library.clear_teardown()
+    settings.clear_keybinds()
+    cfg_keybinds.clear()
+    keybinds.clear()
+    _eprint("[td] containers cleared\n")
+
+    # Everything the OS must not inherit is closed; every container whose
+    # implicit deinit has shown itself unsafe (or whose identity is
+    # unclear through inlining) has been explicitly released. Whatever
+    # remains in main's frame — screens' remaining List[String] state,
+    # COW-shared Config copies, the Python interop runtime — still segfaults
+    # in List.__deinit__ when the frame unwinds. All real resources
+    # ( Wayland, audio, file descriptors, fonts) are already released, so
+    # the remaining teardown is pure memory hygiene at process exit: let
+    # the kernel reclaim it. _exit skips the unwind entirely; the exit code
+    # 0 preserves the app's success semantics.
+    _eprint("[td] clean exit\n")
+    _ = external_call["_exit", NoneType](0)

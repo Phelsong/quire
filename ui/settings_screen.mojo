@@ -571,6 +571,14 @@ struct SettingsScreen:
         self.status_message = ""
         self.status_color = TEXT_DIM
 
+    def clear_keybinds(mut self):
+        """Release the keybind dict before scope exit (see main() teardown).
+
+        The list values share COW storage with main's cfg_keybinds; emptying
+        here drops SettingsScreen's references so the storage has one owner
+        when the implicit deinits run."""
+        self.keybinds.clear()
+
     def _kb_binding_display(self, action: String) raises -> String:
         """First keyboard binding for an action, or 'Unbound'.
 

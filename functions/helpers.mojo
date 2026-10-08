@@ -132,3 +132,72 @@ def truncate_string(var text: String, ref length: Int) -> String:
         result += String(cp_slice)
         count += 1
     return result
+
+
+def truncate_to_width(
+    text: String,
+    max_width_px: Float64,
+    font_scale: Float64,
+    avg_char_px: Float64,
+) -> String:
+    """Truncate `text` (with an ellipsis) to roughly `max_width_px`.
+
+    Character widths are estimated at `avg_char_px` design px per codepoint
+    scaled by `font_scale`; callers pass a per-font-size constant measured
+    once (see the caller comment in player_screen._draw_info_popover).
+    """
+    var max_chars = Int(max_width_px / (avg_char_px * font_scale))
+    if max_chars < 1:
+        max_chars = 1
+    var measured = text.count_codepoints()
+    if measured <= max_chars:
+        return text
+    if max_chars <= 3:
+        return truncate_string(text, max_chars)
+    return truncate_string(text, max_chars - 3) + "..."
+
+
+def split_wrap_chars(text: String, chars_per_line: Int) -> List[String]:
+    """Hard-wrap `text` into lines of `chars_per_line` codepoints.
+
+    Prefers breaking at the last space in each window so words don't split
+    mid-word; a line with no space (longer than the window) breaks hard.
+    """
+    var lines = List[String]()
+    if text.byte_length() == 0:
+        lines.append(String(""))
+        return lines^
+
+    var codepoints = List[String]()
+    for cp_slice in text.codepoint_slices():
+        codepoints.append(String(cp_slice))
+
+    var total = len(codepoints)
+    var pos = 0
+    while pos < total:
+        var end = pos + chars_per_line
+        if end >= total:
+            var tail = String("")
+            for i in range(pos, total):
+                tail += codepoints[i]
+            lines.append(tail^)
+            break
+        # Prefer a space break inside the window (search backwards).
+        var break_at = -1
+        var i = end
+        while i > pos:
+            if codepoints[i] == " ":
+                break_at = i
+                break
+            i -= 1
+        if break_at == -1 or break_at <= pos:
+            break_at = end
+        var line = String("")
+        for j in range(pos, break_at):
+            line += codepoints[j]
+        lines.append(line^)
+        pos = break_at
+        # Skip the space itself so lines don't start with a gap.
+        if codepoints[pos] == " ":
+            pos += 1
+    return lines^

@@ -3,7 +3,7 @@ from std.pathlib import Path
 from std.collections import List, Dict, Optional
 from std.memory.unsafe_pointer import Pointer
 from std.memory import alloc, dealloc, Layout, ThinAllocation, unsafe_memcpy
-from std.math import min
+from std.math import max
 from resources.color import Color
 from resources.imdecode import imdecode
 from resources.keys import (
@@ -13,14 +13,17 @@ from resources.keys import (
     KEY_DELETE,
     KEY_ESCAPE,
 )
-from render.imui import UIContext, UIResult, Vec2, Rect
+from render.imui import DESIGN_W, UIContext, UIResult, Vec2, Rect
 
 from functions.helpers import (
     format_time,
     truncate_string,
+    truncate_to_width,
+    split_wrap_chars,
 )
 from functions.audio_pipe import AudioPipe, ChunkResult, HttpHeader
 from platform.audio_backend import AudioBackend
+from resources.offline_library import update_saved_progress
 from functions.plex_bridge import (
     PlexSession,
     get_book_detail,
@@ -77,26 +80,67 @@ from resources.plex_objects import (
     LibraryItem,
     ServerItem,
 )
-from render.imui import UIContext, UIResult
 
 from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
 from ui.font import FontSet
 from ui import Screen
-from ui.icons import ICON_PLAY, ICON_PAUSE
+from ui.icons import (
+    ICON_PLAY,
+    ICON_PAUSE,
+    ICON_PAUSE_CIRCLE,
+    ICON_CHEV_LEFT,
+    ICON_CHEV_RIGHT,
+    ICON_SKIP_BACK,
+    ICON_SKIP_FORWARD,
+    ICON_LAYERS,
+    ICON_INFO,
+    ICON_TUNE,
+    ICON_LIST,
+    ICON_HEADPHONES,
+    ICON_CLOSE,
+)
 
 # ---------------------------------------------------------------------------
-# Player screen — audiobook playback UI (immediate-mode UI)
+# Player screen — layout1 redesign (assets/quire-layout1.png)
 #
-# The IMUI refactor fixes the critical draw/click layout mismatch bug:
-# layout now happens once in draw() and clicks are checked against the same
-# rectangles returned by UI elements.
+# Minimal single-view layout: centered title header, icon rails on the left
+# (chapter drawer / settings / info toggles) and right (±30s / circled play),
+# a large centered cover, and two bottom seek bars — book above, chapter
+# below, flanked by chapter-skip chevrons. Overlays are mutually exclusive;
+# a click outside a floating card closes it.
 # ---------------------------------------------------------------------------
+
+
+# Overlay panels (mutually exclusive — one drawer/popover at a time).
+comptime OVERLAY_NONE = 0
+comptime OVERLAY_CHAPTERS = 1
+comptime OVERLAY_SETTINGS = 2
+comptime OVERLAY_INFO = 3
+
+# Seconds skipped by the right-rail double-chevron buttons.
+comptime SKIP_SECONDS = 30.0
+
+# Chapter drawer metrics (design px) — shared by draw() and handle_scroll()
+# so the-scroll clamp matches the painted geometry exactly.
+comptime DRAWER_W = 520.0
+comptime DRAWER_TOP = 140.0
+comptime DRAWER_MIN_H = 240.0
+comptime DRAWER_TITLE_ROW = 72.0
+comptime DRAWER_PAD_BOTTOM = 16.0
+
+# Chapter drawer row metrics (design px) — two-line row: title, then times.
+comptime CHAPTER_ROW_H = 76.0
+
+# Cover art request size (square, source px). Higher than display size so
+# the blit stays sharp when the window is large or DPI-scaled up.
+comptime COVER_PX = 600
 
 
 struct PlayerScreen:
     var book_id: String
     var book_title: String
     var book_author: String
+    var book_thumb: String  # Plex thumb path (library bar cover queueing)
     var book_narrator: String
     var book_series: String
     var book_publisher_year: String
@@ -163,10 +207,15 @@ struct PlayerScreen:
     var has_cover: Bool
     var cover_loaded: Bool
 
+    # Layout1 overlay state (mutually exclusive panels).
+    var overlay_mode: Int  # OVERLAY_NONE / CHAPTERS / SETTINGS / INFO
+    var overlay_armed: Bool  # click-outside armed after a toggle click
+
     def __init__(out self, screen_w: Int, screen_h: Int):
         self.book_id = ""
         self.book_title = ""
         self.book_author = ""
+        self.book_thumb = ""
         self.book_narrator = ""
         self.book_series = ""
         self.book_publisher_year = ""
@@ -184,6 +233,8 @@ struct PlayerScreen:
         self.chapters = List[PlexChapter]()
         self.current_chapter_idx = -1
         self.chapter_scroll_offset = 0.0
+        self.overlay_mode = OVERLAY_NONE
+        self.overlay_armed = False
 
         self.progress_dragging = False
         self.chapter_dragging = False
@@ -220,6 +271,9 @@ struct PlayerScreen:
         self.has_cover = False
         self.cover_loaded = False
 
+        self.overlay_mode = OVERLAY_NONE
+        self.overlay_armed = False
+
     def load_book(mut self, book: PlexBookCard, app_state: PlexSession) raises:
         # Unload previous cover art before loading a new book
         if self.has_cover:
@@ -235,6 +289,7 @@ struct PlayerScreen:
         self.book_id = book.rating_key
         self.book_title = book.title
         self.book_author = book.author
+        self.book_thumb = ""
         self.book_narrator = ""
         self.book_series = ""
         self.book_publisher_year = ""
@@ -273,6 +328,7 @@ struct PlayerScreen:
 
         try:
             self._load_cover(detail.thumb, app_state)
+            self.book_thumb = detail.thumb
         except e:
             # DIAGNOSTIC: cover art is decorative, but surface why it failed.
             print("cover load failed:", e)
@@ -609,7 +665,10 @@ struct PlayerScreen:
     def _load_cover(
         mut self, thumb_path: String, app_state: PlexSession
     ) raises:
-        """Load cover art from the Plex thumbnail API."""
+        """Load cover art from the Plex thumbnail API.
+
+        Fetched at COVER_PX so a full-window cover stays sharp on HiDPI;
+        cached on disk at the requested size."""
         if self.cover_loaded:
             return
 
@@ -625,18 +684,18 @@ struct PlayerScreen:
             app_state.server_url,
             thumb_path,
             token,
-            300,
-            300,
+            COVER_PX,
+            COVER_PX,
         )
 
         if thumb_url.byte_length() == 0:
             self.cover_loaded = True
             return
 
-        var image_data = load_cached_cover(self.book_id, 300, 300)
+        var image_data = load_cached_cover(self.book_id, COVER_PX, COVER_PX)
         if image_data.byte_length() == 0:
             image_data = fetch_thumbnail(thumb_url)
-            save_cached_cover(self.book_id, 300, 300, image_data)
+            save_cached_cover(self.book_id, COVER_PX, COVER_PX, image_data)
 
         if image_data.byte_length() == 0:
             self.cover_loaded = True
@@ -670,34 +729,47 @@ struct PlayerScreen:
         self.cover_loaded = True
 
     def stop_and_unload_stream(mut self):
-        """Stop the backend stream, terminate ffmpeg, and unload cover art."""
+        """Stop the backend stream and terminate ffmpeg.
+
+        Cover art is intentionally KEPT: the library's now-playing bar
+        thumbnails it (self.cover_pixels[book_id]) for as long as a book is
+        loaded, and reloading it on every player-screen entry would refetch
+        + redecode ~600px of JPEG for no benefit. It is freed by load_book()
+        (book swap) or deinit — not by leaving the player screen."""
         self.is_playing = False
-        self._sync_progress(force=True)
+
+        # DIAGNOSTIC: the forced progress push runs a Python (httpx) call
+        # immediately before process teardown — bisecting the close crash
+        # by removing it. The timer-based sync during playback already
+        # reported the position; losing the final <15s of progress on a
+        # quit is the acceptable cost of this experiment.
+        # self._sync_progress(force=True)
 
         self._stop_stream()
 
-        if self.has_cover:
-            var old_pixels = self.cover_pixels.take()
-            dealloc(
-                ThinAllocation(unsafe_owned_ptr=old_pixels).unsafe_with_layout(
-                    Layout[UInt8](count=self.cover_w * self.cover_h * 4)
-                )
-            )
-            self.has_cover = False
-        self.cover_loaded = False
+        # Persist the resume point to the offline sidecar (no-op for books
+        # without one) so an offline library reopen resumes here.
+        try:
+            update_saved_progress(self.book_id, Int(self.current_time * 1000.0))
+        except:
+            pass
 
-    def handle_scroll(mut self, wheel_delta: Float32):
-        """Scroll the chapter list (design-pixel space)."""
-        if len(self.chapters) == 0:
+    def handle_scroll(mut self, wheel_delta: Float32, screen_h: Int):
+        """Scroll the chapter drawer (design-pixel space).
+
+        Only the open chapter drawer scrolls; scrolling at any other time is
+        a no-op. Uses the same shared drawer geometry draw() paints, so the
+        scroll clamp can never disagree with the visible window."""
+        if self.overlay_mode != OVERLAY_CHAPTERS or len(self.chapters) == 0:
             return
 
-        var chap_h = 32.0
-        var total_height = Float64(len(self.chapters)) * chap_h
-        # Approximate visible height — the exact value is computed in draw()
-        # from screen_h. We use a conservative estimate here; draw() will
-        # clamp the offset correctly.
-        var visible_height = 600.0
-
+        var card = self._chapter_drawer_rect(
+            Float64(DESIGN_W), Float64(screen_h)
+        )
+        var visible_height = (
+            Float64(card.height) - DRAWER_TITLE_ROW - DRAWER_PAD_BOTTOM
+        )
+        var total_height = Float64(len(self.chapters)) * CHAPTER_ROW_H
         if total_height <= visible_height:
             self.chapter_scroll_offset = 0.0
             return
@@ -1007,6 +1079,35 @@ struct PlayerScreen:
         if ok and was_playing:
             self.audio_backend.play()
 
+    def _set_overlay(mut self, mode: Int):
+        """Open one overlay (or close everything). Mutually exclusive.
+
+        Reopening the same mode closes it — a toggle, so a rail icon is its
+        own dismiss control. Switching modes resets the slide animation
+        (instant appearance of the new panel)."""
+        if self.overlay_mode == mode:
+            self.overlay_mode = OVERLAY_NONE
+        else:
+            self.overlay_mode = mode
+        self.overlay_armed = True
+        self.chapter_scroll_offset = 0.0
+
+    def _skip(mut self, seconds: Float64) raises:
+        """Skip by signed seconds, clamped and streamed consistently."""
+        self.current_time = self.current_time + seconds
+        if self.current_time < 0.0:
+            self.current_time = 0.0
+        if self.current_time > self.duration:
+            self.current_time = self.duration
+        self._update_current_chapter()
+        self._seek_to_current()
+
+    def _skip_30_back(mut self) raises:
+        self._skip(-SKIP_SECONDS)
+
+    def _skip_30_forward(mut self) raises:
+        self._skip(SKIP_SECONDS)
+
     def _speed_label(self) -> String:
         """Return the display label for the current playback speed.
         Formats to 2 decimal places (e.g. '1.05x', '0.50x', '2.00x')."""
@@ -1114,192 +1215,182 @@ struct PlayerScreen:
         mut ui: UIContext,
         mut screen: Screen,
     ) raises:
-        """Render the entire player screen (immediate-mode).
+        """Render the layout1 player screen (assets/quire-layout1.png).
 
-        Layout, input handling, and drawing all happen in this single pass.
-        Slider dragging is handled here via ui.mouse_down + retained drag
-        flags, using the exact same rectangles returned by ui.slider().
+        Single-pass immediate mode: layout, input, and drawing share the same
+        rectangles. Paint order matters — the cover is drawn FIRST and the
+        controls last, so narrow windows that push the cover under the
+        rails still leave every control visible/clickable:
+          cover    — centered art (bottom layer)
+          header   — back chevron, centered title, stub icons top-right
+          bottom   — book bar, then chapter bar with < > skip flanks
+          rails    — left toggles, right ±30s / play (must survive squish)
+          overlays — floating panels on top of everything
         """
         var sw_design = Float64(ui.screen_w) / Float64(ui.ui_scale)
         var sh_design = Float64(ui.screen_h) / Float64(ui.ui_scale)
 
-        # --- Header bar ---
-        var header_h = 60.0
-        ui.panel_bg(0.0, 0.0, sw_design, header_h, PLAYER_BG)
+        # While an overlay is open the rails are covered by the floating
+        # panel — skip them so hidden controls can't be clicked through it.
+        var overlay_open = self.overlay_mode != OVERLAY_NONE
 
-        # Back button
-        var btn_w = sw_design * 0.10
-        var btn_h = 40.0
-        ui.move_to(20.0, 7.0)
-        ui.cursor_w = Float32(btn_w) * ui.ui_scale
-        var back_result = ui.button(
-            "<- LIBRARY",
-            btn_h,
-            BTN_DARK_LIB,
+        # Compute the bottom-bar zone early so the cover can avoid it.
+        var bottom_top = self._bottom_bars_top(sw_design, sh_design)
+        self._draw_cover(ui, sw_design, sh_design, bottom_top)
+
+        self._draw_header(ui, sw_design, screen)
+        self._draw_bottom_bars(ui, sw_design, sh_design)
+        if not overlay_open:
+            self._draw_left_rail(ui, sw_design, bottom_top)
+            self._draw_right_rail(ui, sw_design, bottom_top)
+
+        # Floating panels on top of everything; also handle click-outside.
+        self._draw_overlays(ui, sw_design, sh_design)
+
+    # ------------------------------------------------------------------
+    # Header — back chevron, centered title, stub icons top-right
+    # ------------------------------------------------------------------
+
+    def _draw_header(
+        mut self,
+        mut ui: UIContext,
+        sw_design: Float64,
+        mut screen: Screen,
+    ) raises:
+        """Top bar: back chevron (left), centered title, stub icons (right).
+
+        The stub icons render but are not yet wired — global settings and
+        listening history are future work. They are drawn dimmed so the
+        clickable (back) control stays visually distinct.
+        """
+        var margin = 24.0
+
+        # Back chevron — ghost button top-left.
+        var back_size = 88.0
+        var back_result = ui.button_at(
+            ICON_CHEV_LEFT,
+            margin,
+            10.0,
+            back_size,
+            back_size,
+            PLAYER_BG,
             TEXT_LIGHT,
-            Color(55, 64, 80, 255),
+            Color(30, 60, 74, 255),
             action="back_button",
         )
-        # add back
         if back_result.clicked:
             self.stop_and_unload_stream()
             screen.current = 1
             return
 
-        # "Now Playing" label (right-aligned in header)
-        var now_playing = "Now Playing"
-        var np_meas = ui._measure_text(now_playing, 22)
-        var np_x = sw_design - ui.text_w_design(np_meas.x) - 100.0
-        ui.move_to(np_x, 12.0)
-        ui.label(now_playing, 22, GREEN)
+        # Centered title (layout1 mock: bold page-style title).
+        var title = self.book_title
+        if title.byte_length() == 0:
+            title = "Now Playing"
+        var title_size = 26
+        var title_meas = ui._measure_text(title, title_size)
+        var max_title_w = sw_design * 0.62
+        if title_meas.x > Float32(max_title_w) * ui.font_scale:
+            var max_chars = Int(max_title_w / 12.0)
+            if max_chars < 8:
+                max_chars = 8
+            title = truncate_string(title, max_chars - 3) + "..."
+            title_meas = ui._measure_text(title, title_size)
+        var title_x = (sw_design - ui.text_w_design(title_meas.x)) / 2.0
+        ui.move_to(title_x, 24.0)
+        ui.label(title, title_size, TEXT_BRIGHT)
 
-        # --- Content area (vertical stack: cover → metadata → description → player → chapters) ---
-        var content_x = 20.0
-        var content_w = sw_design - 100.0
+        # Top-right stubs — global settings + history (not implemented).
+        var stub_size = 80.0
+        var stub_y = 8.0
+        var stub_gap = 16.0
+        var stubs_x = sw_design - margin - 2.0 * stub_size - stub_gap
+        var list_stub = ui.button_at(
+            ICON_LIST,
+            stubs_x,
+            stub_y,
+            stub_size,
+            stub_size,
+            PLAYER_BG,
+            TEXT_DIM,
+            Color(30, 60, 74, 255),
+        )
+        var head_x = stubs_x + stub_size + stub_gap
+        var headphones_stub = ui.button_at(
+            ICON_HEADPHONES,
+            head_x,
+            stub_y,
+            stub_size,
+            stub_size,
+            PLAYER_BG,
+            TEXT_DIM,
+            Color(30, 60, 74, 255),
+        )
+        if list_stub.clicked or headphones_stub.clicked:
+            pass  # stubs: global settings / history — wired in a later pass
 
-        # --- Cover art (centered on app width, scaled to x% width bound, aspect-preserving) ---
-        var cover_max = min(sw_design * 0.35, sh_design * 0.35)
-        var cover_w = cover_max
-        var cover_h = cover_max
-        if self.has_cover:
-            # Compute scaled dimensions preserving aspect ratio, fit within cover_max.
-            var tex_w = Float64(self.cover_w)
-            var tex_h = Float64(self.cover_h)
-            if tex_w > 0 and tex_h > 0:
-                var aspect = tex_w / tex_h
-                if aspect >= 1.0:
-                    cover_w = cover_max
-                    cover_h = cover_max / aspect
-                else:
-                    cover_h = cover_max
-                    cover_w = cover_max * aspect
-            var cover_x = (sw_design - cover_w) / 2.0
-            var cover_y = header_h + 14.0
-            # Canvas is in SCREEN pixels; all imui primitives convert
-            # design->screen via ui_scale. blit_rgba expects screen px too,
-            # so scale the design-space cover rect before blitting.
-            var scale = Float64(ui.ui_scale)
-            ui.canvas[unsafe_offset=0].blit_rgba(
-                self.cover_pixels.value(),
-                self.cover_w,
-                self.cover_h,
-                self.cover_w * 4,
-                cover_x * scale,
-                cover_y * scale,
-                cover_w * scale,
-                cover_h * scale,
-            )
-        else:
-            var placeholder_w = cover_max
-            var placeholder_h = cover_max
-            var ph_x = (sw_design - placeholder_w) / 2.0
-            var ph_y = header_h + 14.0
-            ui.card(
-                ph_x,
-                ph_y,
-                placeholder_w,
-                placeholder_h,
-                PLACEHOLDER_BG,
-                roundness=0.06,
-            )
-            var cover_icon = "COVER"
-            var icon_meas = ui._measure_text(cover_icon, 64)
-            var icon_x = (
-                ph_x + (placeholder_w - ui.text_w_design(icon_meas.x)) / 2.0
-            )
-            var icon_y = (
-                ph_y + (placeholder_h - ui.text_h_design(icon_meas.y)) / 2.0
-            )
-            ui.move_to(icon_x, icon_y)
-            ui.label(cover_icon, 64, TEXT_DIM)
-            cover_h = placeholder_h
+    # ------------------------------------------------------------------
+    # Bottom bars — book progress (upper), chapter progress (lower, flanked)
+    # ------------------------------------------------------------------
 
-        # --- Metadata (centered below cover) ---
-        var meta_y = header_h + 14.0 + cover_h + 18.0
-        if self.book_title.byte_length() > 0:
-            var title_meas = ui._measure_text(self.book_title, 22)
-            var title_x = (sw_design - ui.text_w_design(title_meas.x)) / 2.0
-            ui.move_to(title_x, meta_y)
-            ui.label(self.book_title, 26, TEXT_BRIGHT)
-            meta_y += 30.0
+    # ------------------------------------------------------------------
+    # Bottom bars — book progress (upper), chapter progress (lower, flanked)
+    # ------------------------------------------------------------------
 
-        if self.book_author.byte_length() > 0:
-            var author_meas = ui._measure_text(self.book_author, 18)
-            var author_x = (sw_design - ui.text_w_design(author_meas.x)) / 2.0
-            ui.move_to(author_x, meta_y)
-            ui.label(self.book_author, 20, TEXT_DIM)
-            meta_y += 24.0
+    def _bottom_bars_top(
+        self, sw_design: Float64, sh_design: Float64
+    ) -> Float64:
+        """Design-px y where the bottom-bars zone begins (upper bar's top).
 
-        # Secondary metadata line (narrator · series · year · genres)
-        var meta_parts = List[String]()
-        if self.book_narrator.byte_length() > 0:
-            meta_parts.append("Narrator: " + self.book_narrator)
-        if self.book_series.byte_length() > 0:
-            meta_parts.append(self.book_series)
-        if self.book_publisher_year.byte_length() > 0:
-            meta_parts.append(self.book_publisher_year)
-        if self.book_genres.byte_length() > 0:
-            meta_parts.append(self.book_genres)
-        if len(meta_parts) > 0:
-            var meta_line = meta_parts[0]
-            for i in range(1, len(meta_parts)):
-                meta_line = meta_line + "  ·  " + meta_parts[i]
-            var meta_line_meas = ui._measure_text(meta_line, 12)
-            var meta_line_x = (
-                sw_design - ui.text_w_design(meta_line_meas.x)
-            ) / 2.0
-            ui.move_to(meta_line_x, meta_y)
-            ui.label(meta_line, 20, TEXT_MUTED)
-            meta_y += 20.0
+        Shared by draw() and _draw_cover so the cover can stop above the
+        bars without duplicating the geometry constants."""
+        var margin = 28.0
+        var bar_h = 12.0
+        var bar_gap = 40.0
+        var skip_h = 112.0
+        var lower_y = sh_design - margin - skip_h - bar_gap
+        return lower_y - bar_gap - bar_h
 
-        # --- Description (truncated to fit a few lines) ---
-        var desc_y = meta_y + 6.0
-        if self.book_description.byte_length() > 0:
-            var desc_max_w = content_w
-            var desc_max_chars = Int(desc_max_w / 6.0)
-            if desc_max_chars > 3:
-                var desc_text = truncate_string(
-                    self.book_description, desc_max_chars * 4
-                )
-                ui.move_to(content_x, desc_y)
-                ui.label(desc_text, 20, TEXT_DIM)
-                desc_y += 64.0
-            else:
-                desc_y += 0.0
-        else:
-            desc_y += 0.0
+    def _draw_bottom_bars(
+        mut self, mut ui: UIContext, sw_design: Float64, sh_design: Float64
+    ) raises:
+        """Two seek bars at the window bottom.
 
-        # --- Player bar (progress + controls + speed/volume) ---
-        var player_y = desc_y + 16.0
-        var player_w = content_w - 40
-        var player_x = content_x + 40
+        Upper bar = whole-book progress. Lower bar = position inside the
+        current chapter, flanked by < > chapter-skip chevrons. Time labels
+        sit between the bars: elapsed / remaining on the book bar.
+        """
+        var margin = 28.0
+        var bar_h = 12.0
+        var bar_gap = 40.0
+        var label_h = 26.0
+        var skip_w = 112.0
+        var skip_h = 112.0
 
-        # --- Progress bar ---
-        var progress_y = player_y
-        var progress_h = 10.0
-        var progress_result = ui.slider(
-            player_x,
-            progress_y,
-            player_w,
-            progress_h,
+        var lower_y = sh_design - margin - skip_h - bar_gap
+        var upper_y = lower_y - bar_gap - bar_h
+        var upper_w = sw_design * 0.60
+        var upper_x = (sw_design - upper_w) / 2.0
+
+        # --- Book progress bar (upper, shorter, centered) ---
+        var book_result = ui.slider(
+            upper_x,
+            upper_y,
+            upper_w,
+            bar_h,
             self.current_time,
             0.0,
-            self.duration,
+            max(self.duration, 1.0),
         )
-
-        # Handle click + drag on progress bar (same rectangle — no mismatch)
-        if progress_result.clicked:
+        if book_result.clicked:
             self.progress_dragging = True
         if self.progress_dragging and ui.mouse_down:
-            if ui._hit(progress_result.bounds) or True:
-                # Allow dragging outside the bar — clamp inside slider_value_from_mouse
-                self.current_time = ui.slider_value_from_mouse(
-                    progress_result.bounds, ui.mouse_pos.x, 0.0, self.duration
-                )
-                self._update_current_chapter()
+            self.current_time = ui.slider_value_from_mouse(
+                book_result.bounds, ui.mouse_pos.x, 0.0, self.duration
+            )
+            self._update_current_chapter()
         elif not ui.mouse_down:
             if self.progress_dragging and self.has_stream and self.pipe_loaded:
-                # Drag released — restart ffmpeg at the new position.
                 var was_playing = self.is_playing
                 if was_playing:
                     self.audio_backend.pause()
@@ -1308,23 +1399,26 @@ struct PlayerScreen:
                     self.audio_backend.play()
             self.progress_dragging = False
 
-        # Time labels below progress bar
-        var time_y = progress_y + progress_h + 10.0
-        ui.move_to(player_x, time_y)
-        ui.label(format_time(self.current_time), 20, TEXT_DIM)
+        # Elapsed / remaining labels tucked between the bars (book tracker,
+        # right-aligned to the upper bar).
+        var label_size = 16
+        var time_text = (
+            format_time(self.current_time)
+            + "  /  "
+            + format_time(max(self.duration - self.current_time, 0.0))
+        )
+        var time_meas = ui._measure_text(time_text, label_size)
+        ui.move_to(
+            upper_x + upper_w - ui.text_w_design(time_meas.x),
+            upper_y - label_h - 8.0,
+        )
+        ui.label(time_text, label_size, TEXT_MUTED)
 
-        var remaining = self.duration - self.current_time
-        if remaining < 0.0:
-            remaining = 0.0
-        var remaining_str = "-" + format_time(remaining)
-        var rem_meas = ui._measure_text(remaining_str, 12)
-        var rem_x = player_x + player_w - ui.text_w_design(rem_meas.x + 20)
-        ui.move_to(rem_x, time_y)
-        ui.label(remaining_str, 20, TEXT_DIM)
+        # --- Chapter bar (lower, centered, chevron flanks) ---
+        var chap_x = margin + skip_w + 32.0
+        var chap_w = sw_design - 2.0 * (margin + skip_w + 32.0)
+        var chap_y = lower_y
 
-        # --- Chapter seek bar (tracks position within the current chapter) ---
-        var chap_bar_y = time_y + 30.0
-        var chap_bar_h = 8.0
         var chap_start = self._chapter_start_sec()
         var chap_end = self._chapter_end_sec()
         var chap_dur = chap_end - chap_start
@@ -1336,14 +1430,24 @@ struct PlayerScreen:
         if chap_pos > chap_dur:
             chap_pos = chap_dur
 
+        # Chapter tracker: elapsed / total for this chapter, right-aligned
+        # above the chapter bar (mirrors the book tracker's placement).
+        var chap_text = format_time(chap_pos) + "  /  " + format_time(chap_dur)
+        var chap_time_meas = ui._measure_text(chap_text, label_size)
+        ui.move_to(
+            chap_x + chap_w - ui.text_w_design(chap_time_meas.x),
+            chap_y - label_h - 8.0,
+        )
+        ui.label(chap_text, label_size, TEXT_MUTED)
+
         var chap_result = ui.slider(
-            player_x,
-            chap_bar_y,
-            player_w,
-            chap_bar_h,
+            chap_x,
+            chap_y,
+            chap_w,
+            bar_h,
             chap_pos,
             0.0,
-            chap_dur,
+            max(chap_dur, 0.001),
         )
         if chap_result.clicked:
             self.chapter_dragging = True
@@ -1367,208 +1471,513 @@ struct PlayerScreen:
                     self.audio_backend.play()
             self.chapter_dragging = False
 
-        # Chapter time labels
-        var chap_time_y = chap_bar_y + chap_bar_h + 10.0
-        var chap_elapsed_str = format_time(chap_pos)
-        ui.move_to(player_x, chap_time_y)
-        ui.label(chap_elapsed_str, 18, TEXT_DIM)
-
-        var chap_remaining = chap_dur - chap_pos
-        if chap_remaining < 0.0:
-            chap_remaining = 0.0
-        var chap_rem_str = "-" + format_time(chap_remaining)
-        var chap_rem_meas = ui._measure_text(chap_rem_str, 12)
-        var chap_rem_x = (
-            player_x + player_w - ui.text_w_design(chap_rem_meas.x + 20)
-        )
-        ui.move_to(chap_rem_x, chap_time_y)
-        ui.label(chap_rem_str, 18, TEXT_DIM)
-
-        # Chapter label (centered between the two time labels)
-        var chap_label = "Chapter"
-        if self.current_chapter_idx >= 0 and self.current_chapter_idx < len(
-            self.chapters
-        ):
-            chap_label = "Ch " + String(
-                self.chapters[self.current_chapter_idx].index
-            )
-        var chap_lbl_meas = ui._measure_text(chap_label, 12)
-        var chap_lbl_x = (
-            player_x + (player_w - ui.text_w_design(chap_lbl_meas.x)) / 2.0
-        )
-        ui.move_to(chap_lbl_x, chap_time_y)
-        ui.label(chap_label, 18, GREEN)
-
-        # --- Playback control buttons (5 buttons, equal width) ---
-        var ctrl_y = chap_time_y + 50.0
-        var ctrl_btn_h = 120.0
-        var ctrl_gap = 80.0
-        var total_btns = 5
-        var total_gap_w = Float64(total_btns - 1) * ctrl_gap
-        var ctrl_btn_w = (player_w - total_gap_w) / Float64(total_btns)
-
-        # Prev chapter
-        var prev_ch_result = ui.button_at(
-            "|<",
-            player_x,
-            ctrl_y,
-            ctrl_btn_w,
-            ctrl_btn_h,
-            BTN_CONTROL,
+        # < > chapter-skip chevrons flanking the lower bar.
+        var chev_y = chap_y + bar_h / 2.0 - skip_h / 2.0
+        var prev_result = ui.button_at(
+            ICON_CHEV_LEFT,
+            margin,
+            chev_y,
+            skip_w,
+            skip_h,
+            PLAYER_BG,
             TEXT_LIGHT,
-            Color(55, 64, 80, 255),
+            Color(30, 60, 74, 255),
             action="prev_chapter",
         )
-        if prev_ch_result.clicked:
+        if prev_result.clicked:
             self._previous_chapter()
             self._seek_to_current()
 
-        # Skip back 30s
-        var skip_back_result = ui.button_at(
-            "< 10s",
-            player_x + ctrl_btn_w + ctrl_gap,
-            ctrl_y,
-            ctrl_btn_w,
-            ctrl_btn_h,
-            BTN_CONTROL,
+        var next_result = ui.button_at(
+            ICON_CHEV_RIGHT,
+            sw_design - margin - skip_w,
+            chev_y,
+            skip_w,
+            skip_h,
+            PLAYER_BG,
             TEXT_LIGHT,
-            Color(55, 64, 80, 255),
-            action="skip_back",
+            Color(30, 60, 74, 255),
+            action="next_chapter",
         )
-        if skip_back_result.clicked:
-            self.current_time = self.current_time - 10.0
-            if self.current_time < 0.0:
-                self.current_time = 0.0
-            self._update_current_chapter()
+        if next_result.clicked:
+            self._next_chapter()
             self._seek_to_current()
 
-        # Play/Pause
+    def _draw_left_rail(
+        mut self, mut ui: UIContext, sw_design: Float64, bottom_top: Float64
+    ) raises:
+        """Vertical stack of mode toggles on the left edge, vertically
+        centered between the header and the bottom bars."""
+        var margin = 24.0
+        var btn = 88.0
+        var gap = 36.0
+        var rail_x = margin
+        var rail_top = 140.0
+
+        var rail_bottom = bottom_top - 40.0
+        var n = 3
+        var block_h = Float64(n) * btn + Float64(n - 1) * gap
+        var rail_y = rail_top + (rail_bottom - rail_top - block_h) / 2.0
+
+        # Layers → chapter drawer
+        var layers_result = ui.button_at(
+            ICON_LAYERS,
+            rail_x,
+            rail_y,
+            btn,
+            btn,
+            PLAYER_BG,
+            TEXT_LIGHT,
+            Color(30, 60, 74, 255),
+        )
+        if layers_result.clicked:
+            self._set_overlay(OVERLAY_CHAPTERS)
+
+        # Sliders → settings popover (speed + volume)
+        var tune_y = rail_y + btn + gap
+        var tune_result = ui.button_at(
+            ICON_TUNE,
+            rail_x,
+            tune_y,
+            btn,
+            btn,
+            PLAYER_BG,
+            TEXT_LIGHT,
+            Color(30, 60, 74, 255),
+        )
+        if tune_result.clicked:
+            self._set_overlay(OVERLAY_SETTINGS)
+
+        # Info → book details popover
+        var info_y = rail_y + 2.0 * (btn + gap)
+        var info_result = ui.button_at(
+            ICON_INFO,
+            rail_x,
+            info_y,
+            btn,
+            btn,
+            PLAYER_BG,
+            TEXT_LIGHT,
+            Color(30, 60, 74, 255),
+        )
+        if info_result.clicked:
+            self._set_overlay(OVERLAY_INFO)
+
+    # ------------------------------------------------------------------
+    # Right rail — ±30s skips and circled play/pause
+    # ------------------------------------------------------------------
+
+    def _draw_right_rail(
+        mut self, mut ui: UIContext, sw_design: Float64, bottom_top: Float64
+    ) raises:
+        """Skip + play stack on the right edge, mirroring the left rail."""
+        var margin = 24.0
+        var btn = 88.0
+        var play_btn = 128.0
+        var gap = 52.0
+        var rail_x = sw_design - margin - play_btn
+        var rail_top = 140.0
+        var rail_bottom = bottom_top - 40.0
+        var block_h = 2.0 * btn + play_btn + 2.0 * gap
+        var rail_y = rail_top + (rail_bottom - rail_top - block_h) / 2.0
+
+        # << −30s
+        var back30_result = ui.button_at(
+            ICON_SKIP_BACK,
+            rail_x,
+            rail_y,
+            btn,
+            btn,
+            PLAYER_BG,
+            TEXT_LIGHT,
+            Color(30, 60, 74, 255),
+            action="skip_back",
+        )
+        if back30_result.clicked:
+            self._skip_30_back()
+
+        # Circled play / pause (the mock's encircled triangle).
         var play_label = ICON_PLAY
         if self.is_playing:
-            play_label = ICON_PAUSE
+            play_label = ICON_PAUSE_CIRCLE
         var play_result = ui.button_at(
             play_label,
-            player_x + 2.0 * ctrl_btn_w + 2.0 * ctrl_gap,
-            ctrl_y,
-            ctrl_btn_w,
-            ctrl_btn_h,
+            rail_x,
+            rail_y + btn + gap,
+            play_btn,
+            play_btn,
+            PLAYER_BG,
             GREEN,
-            ACCENT_DARK,
-            Color(140, 192, 88, 255),
+            Color(60, 90, 104, 255),
             action="play_pause",
         )
         if play_result.clicked:
             self.toggle_playback()
 
-        # Skip forward 30s
-        var skip_fwd_result = ui.button_at(
-            "10s >",
-            player_x + 3.0 * ctrl_btn_w + 3.0 * ctrl_gap,
-            ctrl_y,
-            ctrl_btn_w,
-            ctrl_btn_h,
-            BTN_CONTROL,
+        # >> +30s
+        var fwd30_result = ui.button_at(
+            ICON_SKIP_FORWARD,
+            rail_x,
+            rail_y + btn + gap + play_btn + gap,
+            btn,
+            btn,
+            PLAYER_BG,
             TEXT_LIGHT,
-            Color(55, 64, 80, 255),
+            Color(30, 60, 74, 255),
             action="skip_forward",
         )
-        if skip_fwd_result.clicked:
-            self.current_time = self.current_time + 10.0
-            if self.current_time > self.duration:
-                self.current_time = self.duration
-            self._update_current_chapter()
-            self._seek_to_current()
+        if fwd30_result.clicked:
+            self._skip_30_forward()
 
-        # Next chapter
-        var next_ch_result = ui.button_at(
-            ">|",
-            player_x + 4.0 * ctrl_btn_w + 4.0 * ctrl_gap,
-            ctrl_y,
-            ctrl_btn_w,
-            ctrl_btn_h,
-            BTN_CONTROL,
-            TEXT_LIGHT,
-            Color(55, 64, 80, 255),
-            action="next_chapter",
+    # ------------------------------------------------------------------
+    # Cover art — centered in the free space
+    # ------------------------------------------------------------------
+
+    def _draw_cover(
+        mut self,
+        mut ui: UIContext,
+        sw_design: Float64,
+        sh_design: Float64,
+        bottom_top: Float64,
+    ):
+        """Blit the cover centered between header and bottom bars.
+
+        Painted FIRST (bottom layer) — rails and bars draw over it when a
+        narrow window forces overlap, so controls stay visible/clickable.
+        The `side` cap keeps the art clear of the rails where space allows.
+        """
+        var header_h = 92.0
+        var top = header_h + 20.0
+        var bottom = bottom_top - 40.0
+        var box_h = bottom - top
+
+        var side = box_h
+        if side > sw_design - 2.0 * 24.0:
+            side = sw_design - 2.0 * 24.0
+        if side < 80.0:
+            side = 80.0
+        var cover_x = (sw_design - side) / 2.0
+        var cover_y = top + (box_h - side) / 2.0
+        _ = sh_design
+
+        if self.has_cover:
+            var cover_h_safe = self.cover_h
+            if cover_h_safe < 1:
+                cover_h_safe = 1
+            var aspect = Float64(self.cover_w) / Float64(cover_h_safe)
+            var dst_w = side
+            var dst_h = side
+            if aspect >= 1.0:
+                dst_h = side / aspect
+            else:
+                dst_w = side * aspect
+            var scale = Float64(ui.ui_scale)
+            ui.canvas[unsafe_offset=0].blit_rgba(
+                self.cover_pixels.value(),
+                self.cover_w,
+                self.cover_h,
+                self.cover_w * 4,
+                cover_x * scale,
+                cover_y * scale,
+                dst_w * scale,
+                dst_h * scale,
+            )
+        else:
+            ui.card(
+                cover_x, cover_y, side, side, PLACEHOLDER_BG, roundness=0.08
+            )
+            var cover_icon = "COVER"
+            var icon_meas = ui._measure_text(cover_icon, 48)
+            var icon_x = cover_x + (side - ui.text_w_design(icon_meas.x)) / 2.0
+            var icon_y = cover_y + (side - ui.text_h_design(icon_meas.y)) / 2.0
+            ui.move_to(icon_x, icon_y)
+            ui.label(cover_icon, 48, TEXT_DIM)
+
+    # ------------------------------------------------------------------
+    # Overlays — chapter drawer, settings popover, info popover
+    # ------------------------------------------------------------------
+
+    def _draw_overlays(
+        mut self,
+        mut ui: UIContext,
+        sw_design: Float64,
+        sh_design: Float64,
+    ) raises:
+        """Mutually exclusive floating panels + click-outside-to-close.
+
+        `overlay_armed` prevents the same click that opened a panel from
+        instantly closing it (the toggle button click would otherwise land
+        on the click-outside guard the same frame)."""
+        if self.overlay_mode == OVERLAY_NONE:
+            return
+
+        if ui.mouse_pressed and not self.overlay_armed:
+            if not self._pointer_in_active_panel(ui, sw_design, sh_design):
+                self.overlay_mode = OVERLAY_NONE
+                return
+
+        self.overlay_armed = False
+
+        if self.overlay_mode == OVERLAY_CHAPTERS:
+            self._draw_chapter_drawer(ui, sw_design, sh_design)
+        elif self.overlay_mode == OVERLAY_SETTINGS:
+            self._draw_settings_popover(ui, sw_design, sh_design)
+        elif self.overlay_mode == OVERLAY_INFO:
+            self._draw_info_popover(ui, sw_design, sh_design)
+
+    def _pointer_in_active_panel(
+        self, mut ui: UIContext, sw_design: Float64, sh_design: Float64
+    ) -> Bool:
+        """True if the cursor is inside the currently open overlay panel."""
+        var card = self._active_panel_rect(sw_design, sh_design)
+        return ui._hit(card)
+
+    def _active_panel_rect(
+        self, sw_design: Float64, sh_design: Float64
+    ) -> Rect:
+        """Design-px rect of the open overlay (chapter drawer OR popovers)."""
+        if self.overlay_mode == OVERLAY_CHAPTERS:
+            return self._chapter_drawer_rect(sw_design, sh_design)
+        return self._popover_rect(sw_design, sh_design)
+
+    def _chapter_drawer_rect(
+        self, sw_design: Float64, sh_design: Float64
+    ) -> Rect:
+        """Geometry of the left chapter drawer (design px)."""
+        var margin = 20.0
+        var bottom = sh_design - 120.0
+        if bottom - DRAWER_TOP < DRAWER_MIN_H:
+            bottom = DRAWER_TOP + DRAWER_MIN_H
+            if bottom > sh_design:
+                bottom = sh_design
+        var usable = sw_design - 2.0 * margin
+        var w = DRAWER_W
+        if w > usable:
+            w = usable
+        return Rect(margin, DRAWER_TOP, w, bottom - DRAWER_TOP)
+
+    def _popover_rect(self, sw_design: Float64, sh_design: Float64) -> Rect:
+        """Geometry shared by the settings and info popovers (left-anchored)."""
+        var margin = 20.0
+        var w = 380.0
+        var bottom = sh_design - 120.0
+        if bottom - DRAWER_TOP < DRAWER_MIN_H:
+            bottom = DRAWER_TOP + DRAWER_MIN_H
+            if bottom > sh_design:
+                bottom = sh_design
+        var usable = sw_design - 2.0 * margin
+        if w > usable:
+            w = usable
+        return Rect(margin, DRAWER_TOP, w, bottom - DRAWER_TOP)
+
+    def _draw_chapter_drawer(
+        mut self, mut ui: UIContext, sw_design: Float64, sh_design: Float64
+    ) raises:
+        """Slide-out chapter list on the left (scrollable, click to seek)."""
+        var card = self._chapter_drawer_rect(sw_design, sh_design)
+        var x = Float64(card.x)
+        var y = Float64(card.y)
+        var w = Float64(card.width)
+        var h = Float64(card.height)
+
+        ui.card(x, y, w, h, CARD_BG, roundness=0.03)
+
+        # Drawer title + close button.
+        ui.move_to(x + 24.0, y + 18.0)
+        ui.label("Chapters", 22, TEXT_BRIGHT)
+
+        var close_btn = 36.0
+        var close_result = ui.button_at(
+            ICON_CLOSE,
+            x + w - close_btn - 14.0,
+            y + 12.0,
+            close_btn,
+            close_btn,
+            CARD_BG,
+            TEXT_DIM,
+            Color(30, 60, 74, 255),
         )
-        if next_ch_result.clicked:
-            self._next_chapter()
-            self._seek_to_current()
+        if close_result.clicked:
+            self.overlay_mode = OVERLAY_NONE
+            return
 
-        # --- Speed + Volume row ---
-        var vol_y = ctrl_y + ctrl_btn_h + 24.0
+        # Scrollable chapter rows.
+        if len(self.chapters) == 0:
+            ui.move_to(x + 24.0, y + 70.0)
+            ui.label("No chapters", 18, TEXT_DIM)
+            return
 
-        # Speed: two buttons (− / +) with the current speed label between.
-        # ±0.05 per click, pitch-correct via ffmpeg atempo restart.
-        # Buttons auto-widen to label + padding (fitted_button_w), so all
-        # x offsets below must use the GROWN widths to stay in sync.
-        var speed_btn_w = 40.0
-        var speed_btn_w_minus = ui.fitted_button_w("-", 22, speed_btn_w)
-        var speed_minus_result = ui.button_at(
+        var list_top = y + DRAWER_TITLE_ROW
+        var list_h = h - DRAWER_TITLE_ROW - DRAWER_PAD_BOTTOM
+        var chap_h = CHAPTER_ROW_H
+
+        ui.begin_clip(x, list_top, w, list_h)
+
+        var scroll_design = Float64(self.chapter_scroll_offset) / Float64(
+            ui.ui_scale
+        )
+        var row_y = list_top - scroll_design
+
+        for i in range(len(self.chapters)):
+            var chap = self.chapters[i]
+            if row_y + chap_h < list_top:
+                row_y += chap_h
+                continue
+            if row_y > list_top + list_h:
+                break
+
+            # Highlight only the current chapter (canvas has no alpha
+            # compositing — "transparent" simply means don't paint).
+            if chap.is_current:
+                var row_rect = ui.rect(x + 10.0, row_y, w - 20.0, chap_h - 6.0)
+                ui.canvas[unsafe_offset=0].fill_rect(
+                    Float64(row_rect.x),
+                    Float64(row_rect.y),
+                    Float64(row_rect.width),
+                    Float64(row_rect.height),
+                    CHAPTER_HIGHLIGHT,
+                )
+
+            # Chapter number.
+            var ch_num = String(chap.index)
+            ui.move_to(x + 22.0, row_y + 10.0)
+            ui.label(ch_num, 16, GREEN if chap.is_current else TEXT_DIM)
+
+            # Chapter title (truncated to the row's free width; time column
+            # reserves ~120 design px on the right).
+            var title_x = x + 60.0
+            var max_title_w = w - 60.0 - 130.0
+            var chap_title = chap.tag
+            var title_meas = ui._measure_text(chap_title, 14)
+            if title_meas.x > Float32(max_title_w) * ui.font_scale:
+                var max_chars = Int(max_title_w / 8.0)
+                if max_chars > 3:
+                    chap_title = (
+                        truncate_string(chap_title, max_chars - 3) + "..."
+                    )
+                else:
+                    chap_title = truncate_string(chap_title, max_chars)
+            ui.move_to(title_x, row_y + 9.0)
+            var title_color = TEXT_BRIGHT if chap.is_current else TEXT_LIGHT
+            ui.label(chap_title, 20, title_color)
+
+            # Second line: start time + chapter duration ("1h 12m" style).
+            var start_sec = Float64(chap.start_time_ms) / 1000.0
+            var duration_text = _chapter_duration_text(chap)
+            var start_text = format_time(start_sec)
+            ui.move_to(title_x, row_y + 42.0)
+            ui.label(start_text, 14, TEXT_MUTED)
+
+            var dur_meas = ui._measure_text(duration_text, 14)
+            var dur_x = x + w - ui.text_w_design(dur_meas.x) - 24.0
+            ui.move_to(dur_x, row_y + 42.0)
+            ui.label(duration_text, 14, TEXT_MUTED)
+
+            # Click detection for chapter row (same rect as drawn).
+            var click_rect = ui.rect(x + 10.0, row_y, w - 20.0, chap_h)
+            if ui._clicked(click_rect):
+                self.current_time = Float64(chap.start_time_ms) / 1000.0
+                self._update_current_chapter()
+                self._seek_to_current()
+
+            row_y += chap_h
+
+        ui.end_clip()
+
+    def _draw_settings_popover(
+        mut self, mut ui: UIContext, sw_design: Float64, sh_design: Float64
+    ) raises:
+        """Left-anchored popover: playback speed −/+ and volume slider."""
+        var card = self._popover_rect(sw_design, sh_design)
+        var x = Float64(card.x)
+        var y = Float64(card.y)
+        var w = Float64(card.width)
+        var h = Float64(card.height)
+
+        ui.card(x, y, w, h, CARD_BG, roundness=0.03)
+
+        ui.move_to(x + 24.0, y + 18.0)
+        ui.label("Settings", 22, TEXT_BRIGHT)
+
+        var close_btn = 36.0
+        var close_result = ui.button_at(
+            ICON_CLOSE,
+            x + w - close_btn - 14.0,
+            y + 12.0,
+            close_btn,
+            close_btn,
+            CARD_BG,
+            TEXT_DIM,
+            Color(30, 60, 74, 255),
+        )
+        if close_result.clicked:
+            self.overlay_mode = OVERLAY_NONE
+            return
+
+        var row_y = y + 70.0
+
+        # --- Speed: − [label] + (±0.05 per tap, atempo restart) ---
+        ui.move_to(x + 24.0, row_y + 6.0)
+        ui.label("Speed", 18, TEXT_LIGHT)
+
+        var btn = 44.0
+        var minus_result = ui.button_at(
             "-",
-            player_x,
-            vol_y,
-            speed_btn_w,
-            52.0,
+            x + 24.0,
+            row_y + 34.0,
+            btn,
+            btn,
             BTN_CONTROL,
             TEXT_LIGHT,
-            Color(55, 64, 80, 255),
+            Color(30, 60, 74, 255),
             action="speed_down",
         )
-        if speed_minus_result.clicked:
+        if minus_result.clicked:
             self._change_speed(-0.05)
 
-        # Speed label (read-only, centered between the two buttons)
         var speed_lbl = self._speed_label()
         var speed_meas = ui._measure_text(speed_lbl, 16)
-        var speed_lbl_slot = 110.0  # design-px reserved for the label
-        var speed_lbl_x = (
-            player_x
-            + speed_btn_w_minus
-            + 10.0
-            + (speed_lbl_slot - ui.text_w_design(speed_meas.x)) / 2.0
+        var label_slot = 96.0
+        ui.move_to(
+            x
+            + 24.0
+            + btn
+            + 12.0
+            + (label_slot - ui.text_w_design(speed_meas.x)) / 2.0,
+            row_y + 46.0,
         )
-        ui.move_to(speed_lbl_x, vol_y + 8.0)
-        ui.label(speed_lbl, 18, TEXT_BRIGHT)
+        ui.label(speed_lbl, 20, TEXT_BRIGHT)
 
-        var speed_plus_x = (
-            player_x + speed_btn_w_minus + 10.0 + speed_lbl_slot + 10.0
-        )
-        var speed_btn_w_plus = ui.fitted_button_w("+", 22, speed_btn_w)
-        var speed_plus_result = ui.button_at(
+        var plus_result = ui.button_at(
             "+",
-            speed_plus_x,
-            vol_y,
-            speed_btn_w,
-            52.0,
+            x + 24.0 + btn + 12.0 + label_slot + 12.0,
+            row_y + 34.0,
+            btn,
+            btn,
             BTN_CONTROL,
             TEXT_LIGHT,
-            Color(55, 64, 80, 255),
+            Color(30, 60, 74, 255),
             action="speed_up",
         )
-        if speed_plus_result.clicked:
+        if plus_result.clicked:
             self._change_speed(0.05)
 
-        # Volume label
-        var vol_label_x = speed_plus_x + speed_btn_w_plus + 140.0
-        ui.move_to(vol_label_x, vol_y + 12.0)
-        ui.label("Vol", 26, TEXT_DIM)
+        # --- Volume: slider + percentage ---
+        var vol_row_y = row_y + btn + 60.0
+        ui.move_to(x + 24.0, vol_row_y + 6.0)
+        ui.label("Volume", 18, TEXT_LIGHT)
 
-        # Volume slider
-        var vol_slider_x = vol_label_x + 200.0
-        var vol_slider_w = 300.0
-        var vol_slider_h = 10.0
+        var vol_slider_x = x + 24.0
+        var vol_slider_w = w - 120.0
         var vol_result = ui.slider(
             vol_slider_x,
-            vol_y + 16.0,
+            vol_row_y + 40.0,
             vol_slider_w,
-            vol_slider_h,
+            12.0,
             self.volume,
             0.0,
             1.0,
         )
-
-        # Handle volume drag
         if vol_result.clicked:
             self.volume_dragging = True
         if self.volume_dragging and ui.mouse_down:
@@ -1580,111 +1989,124 @@ struct PlayerScreen:
         elif not ui.mouse_down:
             self.volume_dragging = False
 
-        # Volume percentage label
         var vol_pct = Int(self.volume * 100.0)
         var vol_pct_str = String(vol_pct) + "%"
-        ui.move_to(vol_slider_x + vol_slider_w + 8.0, vol_y + 6.0)
-        ui.label(vol_pct_str, 20, TEXT_DIM)
+        ui.move_to(vol_slider_x + vol_slider_w + 14.0, vol_row_y + 38.0)
+        ui.label(vol_pct_str, 16, TEXT_DIM)
 
-        # Reset progress: unscrobbles every track + zeroes the position
-        # on Plex, then rewinds locally. Destructive to server state, so
-        # it sits at the row's far edge with a red tint.
-        # var reset_btn_w = 72.0
-        # var reset_fit_w = ui.fitted_button_w("RESET", 20, reset_btn_w)
-        # var reset_x = player_x + player_w - reset_fit_w
-        # var reset_result = ui.button_at(
-        #     "RESET",
-        #     reset_x,
-        #     vol_y,
-        #     reset_btn_w,
-        #     52.0,
-        #     Color(150, 60, 60, 255),
-        #     TEXT_LIGHT,
-        #     Color(190, 84, 84, 255),
-        #     action="reset_progress",
-        # )
-        # if reset_result.clicked:
-        #     self.reset_progress()
+    def _draw_info_popover(
+        mut self, mut ui: UIContext, sw_design: Float64, sh_design: Float64
+    ) raises:
+        """Left-anchored popover: title, author, series/genres, synopsis.
 
-        # --- Chapter list (scrollable) ---
-        if len(self.chapters) > 0:
-            var chap_list_y = vol_y + 90.0
-            var chap_list_bottom = sh_design - 10.0
-            var chap_list_h = chap_list_bottom - chap_list_y
-            var chap_h = 60.0
+        Carries the metadata the minimal layout1 canvas removed."""
+        var card = self._popover_rect(sw_design, sh_design)
+        var x = Float64(card.x)
+        var y = Float64(card.y)
+        var w = Float64(card.width)
+        var h = Float64(card.height)
 
-            ui.begin_clip(player_x, chap_list_y, player_w, chap_list_h)
+        ui.card(x, y, w, h, CARD_BG, roundness=0.03)
 
-            var scroll_design = Float64(self.chapter_scroll_offset) / Float64(
-                ui.ui_scale
+        ui.move_to(x + 24.0, y + 18.0)
+        ui.label("Details", 22, TEXT_BRIGHT)
+
+        var close_btn = 36.0
+        var close_result = ui.button_at(
+            ICON_CLOSE,
+            x + w - close_btn - 14.0,
+            y + 12.0,
+            close_btn,
+            close_btn,
+            CARD_BG,
+            TEXT_DIM,
+            Color(30, 60, 74, 255),
+        )
+        if close_result.clicked:
+            self.overlay_mode = OVERLAY_NONE
+            return
+
+        var text_x = x + 24.0
+        var text_w = w - 48.0
+        var row_y = y + DRAWER_TITLE_ROW
+
+        # Title, truncated by measured width (monospace 20 ≈ 12 design px/char).
+        if self.book_title.byte_length() > 0:
+            var fit_title = truncate_to_width(
+                self.book_title, text_w, Float64(ui.font_scale), 12.0
             )
-            var cy = chap_list_y - scroll_design
+            ui.move_to(text_x, row_y)
+            ui.label(fit_title, 20, TEXT_BRIGHT)
+            row_y += 32.0
 
-            for i in range(len(self.chapters)):
-                var chap = self.chapters[i]
-                var row_y = cy + Float64(i) * chap_h
+        if self.book_author.byte_length() > 0:
+            ui.move_to(text_x, row_y)
+            ui.label(
+                truncate_to_width(
+                    self.book_author, text_w, Float64(ui.font_scale), 11.0
+                ),
+                18,
+                TEXT_LIGHT,
+            )
+            row_y += 26.0
 
-                if row_y + chap_h < chap_list_y:
-                    continue
-                if row_y > chap_list_bottom:
-                    break
+        # Secondary line: narrator · series · year · genres.
+        var meta_parts = List[String]()
+        if self.book_narrator.byte_length() > 0:
+            meta_parts.append("Narrator: " + self.book_narrator)
+        if self.book_series.byte_length() > 0:
+            meta_parts.append(self.book_series)
+        if self.book_publisher_year.byte_length() > 0:
+            meta_parts.append(self.book_publisher_year)
+        if self.book_genres.byte_length() > 0:
+            meta_parts.append(self.book_genres)
+        if len(meta_parts) > 0:
+            var meta_line = meta_parts[0]
+            for i in range(1, len(meta_parts)):
+                meta_line = meta_line + "  ·  " + meta_parts[i]
+            ui.move_to(text_x, row_y)
+            ui.label(
+                truncate_to_width(
+                    meta_line, text_w, Float64(ui.font_scale), 9.6
+                ),
+                16,
+                TEXT_MUTED,
+            )
+            row_y += 26.0
 
-                # Row background: transparent by default (gradient shows
-                # through); highlight only the current chapter. Canvas has
-                # no alpha compositing, so "transparent" = don't paint.
-                if chap.is_current:
-                    var row_rect = ui.rect(
-                        player_x, row_y, player_w, chap_h - 2.0
-                    )
-                    ui.canvas[unsafe_offset=0].fill_rect(
-                        Float64(row_rect.x),
-                        Float64(row_rect.y),
-                        Float64(row_rect.width),
-                        Float64(row_rect.height),
-                        CHAPTER_HIGHLIGHT,
-                    )
-
-                # Chapter number
-                var ch_num = String(chap.index)
-                ui.move_to(player_x + 8.0, row_y + 12.0)
-                ui.label(ch_num, 20, GREEN if chap.is_current else TEXT_DIM)
-
-                # Chapter title (truncated)
-                var title_x_d = player_x + 40.0
-                var max_title_w = player_w - 180.0
-                var chap_title = chap.tag
-                var title_meas = ui._measure_text(chap_title, 14)
-                if title_meas.x > Float32(max_title_w) * ui.font_scale:
-                    var max_chars = Int(max_title_w / 8.0)
-                    if max_chars > 3:
-                        chap_title = (
-                            truncate_string(chap_title, max_chars - 3) + "..."
-                        )
-                    else:
-                        chap_title = truncate_string(chap_title, max_chars)
-
-                ui.move_to(title_x_d, row_y + 12.0)
-                var title_color = TEXT_BRIGHT if chap.is_current else TEXT_LIGHT
-                ui.label(chap_title, 26, title_color)
-
-                # Time range
-                var time_range = (
-                    format_time(Float64(chap.start_time_ms) / 1000.0)
-                    + " - "
-                    + format_time(Float64(chap.end_time_ms) / 1000.0)
-                )
-                var time_meas = ui._measure_text(time_range, 12)
-                var time_x = (
-                    player_x + player_w - ui.text_w_design(time_meas.x) - 100.0
-                )
-                ui.move_to(time_x, row_y + 9.0)
-                ui.label(time_range, 26, TEXT_MUTED)
-
-                # Click detection for chapter row (same rectangle as drawn)
-                var click_rect = ui.rect(player_x, row_y, player_w, chap_h)
-                if ui._clicked(click_rect):
-                    self.current_time = Float64(chap.start_time_ms) / 1000.0
-                    self._update_current_chapter()
-                    self._seek_to_current()
-
+        # Description, word-wrapped to the popover width and clipped to the
+        # card interior (monospace 16 ≈ 9.6 design px/char).
+        if self.book_description.byte_length() > 0:
+            row_y += 10.0
+            var line_h = 22.0
+            var max_lines = Int((y + h - row_y - 16.0) / line_h)
+            if max_lines < 1:
+                max_lines = 1
+            var cpl = Int(text_w / (9.6 * Float64(ui.font_scale)))
+            if cpl < 10:
+                cpl = 10
+            var wrapped = split_wrap_chars(self.book_description, cpl)
+            ui.begin_clip(x, row_y, w, y + h - row_y)
+            var line_idx = 0
+            while line_idx < max_lines and line_idx < len(wrapped):
+                ui.move_to(text_x, row_y + Float64(line_idx) * line_h)
+                ui.label(wrapped[line_idx], 16, TEXT_LIGHT)
+                line_idx += 1
             ui.end_clip()
+
+
+def _chapter_duration_text(chap: PlexChapter) -> String:
+    """Human chapter duration: 'Xh Ym', 'Ym Zs', or 'Zs' (seconds rounded)."""
+    var total_sec = Int(
+        (Float64(chap.end_time_ms - chap.start_time_ms) / 1000.0) + 0.5
+    )
+    if total_sec < 0:
+        total_sec = 0
+    var hours = total_sec // 3600
+    var minutes = (total_sec % 3600) // 60
+    var seconds = total_sec % 60
+    if hours > 0:
+        return String(hours) + "h " + String(minutes) + "m"
+    if minutes > 0:
+        return String(minutes) + "m " + String(seconds) + "s"
+    return String(seconds) + "s"

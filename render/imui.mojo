@@ -128,6 +128,11 @@ struct UIContext:
     var mouse_pos: Vec2
     var mouse_pressed: Bool  # True on the frame the left button went down
     var mouse_down: Bool  # True while the left button is held
+    # Touch-origin tracking (mirrors WindowInput; see its doc comment).
+    # True while the active press came from a touch—used by screens that
+    # scroll via drag (library list) to defer press-edge actions.
+    var press_is_touch: Bool
+    var touch_start: Vec2  # where the current touch drag began (screen px)
     var screen_w: Int  # Current window width (screen pixels)
     var screen_h: Int  # Current window height (screen pixels)
     var ui_scale: Float32  # screen_px = design_px * ui_scale (layout + dpi)
@@ -166,6 +171,11 @@ struct UIContext:
         )
         self.mouse_pressed = input[unsafe_offset=0].mouse_pressed
         self.mouse_down = input[unsafe_offset=0].mouse_down
+        self.press_is_touch = input[unsafe_offset=0].press_is_touch
+        self.touch_start = Vec2(
+            input[unsafe_offset=0].touch_start_x,
+            input[unsafe_offset=0].touch_start_y,
+        )
         self.screen_w = screen_w
         self.screen_h = screen_h
         # Layout scale = min dimension ratio * dpi. Keeps UI proportional to

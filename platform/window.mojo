@@ -83,6 +83,13 @@ from wayland.gen.xdg_shell import (
     xdg_toplevel_set_maximized,
     xdg_toplevel_set_title,
 )
+from wayland.gen.xdg_decoration_unstable_v1 import (
+    ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE,
+    zxdg_decoration_manager_v1_get_toplevel_decoration,
+    zxdg_toplevel_decoration_v1_listen,
+    zxdg_toplevel_decoration_v1_next_configure,
+    zxdg_toplevel_decoration_v1_set_mode,
+)
 
 
 # --- tiny libc bindings -------------------------------------------------
@@ -336,6 +343,49 @@ struct GlobalInfo(Copyable, Movable):
         self.version = version
 
 
+def _find_globals(
+    queue: WLPtr, display: WLPtr, wants: List[String]
+) raises -> List[GlobalInfo]:
+    """Scan registry globals once for several interfaces.
+
+    Globals are announced exactly once per registry, in one startup burst;
+    a sequential find-and-discard loop (find A, then find B) silently eats
+    B's announcement while waiting for A's successors. This scans until
+    every requested interface is claimed or the burst ends, so optional
+    protocols announced early survive to be bound.
+
+    Returns infos in the same order as `wants`; a name the compositor
+    doesn't offer comes back as name=0."""
+    var found = List[GlobalInfo]()
+    var want_count = len(wants)
+    for _make in range(want_count):
+        found.append(GlobalInfo(0, 0))
+
+    var remaining = len(wants)
+    var args = stack_allocation[MAX_EVENT_ARGS, WLArgument]()
+    # The burst is bounded: a handful of roundtrips collects a complete
+    # announcement list from any compositor (or proves it done).
+    for _attempt in range(20):
+        while wl_registry_next_global(queue, args):
+            var iface_name = _arg_as_string(args[unsafe_offset=1])
+            for want_idx in range(len(wants)):
+                if iface_name == wants[want_idx] and found[want_idx].name == 0:
+                    found[want_idx] = GlobalInfo(
+                        _arg_as_u32(args[unsafe_offset=0]),
+                        _arg_as_u32(args[unsafe_offset=2]),
+                    )
+                    remaining -= 1
+            _free_string_arg(args[unsafe_offset=1])
+            if remaining == 0:
+                return found^
+        # Pump what's still in flight without ever blocking on an idle
+        # socket (dispatch would block forever once the burst is over;
+        # roundtrip always returns).
+        _ = wl_display_roundtrip(display)
+        _ = wl_display_dispatch_pending(display)
+    return found^
+
+
 def _find_global(
     queue: WLPtr, display: WLPtr, want: String
 ) raises -> GlobalInfo:
@@ -448,6 +498,14 @@ struct WindowInput(Copyable, Movable):
     # True while the window has keyboard focus (wl_keyboard enter/leave).
     # Gamepad input is only honored while focused.
     var focused: Bool
+    # Touch-origin tracking (for drag-to-scroll): True when the current
+    # press came from wl_touch_down rather than a pointer button. Mouse
+    # presses fire actions on the press edge; touch presses instead record
+    # intent and complete on release (tap = activate, drag = scroll).
+    var press_is_touch: Bool
+    # Surface position where the current touch drag began (screen px).
+    var touch_start_x: Float64
+    var touch_start_y: Float64
     # internal edge bookkeeping
     var pending_clear: Bool
 
@@ -461,6 +519,9 @@ struct WindowInput(Copyable, Movable):
         self.any_key_pressed = False
         self.wheel_delta = 0.0
         self.focused = False
+        self.press_is_touch = False
+        self.touch_start_x = 0.0
+        self.touch_start_y = 0.0
         self.pending_clear = False
 
     def __copyinit__(mut self, existing: Self):
@@ -473,6 +534,9 @@ struct WindowInput(Copyable, Movable):
         self.any_key_pressed = existing.any_key_pressed
         self.wheel_delta = existing.wheel_delta
         self.focused = existing.focused
+        self.press_is_touch = existing.press_is_touch
+        self.touch_start_x = existing.touch_start_x
+        self.touch_start_y = existing.touch_start_y
         self.pending_clear = existing.pending_clear
 
 
@@ -485,6 +549,15 @@ struct Window(Copyable, Movable):
     var surface: WLPtr
     var xdg_surface: WLPtr
     var toplevel: WLPtr
+    # xdg-decoration (server-side title bar). decoration_manager null when
+    # the compositor doesn't advertise the protocol — all decoration calls
+    # guard on it, so compositors without it fall back to client chrome.
+    var decoration_manager: WLPtr
+    var toplevel_decoration: WLPtr
+    var deco_queue: WLPtr
+    # Latest decoration configure mode (SERVER_SIDE / CLIENT_SIDE); the
+    # configure must be acked by committing after it, which present() does.
+    var decoration_mode: UInt32
     var xs_queue: WLPtr
     var top_queue: WLPtr
     var wm_queue: WLPtr
@@ -524,6 +597,10 @@ struct Window(Copyable, Movable):
         self.surface = _null[NoneType]()
         self.xdg_surface = _null[NoneType]()
         self.toplevel = _null[NoneType]()
+        self.decoration_manager = _null[NoneType]()
+        self.toplevel_decoration = _null[NoneType]()
+        self.deco_queue = _null[NoneType]()
+        self.decoration_mode = UInt32(0)
         self.xs_queue = _null[NoneType]()
         self.top_queue = _null[NoneType]()
         self.wm_queue = _null[NoneType]()
@@ -553,6 +630,10 @@ struct Window(Copyable, Movable):
         self.toplevel = existing.toplevel
         self.xs_queue = existing.xs_queue
         self.top_queue = existing.top_queue
+        self.decoration_manager = existing.decoration_manager
+        self.toplevel_decoration = existing.toplevel_decoration
+        self.deco_queue = existing.deco_queue
+        self.decoration_mode = existing.decoration_mode
         self.wm_queue = existing.wm_queue
         self.pointer = existing.pointer
         self.keyboard = existing.keyboard
@@ -586,9 +667,20 @@ struct Window(Copyable, Movable):
             raise Error("wayland: registry listen failed")
         var reg_queue = queue_buf[unsafe_offset=0]
 
-        var comp_info = _find_global(reg_queue, w.display, "wl_compositor")
-        var shm_info = _find_global(reg_queue, w.display, "wl_shm")
-        var wm_info = _find_global(reg_queue, w.display, "xdg_wm_base")
+        # One burst scan for every interface we bind at startup. Globals
+        # are announced once each; separate find-loops would eat the
+        # announcements of later finds (decoration is announced BEFORE
+        # xdg_wm_base on KWin — sequential lookups starve it).
+        var wanted = List[String]()
+        wanted.append("wl_compositor")
+        wanted.append("wl_shm")
+        wanted.append("xdg_wm_base")
+        wanted.append("zxdg_decoration_manager_v1")  # optional
+        var infos = _find_globals(reg_queue, w.display, wanted)
+        ref comp_info = infos[0]
+        ref shm_info = infos[1]
+        ref wm_info = infos[2]
+        ref deco_info = infos[3]
 
         var compositor = wl_registry_bind(
             registry,
@@ -618,10 +710,48 @@ struct Window(Copyable, Movable):
         w.shm = shm
         w.wm_base = wm_base
 
+        # Server-side decorations: bind the manager, request a decoration
+        # object for our toplevel and ask for SERVER_SIDE chrome. The
+        # compositor replies with a configure carrying the granted mode —
+        # polled below before the buffer attach (an unacked decoration
+        # configure + buffer attach is UNCONFIGURED_BUFFER, a protocol
+        # error that compositors kill the client for).
+        if deco_info.name > 0:
+            var deco_mgr = wl_registry_bind(
+                registry,
+                shim_interface("zxdg_decoration_manager_v1"),
+                _wlstring("zxdg_decoration_manager_v1"),
+                deco_info.name,
+                1,
+            )
+            if Int(deco_mgr) != 0:
+                w.decoration_manager = deco_mgr
+
         var surface = wl_compositor_create_surface(compositor)
         var xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface)
         var toplevel = xdg_surface_get_toplevel(xdg_surface)
         xdg_toplevel_set_title(toplevel, _wlstring(title))
+
+        # Request server-side decorations (title bar drawn by the compositor)
+        # before the first commit. Guarded: compositors without
+        # zxdg_decoration_manager_v1 keep the client-side default.
+        w.toplevel_decoration = _null[NoneType]()
+        if Int(w.decoration_manager) != 0:
+            var deco = zxdg_decoration_manager_v1_get_toplevel_decoration(
+                w.decoration_manager, toplevel
+            )
+            w.toplevel_decoration = deco
+            if Int(deco) != 0:
+                zxdg_toplevel_decoration_v1_set_mode(
+                    deco, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+                )
+                var qd_buf = stack_allocation[1, WLPtr]()
+                if zxdg_toplevel_decoration_v1_listen(deco, qd_buf) != 0:
+                    # Listen failure is non-fatal: degrade to client chrome.
+                    w.toplevel_decoration = _null[NoneType]()
+                else:
+                    w.deco_queue = qd_buf[unsafe_offset=0]
+
         # Request a maximized toplevel BEFORE the first commit. The
         # compositor answers with a configure carrying the real workbench
         # size (see below) — the caller reads it from frame.width/height.
@@ -679,6 +809,23 @@ struct Window(Copyable, Movable):
             raise Error("wayland: never received surface configure")
         xdg_surface_ack_configure(xdg_surface, serial)
         _ = wl_display_roundtrip(w.display)
+
+        # Decoration configure: the compositor answers the set_mode request
+        # with (mode) on the decoration queue. Read it now so
+        # decoration_mode reflects what will be committed with the first
+        # buffer (the commit acks the configure — that's the protocol's
+        # ack mechanism for this object). Absent event = compositor picked
+        # its own mode; the default keeps decorations alive either way.
+        if Int(w.deco_queue) != 0:
+            var dargs = stack_allocation[MAX_EVENT_ARGS, WLArgument]()
+            for _ in range(20):
+                while zxdg_toplevel_decoration_v1_next_configure(
+                    w.deco_queue, dargs
+                ):
+                    w.decoration_mode = _arg_as_u32(dargs[unsafe_offset=0])
+                if w.decoration_mode != 0:
+                    break
+                _ = wl_display_roundtrip(w.display)
 
         _ = wl_display_roundtrip(w.display)
 
@@ -902,6 +1049,7 @@ struct Window(Copyable, Movable):
                 if st == 1:
                     self.input.mouse_down = True
                     self.input.mouse_pressed = True
+                    self.input.press_is_touch = False
                 else:
                     self.input.mouse_down = False
         # pointer axis: axis 0 = vertical scroll
@@ -932,6 +1080,9 @@ struct Window(Copyable, Movable):
             self.input.mouse_y = _arg_as_fixed(wargs[unsafe_offset=5])
             self.input.mouse_down = True
             self.input.mouse_pressed = True
+            self.input.press_is_touch = True
+            self.input.touch_start_x = self.input.mouse_x
+            self.input.touch_start_y = self.input.mouse_y
         while wl_touch_next_motion(self.tch_queue, wargs):
             self.input.mouse_x = _arg_as_fixed(wargs[unsafe_offset=2])
             self.input.mouse_y = _arg_as_fixed(wargs[unsafe_offset=3])

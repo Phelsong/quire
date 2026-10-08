@@ -2,6 +2,8 @@ from resources.color import Color
 from std.collections import Dict, Optional
 from std.memory import alloc, Layout, unsafe_memcpy
 from std.memory.unsafe_pointer import Pointer
+from std.os import path
+from std.pathlib import Path
 
 from functions.helpers import (
     format_time,
@@ -21,6 +23,7 @@ from functions.plex_bridge import (
     fetch_thumbnail,
     load_cached_cover,
     save_cached_cover,
+    get_audio_cache_dir,
     report_progress,
     mark_watched,
 )
@@ -71,11 +74,17 @@ from resources.plex_objects import (
     LibraryItem,
     ServerItem,
 )
+from resources.offline_library import load_saved_books
 from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
 from ui.font import FontSet
 from ui import Screen
 from ui.icons import ICON_PLAY, ICON_PAUSE, ICON_SETTINGS
 from ui.player_screen import PlayerScreen
+
+
+# Touch drag-to-scroll: movement below this (screen px) is a tap, at or
+# above it is a scroll drag.
+comptime TAP_SLOP_PX = 12.0
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +128,23 @@ struct LibraryScreen:
     var search_query_requested: Bool
     var pending_search_query: String
 
+    # One-time sidecar backfill request: draw() raises this when it loads a
+    # library; main.mojo runs sync_saved_sidecars() (network) then reloads.
+    # Reset after a successful sync so it never loops.
+    var sync_requested: Bool
+    var sync_done: Bool
+
+    # Touch drag-to-scroll. While a touch is down inside the list, the row
+    # it started on is STAGED (not activated): dragging scrolls and cancels
+    # the staging, releasing without dragging activates it. Mouse presses
+    # are untouched (press-edge activation as before).
+    var touch_scroll_active: Bool
+    var touch_last_y: Float64  # previous frame's touch y (screen px)
+    var touch_row_index: Int  # row staged by the press, -1 = none
+    var touch_moved: Bool  # drag exceeded the tap threshold
+    # Row index delivered by the most recent tap (valid one frame).
+    var touch_tap_index: Int
+
     # Lazy per-book cover cache, keyed by rating_key. Loaded AFTER the rest
     # of the screen renders: draw() queues visible rows, and one queued
     # cover is fetched per frame (a blocking HTTP call) so the UI never
@@ -127,6 +153,14 @@ struct LibraryScreen:
     var cover_sizes: Dict[String, Int]
     var cover_queue: List[String]  # rating_keys pending fetch
     var covers_done: Dict[String, Bool]  # rating_key -> fetched (or failed)
+    # Memoized download probe (rating_key -> has cached audio file). Filled
+    # lazily by _is_downloaded; recomputed from scratch per book-list load
+    # is enough — a SAVE completed this session shows its badge on reload.
+    var downloaded_cache: Dict[String, Bool]
+
+    # Downloads pinned to the head of every page/search (from sidecars,
+    # newest first). Refreshed by load_data; consumed by the sort pass.
+    var pinned_books: List[PlexBookCard]
 
     def __init__(out self, screen_w: Int, screen_h: Int):
         self.books = List[PlexBookCard]()
@@ -139,6 +173,11 @@ struct LibraryScreen:
         self.play_book_index = -1
         self.download_requested = False
         self.download_book_index = -1
+        self.touch_scroll_active = False
+        self.touch_last_y = 0.0
+        self.touch_row_index = -1
+        self.touch_moved = False
+        self.touch_tap_index = -1
 
         self.page = 0
         self.page_size = 25
@@ -152,6 +191,8 @@ struct LibraryScreen:
         self.cover_sizes = Dict[String, Int]()
         self.cover_queue = List[String]()
         self.covers_done = Dict[String, Bool]()
+        self.downloaded_cache = Dict[String, Bool]()
+        self.pinned_books = List[PlexBookCard]()
 
         # Search bar: spans the area below the header. Bounds are in screen
         # px (matching ui.mouse_pos); updated each frame in draw() to track
@@ -167,9 +208,18 @@ struct LibraryScreen:
         self.active_search = ""
         self.search_query_requested = False
         self.pending_search_query = ""
+        self.sync_requested = False
+        self.sync_done = False
 
     def load_data(mut self, app_state: PlexSession) raises:
-        """Fetch audiobooks from Plex server and populate the book list.
+        """Fetch audiobooks from Plex and populate the book list.
+
+        Offline-first: saved sidecars (downloads) are loaded BEFORE the
+        server fetch. With no token/library/server they ARE the library —
+        fully offline. Online they get merged into the hoist sort below the
+        server page (a downloaded book shows in whatever page holds it, and
+        sidecars only surface as standalone rows when the server is
+        unreachable).
 
         Uses the current page/page_size for server-side pagination via Plex's
         X-Plex-Container-Start/Size headers. Stores total_size for page count.
@@ -178,14 +228,43 @@ struct LibraryScreen:
         self.status_message = "Loading page " + String(self.page + 1) + "..."
         self.status_color = TEXT_DIM
 
+        # --- Offline seed: sidecars drive pinned rows + offline fallback ---
+        # `pinned_books` = every sidecar'd download, newest first. They're
+        # pinned onto the head of whatever page/search loads next
+        # (see _sort_books_for_display); with no server they ARE the list
+        # via offline_books below.
+        var saved = load_saved_books()
+        var offline_books = List[PlexBookCard]()
+        self.pinned_books = List[PlexBookCard]()
+        for i in range(len(saved)):
+            ref meta = saved[i]
+            var card = meta.to_card()
+            offline_books.append(card)
+            self.pinned_books.append(card)
+            # Sidecar rows are known-downloaded; memoize so badges and the
+            # sort pass need no filesystem probe this session.
+            self.downloaded_cache[meta.rating_key] = True
+
         var token = app_state.server_token
         if token.byte_length() == 0:
             token = app_state.account_token
 
-        # Guard: no token available
+        # Guard: no token available — offline mode.
         if token.byte_length() == 0:
-            self.status_message = "Not authenticated"
-            self.status_color = ERROR_COLOR
+            self.books = offline_books^
+            self.total_size = len(self.books)
+            var n = String(len(self.books))
+            if len(self.books) > 0:
+                self.status_message = (
+                    "Offline — showing " + n + " downloaded books"
+                )
+                self.status_color = TEXT_DIM
+            else:
+                self.status_message = "Not authenticated"
+                self.status_color = ERROR_COLOR
+            self.scroll_offset = 0.0
+            self.active_search = ""
+            self.cover_queue = List[String]()
             self.data_loaded = True
             return
 
@@ -212,7 +291,18 @@ struct LibraryScreen:
                     result.error_code
                 )
                 self.status_color = ERROR_COLOR
+                # The server answered but errored: offline rows are better
+                # than an empty page.
+                if len(offline_books) > 0:
+                    self.books = offline_books^
+                    self.total_size = len(self.books)
+                    self.scroll_offset = 0.0
+                    self.active_search = ""
             else:
+                # Server online — request the one-time sidecar backfill
+                if not self.sync_done:
+                    self.sync_requested = True
+
                 # COW transfer: List.copy() is shallow copy-on-write, so the
                 # 25 cards share storage with result.items until either side
                 # mutates — no per-card copy loop.
@@ -236,8 +326,29 @@ struct LibraryScreen:
                 # We're in page mode (no active search).
                 self.active_search = ""
         except e:
-            self.status_message = "Failed to load library"
-            self.status_color = ERROR_COLOR
+            # Server unreachable (no network, wrong URL, down): degrade to
+            # the offline library instead of an error page.
+            print("[Quire] library fetch failed, using offline: " + String(e))
+            self.books = offline_books^
+            self.total_size = len(self.books)
+            if len(self.books) > 0:
+                self.status_message = (
+                    "Offline — showing "
+                    + String(len(self.books))
+                    + " downloaded books"
+                )
+                self.status_color = TEXT_DIM
+            else:
+                self.status_message = "Failed to load library"
+                self.status_color = ERROR_COLOR
+            self.scroll_offset = 0.0
+            self.active_search = ""
+            self.cover_queue = List[String]()
+            self.data_loaded = True
+            return
+
+        # Hoist in-progress + downloaded books to the top of the list.
+        self._sort_books_for_display()
 
         # New book list: drop stale cover cache entries so keys are
         # re-queued for visible rows on the next frames.
@@ -255,6 +366,95 @@ struct LibraryScreen:
         if pages < 1:
             pages = 1
         return pages
+
+    def _is_downloaded(mut self, rating_key: String) raises -> Bool:
+        """True if the book's first track is cached in the audio directory.
+
+        Mirrors the player's source-resolution probe (same extension set):
+        a cached file means offline playback works. Results are memoized
+        per rating_key (dict hit = no filesystem stats) because draw() calls
+        this per visible row every frame."""
+        if rating_key in self.downloaded_cache:
+            return self.downloaded_cache[rating_key]
+
+        var extensions = List[String]()
+        extensions.append("mp3")
+        extensions.append("ogg")
+        extensions.append("wav")
+        extensions.append("m4b")
+        extensions.append("m4a")
+        extensions.append("aac")
+        extensions.append("flac")
+
+        var cache_dir = get_audio_cache_dir()
+        var found = False
+        for i in range(len(extensions)):
+            var candidate = cache_dir + "/" + rating_key + "." + extensions[i]
+            if path.exists(Path(candidate)):
+                found = True
+                break
+        self.downloaded_cache[rating_key] = found
+        return found
+
+    def _sort_books_for_display(mut self) raises:
+        """Pin downloaded + in-progress books to the top of the list.
+
+        Two parts:
+        1. PIN — sidecar'd downloads (load_saved_books, newest first) are
+           merged onto the head of ANY loaded page/search, deduped against
+           rows already present, and removed from their old positions. So
+           your downloads are always the first items regardless of which
+           page Plex paginated them onto.
+        2. HOIST — in-progress books already on this page rise above the
+           remaining server rows (last-listened proxy: viewOffset is the
+           only listen-state the listing exposes).
+
+        Runs after load_data/run_search land a fresh `books` list.
+        """
+        if len(self.books) == 0 and len(self.pinned_books) == 0:
+            return
+
+        # --- Pass 1: pin sidecar'd downloads to the head ---
+        # Dedup: a book both pinned and on this page keeps ONE copy (the
+        # pinned one, which carries fresher offline progress).
+        var seen = List[String]()
+        var pinned_head = List[PlexBookCard]()
+        for i in range(len(self.pinned_books)):
+            var pinned = self.pinned_books[i]
+            seen.append(pinned.rating_key)
+            pinned_head.append(pinned)
+
+        var rows = List[PlexBookCard]()
+        for i in range(len(self.books)):
+            var book = self.books[i]
+            var duplicate = False
+            for j in range(len(seen)):
+                if seen[j] == book.rating_key:
+                    duplicate = True
+                    break
+            if not duplicate:
+                rows.append(book)
+
+        # --- Pass 2: hoist in-progress rows within the page remainder ---
+        var in_progress = List[PlexBookCard]()
+        var rest = List[PlexBookCard]()
+        for i in range(len(rows)):
+            var book = rows[i]
+            if book.view_offset_ms > 0 and (
+                book.viewed_leaf_count < book.leaf_count or book.leaf_count == 0
+            ):
+                in_progress.append(book)
+            else:
+                rest.append(book)
+
+        var hoisted = List[PlexBookCard]()
+        for i in range(len(pinned_head)):
+            hoisted.append(pinned_head[i])
+        for i in range(len(in_progress)):
+            hoisted.append(in_progress[i])
+        for i in range(len(rest)):
+            hoisted.append(rest[i])
+        self.books = hoisted^
 
     def run_search(mut self, app_state: PlexSession, query: String) raises:
         """Fetch server-side search results for `query` and replace `books`.
@@ -301,6 +501,9 @@ struct LibraryScreen:
             self.status_message = "Search failed: " + String(e)
             self.status_color = ERROR_COLOR
 
+        # Search results use the same hoist ordering as the page view.
+        self._sort_books_for_display()
+
         # New book list: drop stale cover queue (same as load_data).
         self.cover_queue = List[String]()
 
@@ -334,12 +537,16 @@ struct LibraryScreen:
         ](Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(dst)))
         self.cover_sizes[rating_key] = decoded.width * 1000000 + decoded.height
 
-    def _fetch_next_cover(mut self, app_state: PlexSession) raises:
+    def _fetch_next_cover(
+        mut self, app_state: PlexSession, player: PlayerScreen
+    ) raises:
         """Fetch ONE queued cover per call (blocking HTTP).
 
         Called from draw() AFTER the frame's rows are drawn, so a slow
         thumbnail never delays rendering — it just appears on a later
-        frame. Queue is rebuilt each frame from currently-visible rows.
+        frame. Queue is rebuilt each frame from currently-visible rows;
+        the now-playing bar queues the playing book even when its row is
+        off-page, resolved via player.book_thumb.
         """
         # Skip entries already fetched; drop them from the queue.
         while len(self.cover_queue) > 0:
@@ -356,12 +563,16 @@ struct LibraryScreen:
         _ = self.cover_queue.pop(0)
         self.covers_done[rating_key] = True  # only attempt each cover once
 
-        # Find the book for this rating_key to get its thumb path.
+        # Find the book for this rating_key to get its thumb path. The
+        # playing book is resolved from the player (works when paged away).
         var thumb_path = ""
-        for i in range(len(self.books)):
-            if self.books[i].rating_key == rating_key:
-                thumb_path = self.books[i].thumb
-                break
+        if rating_key == player.book_id:
+            thumb_path = player.book_thumb
+        else:
+            for i in range(len(self.books)):
+                if self.books[i].rating_key == rating_key:
+                    thumb_path = self.books[i].thumb
+                    break
         if thumb_path.byte_length() == 0:
             return
 
@@ -407,6 +618,23 @@ struct LibraryScreen:
         # elif ui.key_pressed(KEY_DELETE):
         # self.search_input.handle_delete()
 
+    def clear_teardown(mut self):
+        """Drop big container state before scope exit (see main() teardown).
+
+        The book/cover dicts hold the only strong references to decoded
+        cover pixel buffers; emptying them here frees those allocations on
+        this side so the implicit deinits never release shared storage
+        twice. Must be idempotent-safe at exit — there is no draw after."""
+        self.books = List[PlexBookCard]()
+        self.pinned_books = List[PlexBookCard]()
+        self.downloaded_cache = Dict[String, Bool]()
+        self.covers_done = Dict[String, Bool]()
+        self.cover_queue = List[String]()
+        self.cover_pixels = Dict[
+            String, Optional[Pointer[UInt8, MutUntrackedOrigin]]
+        ]()
+        self.cover_sizes = Dict[String, Int]()
+
     def handle_scroll(mut self, wheel_delta: Float32, screen_h: Int):
         """Handle mouse wheel scrolling."""
         if len(self.books) == 0:
@@ -427,6 +655,81 @@ struct LibraryScreen:
 
         self.scroll_offset += wheel_delta * 40.0
         var max_scroll = Float32(total_height - visible_height - 300)
+        if self.scroll_offset < 0.0:
+            self.scroll_offset = 0.0
+        elif self.scroll_offset > max_scroll:
+            self.scroll_offset = max_scroll
+
+    def _touch_in_list(
+        self, ui: UIContext, list_top: Float64, list_bottom: Float64
+    ) -> Bool:
+        """True if the active press point is inside the scrollable list."""
+        var mouse_y = Float64(ui.mouse_pos.y)
+        return mouse_y >= list_top and mouse_y < list_bottom
+
+    def _handle_touch_scroll(
+        mut self,
+        mut ui: UIContext,
+        list_top: Float64,
+        list_bottom: Float64,
+        max_scroll: Float32,
+        row_hit: Int,
+    ) -> Bool:
+        """One touch-drag scroll step; returns True if a tap should fire.
+
+        Touch lifecycle mapped to scroll:
+          press   → stage `row_hit` (touch_row_index), begin tracking
+          motion  → scroll by the drag delta (1:1 finger travel); movement
+                    past TAP_SLOP_PX cancels the staged row
+          release → no drag = tap → True (caller activates the staged row)
+
+        Mouse input passes straight through (returns False; mouse clicks
+        keep their own press-edge path). Keys off ui.press_is_touch.
+        """
+        if not ui.mouse_down:
+            # Release: a still-staged row that never dragged = tap.
+            var was_tap = (
+                self.touch_scroll_active
+                and not self.touch_moved
+                and self.touch_row_index >= 0
+            )
+            if was_tap:
+                self.touch_tap_index = self.touch_row_index
+            self.touch_scroll_active = False
+            self.touch_row_index = -1
+            self.touch_moved = False
+            return was_tap
+
+        if not ui.press_is_touch:
+            return False  # mouse drag: nothing to do here
+
+        if not self.touch_scroll_active:
+            # Press starts tracking (only inside the scrollable region).
+            if not self._touch_in_list(ui, list_top, list_bottom):
+                return False
+            self.touch_scroll_active = True
+            self.touch_last_y = Float64(ui.mouse_pos.y)
+            self.touch_row_index = row_hit
+            self.touch_moved = False
+            return False
+
+        # Active touch drag: scroll by finger delta (screen px → design px).
+        var dy_screen = Float64(ui.mouse_pos.y) - self.touch_last_y
+        self.touch_last_y = Float64(ui.mouse_pos.y)
+        if dy_screen != 0.0:
+            var dy_design = dy_screen / Float64(ui.ui_scale)
+            self.scroll_offset = Float32(
+                Float64(self.scroll_offset) - dy_design
+            )
+        var moved_px = dy_screen if dy_screen > 0.0 else -dy_screen
+        if moved_px > TAP_SLOP_PX:
+            self.touch_moved = True
+        if self.touch_moved:
+            self._clamp_scroll(max_scroll)
+        return False
+
+    def _clamp_scroll(mut self, max_scroll: Float32):
+        """Keep touch-drag scroll_offset inside [0, max_scroll]."""
         if self.scroll_offset < 0.0:
             self.scroll_offset = 0.0
         elif self.scroll_offset > max_scroll:
@@ -571,13 +874,47 @@ struct LibraryScreen:
         # --- Scrollable book list (compact Plex-style rows) ---
         # Reserve the bottom strip for the now-playing bar when a book is
         # loaded (matches the bar height below).
-        var bar_h = 64.0
+        var bar_h = 128.0
         var has_now_playing = player.book_title.byte_length() > 0
         var list_bottom = sh_design - 10.0
         if has_now_playing:
             list_bottom = sh_design - bar_h - 6.0
-        var list_top = status_y + 26.0
+        # Clear the pagination row (buttons end at status_y + 34) with room
+        # to spare so the first card never crowds the PREV/NEXT buttons.
+        var list_top = status_y + 54.0
         var list_height = list_bottom - list_top
+
+        # Touch drag-to-scroll scroll bounds (same row metrics as below).
+        var touch_row_h = 180.0
+        var touch_row_gap = 16.0
+        var touch_total_h = (
+            Float64(len(self.books)) * (touch_row_h + touch_row_gap)
+            - touch_row_gap
+        )
+        var touch_max_scroll = Float32(0.0)
+        if touch_total_h > Float64(list_height):
+            touch_max_scroll = Float32(touch_total_h - Float64(list_height))
+
+        # Which row (if any) is under the current press point. Computed
+        # before the draw loop so the touch handler can stage it.
+        var row_hit = -1
+        if ui.mouse_down and ui.press_is_touch:
+            var hit_design_y = (
+                Float64(ui.mouse_pos.y) / Float64(ui.ui_scale)
+                - list_top
+                + Float64(self.scroll_offset) / Float64(ui.ui_scale)
+            )
+            if hit_design_y >= 0.0:
+                var stride = touch_row_h + touch_row_gap
+                var idx = Int(hit_design_y / stride)
+                if idx >= 0 and idx < len(self.books):
+                    # Must be inside the row body, not the gap.
+                    if hit_design_y - Float64(idx) * stride < touch_row_h:
+                        row_hit = idx
+
+        var tap_fired = self._handle_touch_scroll(
+            ui, list_top, list_bottom, touch_max_scroll, row_hit
+        )
 
         ui.begin_clip(0.0, list_top, sw_design, list_height)
 
@@ -685,7 +1022,7 @@ struct LibraryScreen:
             ui.move_to(info_x, title_y + 40.0)
             ui.label(book.author, 20, TEXT_DIM)
 
-            # Progress line
+            # Downloaded badge (offline copy cached) + progress line.
             var progress_text = "Not Started"
             if book.duration_ms > 0:
                 if (
@@ -710,8 +1047,14 @@ struct LibraryScreen:
                         Float64(book.duration_ms) / 1000.0
                     )
 
+            # Hoisted rows are flagged so the ordering is explainable: a
+            # downloaded book shows a DOWNLOADED tag next to its progress.
+            var badge_text = progress_text
+            if self._is_downloaded(book.rating_key):
+                badge_text = progress_text + "  ·  DOWNLOADED"
+
             ui.move_to(info_x, title_y + 70.0)
-            ui.label(progress_text, 14, GREEN)
+            ui.label(badge_text, 14, GREEN)
 
             # --- Row actions (right side): SAVE + PLAY ---
             var play_w = 60.0
@@ -764,7 +1107,11 @@ struct LibraryScreen:
             # Full-row click target: clicking anywhere else on a row plays
             # it. Checked AFTER the PLAY button so the button wins when both
             # contain the press; _clicked() consumes via item_clicked.
-            if ui._clicked(row_rect):
+            # Touch presses are excluded — they stage via the touch handler
+            # (drag = scroll would otherwise open a book mid-scroll) and
+            # complete as taps on release.
+            var row_click_allowed = not ui.press_is_touch
+            if row_click_allowed and ui._clicked(row_rect):
                 self.play_requested = True
                 # `books` holds either the page or search results; direct.
                 self.play_book_index = i
@@ -775,12 +1122,40 @@ struct LibraryScreen:
 
         ui.end_clip()
 
+        # Touch tap (press→release without drag) on a staged row: play it.
+        # Runs after end_clip so the tap can't double-fire with the
+        # mouse press-edge path above (touch never reaches that branch).
+        if tap_fired:
+            var tap_idx = self.touch_tap_index
+            self.touch_tap_index = -1
+            if tap_idx >= 0 and tap_idx < len(self.books):
+                self.play_requested = True
+                self.play_book_index = tap_idx
+                screen.current = 2
+                ui.item_clicked = True
+                return
+
+        # Queue the now-playing book's cover before the fetch pass: the
+        # playing book may not be among the visible rows (user paged away),
+        # and covers_done dedups repeat queueing.
+        if has_now_playing:
+            var np_queued = False
+            for queued_key in self.cover_queue:
+                if queued_key == player.book_id:
+                    np_queued = True
+                    break
+            if not np_queued and player.book_id not in self.covers_done:
+                self.cover_queue.append(player.book_id)
+
         # Lazy cover fetch: one blocking HTTP fetch per frame, after the
-        # screen has rendered, so the UI stays responsive.
-        self._fetch_next_cover(app_state)
+        # list has rendered. Runs here — before the now-playing early
+        # return — so the fetch pipeline keeps draining on every frame
+        # regardless of whether a book is playing.
+        self._fetch_next_cover(app_state, player)
 
         # ------------------------------------------------------------------
-        # Now-playing bar (bottom of screen)
+        # Now-playing bar (bottom of screen) — 2x row height; click the bar
+        # (or album art) to open the player screen.
         # ------------------------------------------------------------------
         if not has_now_playing:
             return
@@ -795,51 +1170,77 @@ struct LibraryScreen:
                 frac = 0.0
             if frac > 1.0:
                 frac = 1.0
-            ui.panel_bg(0, bar_y, sw_design * frac, 3.0, SLIDER_FILL)
+            ui.panel_bg(0, bar_y, sw_design * frac, 6.0, SLIDER_FILL)
 
-        # Title + author (left, after cover thumb).
+        # Cover thumb (left) — pixels come from the shared cover cache; the
+        # playing book's cover was queued above _fetch_next_cover.
         var np_cover_x = row_pad + inner_pad
-        var np_cover_size = bar_h - 16.0
-        ui.card(
-            np_cover_x,
-            bar_y + 8.0,
-            np_cover_size,
-            np_cover_size,
-            PLACEHOLDER_BG,
-            roundness=0.06,
-        )
-        var np_text_x = np_cover_x + np_cover_size + 14.0
-        var np_text_w = sw_design - np_text_x - 260.0
+        var np_cover_size = bar_h - 24.0
+        var np_has_thumb = False
+        if player.book_id in self.cover_pixels:
+            var np_cover_opt = self.cover_pixels[player.book_id]
+            if np_cover_opt:
+                var np_pixels = np_cover_opt.value()
+                var np_packed = self.cover_sizes[player.book_id]
+                var np_src_w = np_packed // 1000000
+                var np_src_h = np_packed % 1000000
+                var s = Float64(ui.ui_scale)
+                ui.canvas[unsafe_offset=0].blit_rgba(
+                    np_pixels,
+                    np_src_w,
+                    np_src_h,
+                    np_src_w * 4,
+                    np_cover_x * s,
+                    (bar_y + 12.0) * s,
+                    np_cover_size * s,
+                    np_cover_size * s,
+                )
+                np_has_thumb = True
+        if not np_has_thumb:
+            ui.card(
+                np_cover_x,
+                bar_y + 12.0,
+                np_cover_size,
+                np_cover_size,
+                PLACEHOLDER_BG,
+                roundness=0.06,
+            )
+
+        # Title + author (right of thumb), vertically centered.
+        var np_text_x = np_cover_x + np_cover_size + 18.0
+        var np_text_w = sw_design - np_text_x - 300.0
         var np_title = player.book_title
-        var np_meas = ui._measure_text(np_title, 16)
+        var np_title_size = 22
+        var np_meas = ui._measure_text(np_title, np_title_size)
         if np_meas.x > Float32(np_text_w) * ui.font_scale:
-            var max_chars = Int(np_text_w / 9.0)
-            if max_chars > 3:
-                np_title = truncate_string(np_title, max_chars - 3) + "..."
+            var np_max_chars = Int(np_text_w / 12.0)
+            if np_max_chars > 3:
+                np_title = truncate_string(np_title, np_max_chars - 3) + "..."
             else:
-                np_title = truncate_string(np_title, max_chars)
-        ui.move_to(np_text_x, bar_y + 14.0)
-        ui.label(np_title, 16, TEXT_BRIGHT)
-        ui.move_to(np_text_x, bar_y + 36.0)
-        ui.label(player.book_author, 14, TEXT_DIM)
+                np_title = truncate_string(np_title, np_max_chars)
+        ui.move_to(np_text_x, bar_y + 26.0)
+        ui.label(np_title, np_title_size, TEXT_BRIGHT)
+        ui.move_to(np_text_x, bar_y + 62.0)
+        ui.label(player.book_author, 18, TEXT_DIM)
 
         # Time display (right of text).
-        var np_time_x = sw_design - 250.0
-        ui.move_to(np_time_x, bar_y + 24.0)
+        var np_time_x = sw_design - 300.0
+        ui.move_to(np_time_x, bar_y + 46.0)
         ui.label(
             format_time(player.current_time)
             + " / "
             + format_time(player.duration),
-            14,
+            18,
             TEXT_LIGHT,
         )
 
-        # Play/pause toggle (far right).
+        # Play/pause toggle (far right). Checked BEFORE the open-player bar
+        # target below, so the button consumes its own press.
         var np_btn_w = 90.0
-        var np_btn_h = 34.0
+        var np_btn_h = 76.0
         var np_btn = ui.button_at(
             ICON_PAUSE if player.is_playing else ICON_PLAY,
-            sw_design - row_pad - np_btn_w,
+            sw_design - row_pad - np_btn_w - 100.0,
             bar_y + (bar_h - np_btn_h) / 2.0,
             np_btn_w,
             np_btn_h,
@@ -849,3 +1250,11 @@ struct LibraryScreen:
         )
         if np_btn.clicked:
             player.toggle_playback()
+            ui.item_clicked = True
+
+        # Whole-bar click target (album art included): open the player
+        # screen. Runs after the button so the button wins when both
+        # contain the press (ui._clicked refuses once item_clicked is set).
+        var open_rect = ui.rect(0.0, bar_y, sw_design, bar_h)
+        if ui._clicked(open_rect):
+            screen.current = 2

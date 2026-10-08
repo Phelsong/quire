@@ -19,3 +19,15 @@ comptime ICON_OVERFLOW = "\U000f01e5"
 comptime ICON_LOGOUT = "\U000f02d6"
 comptime ICON_VOLUME = "\U000f0482"
 comptime ICON_TUNE = "\U000f057e"
+
+# --- Player screen layout1 (assets/quire-layout1.png) ---
+comptime ICON_CHEV_LEFT = "\U000f0141"  # md-chevron-left (chapter back)
+comptime ICON_CHEV_RIGHT = "\U000f0142"  # md-chevron-right (alias of ICON_BACK)
+comptime ICON_SKIP_BACK = "\U000f013d"  # md-chevron-double-left (-30s)
+comptime ICON_SKIP_FORWARD = "\U000f013e"  # md-chevron-double-right (+30s)
+comptime ICON_PAUSE_CIRCLE = "\U000f03e6"  # md-pause-circle-outline
+comptime ICON_LAYERS = "\U000f0328"  # md-layers (chapter list toggle)
+comptime ICON_INFO = "\U000f02fc"  # md-information (book info toggle)
+comptime ICON_LIST = "\U000f0279"  # md-format-list-bulleted (top-right, stub)
+comptime ICON_HEADPHONES = "\U000f02cb"  # md-headphones (top-right, stub)
+comptime ICON_CLOSE = "\U000f0156"  # md-close (overlay dismiss)

@@ -31,6 +31,7 @@ mojo-wayland = { path = "../mojo-wayland" }
 httpx = ">=0.28.1,<0.29"
 mojo = ">=1.1.0,<1.1.9"
 ffmpeg = ">=9.0.2,<10"
+mojo_csv = ">=1.8.0,<2"
 # uuid = { git = "https://github.com/ehsanmok/uuid.git", branch = "main" }
 
 [pypi-dependencies]
@@ -50,6 +51,7 @@ gcc -shared -fPIC -O2 -Wall \
   -o .pixi/lib/libwayland_shim.so \
   ../mojo-wayland/wayland/c/shim.c \
   ../mojo-wayland/wayland/c/generated/xdg-shell-protocol.c \
+  ../mojo-wayland/wayland/c/generated/xdg-decoration-protocol.c \
   -lwayland-client"""
 
 # dev
@@ -65,7 +67,7 @@ build = { cmd = "mojo build main.mojo -I . -Xlinker -L.pixi/lib -Xlinker -L.pixi
 dist = { cmd = "python3 scripts/make_bundle.py", depends-on = ["build"] }
 appimage = { cmd = "python3 scripts/make_appimage.py", depends-on = ["dist"] }
 # test/debug
-test = "mojo -I . tests/test_config.mojo"
+test = "mojo -I . tests/test_config.mojo && mojo -I . tests/test_offline_library.mojo"
 wayland-test = { cmd = "mojo build tests/test_globals.mojo -I . -o .pixi/test_globals -Xlinker -L.pixi/lib -Xlinker -L.pixi/envs/default/lib -Xlinker -lwayland_shim -Xlinker -lwayland-client && LD_LIBRARY_PATH=.pixi/lib:.pixi/envs/default/lib .pixi/test_globals", depends-on = [
   "shim",
 ] }

@@ -103,6 +103,15 @@ struct FontSet(Copyable, Movable):
         codepoints.append(Int32(0xF02D6))  # logout
         codepoints.append(Int32(0xF0482))  # volume-high
         codepoints.append(Int32(0xF057E))  # tune (equalizer)
+        codepoints.append(Int32(0xF0141))  # chevron-left (chapter back)
+        codepoints.append(Int32(0xF013D))  # chevron-double-left (-30s)
+        codepoints.append(Int32(0xF013E))  # chevron-double-right (+30s)
+        codepoints.append(Int32(0xF03E6))  # pause-circle-outline
+        codepoints.append(Int32(0xF0328))  # layers (chapter list)
+        codepoints.append(Int32(0xF02FC))  # information (book info)
+        codepoints.append(Int32(0xF0279))  # format-list-bulleted (stub)
+        codepoints.append(Int32(0xF02CB))  # headphones (stub)
+        codepoints.append(Int32(0xF0156))  # close (overlay dismiss)
 
         self._ensure_slots()
 
