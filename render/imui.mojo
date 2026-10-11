@@ -12,7 +12,7 @@ from std.collections import Dict, List
 from resources.color import Color
 from render.canvas import Canvas
 from platform.window import WindowInput
-from platform.gamepad import Gamepad, null_gamepad_ptr
+from platform.gamepad import Gamepad
 from ui.font import FontSet
 from platform.text import TextAtlas
 from resources.keys import GAMEPAD_SENTINEL
@@ -35,6 +35,53 @@ comptime BUTTON_PAD_X = 30.0
 
 # Atlas ladder sizes (must match FontSet fields in ui/font.mojo).
 comptime ATLAS_SIZES = (12, 14, 16, 18, 20, 22, 26, 32, 48, 56, 64, 81, 96)
+
+
+@always_inline
+def _ladder_nearest(target: Int) -> Int:
+    """Nearest baked-atlas rung for a target pixel size.
+
+    The ladder is strictly ascending, so the nearest rung is the first one
+    whose midpoint with its right neighbor the target has not passed; above
+    the last midpoint the top rung (96) wins. Exact midpoints keep the
+    SMALLER rung — the same first-wins-on-ties rule as the original List
+    scan this replaces — and half-integer midpoints (72.5, 88.5) can never
+    be hit by an Int target, so the integer bounds below match it exactly.
+    Literally indexes the static ATLAS_SIZES tuple, so every subscript is
+    constant-folded — no heap allocation per call.
+
+    Range quirk kept from the old List scan: its (rung 12, diff 1000) seed
+    could only be beaten by candidates < 1000 away, so a target outside
+    every rung's ±1000 window (<= -988 or >= 1096) returned rung 12; the
+    same guard reproduces that exactly.
+    """
+    if target <= -988 or target >= 1096:
+        return ATLAS_SIZES[0]
+    if target <= 13:  # midpoint(12, 14)
+        return ATLAS_SIZES[0]
+    if target <= 15:  # midpoint(14, 16)
+        return ATLAS_SIZES[1]
+    if target <= 17:  # midpoint(16, 18)
+        return ATLAS_SIZES[2]
+    if target <= 19:  # midpoint(18, 20)
+        return ATLAS_SIZES[3]
+    if target <= 21:  # midpoint(20, 22)
+        return ATLAS_SIZES[4]
+    if target <= 24:  # midpoint(22, 26)
+        return ATLAS_SIZES[5]
+    if target <= 29:  # midpoint(26, 32)
+        return ATLAS_SIZES[6]
+    if target <= 40:  # midpoint(32, 48)
+        return ATLAS_SIZES[7]
+    if target <= 52:  # midpoint(48, 56)
+        return ATLAS_SIZES[8]
+    if target <= 60:  # midpoint(56, 64)
+        return ATLAS_SIZES[9]
+    if target <= 72:  # midpoint(64, 81) = 72.5
+        return ATLAS_SIZES[10]
+    if target <= 88:  # midpoint(81, 96) = 88.5
+        return ATLAS_SIZES[11]
+    return ATLAS_SIZES[12]
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +165,25 @@ struct UIContext:
     The cursor advances downward; `begin_panel`/`end_panel` push/pop
     a sub-region. All sizes are in design pixels; `ui_scale` converts
     them to screen pixels for both layout and drawing.
+
+    Storage model (unchanged): the font ladder, Canvas, WindowInput and
+    Gamepad live in heap boxes owned by main.mojo for the whole process
+    lifetime; the context borrows them through raw pointers (struct
+    copies of these types share COW/mask storage and have historically
+    double-freed it). Consumers never touch the pointers: `canvas()`
+    and `font()` return language-level reference views (single confined
+    unsafe-offset deref below), and input/gamepad reads go through the
+    methods at the top of the struct.
     """
 
-    var fonts: Pointer[FontSet, MutUntrackedOrigin]
-    var canvas: Pointer[Canvas, MutUntrackedOrigin]
-    var input: Pointer[WindowInput, MutUntrackedOrigin]
-    var gamepad: Pointer[Gamepad, MutUntrackedOrigin]
+    # Heap-box dependencies (main.mojo owns the boxes — see top of struct).
+    # Underscore-private by convention; every external read routes through
+    # the ref-returning accessors so no consumer derefs a pointer.
+    var _fonts: Pointer[FontSet, MutUntrackedOrigin]
+    var _canvas: Pointer[Canvas, MutUntrackedOrigin]
+    var _input: Pointer[WindowInput, MutUntrackedOrigin]
+    # Gamepad is optional (batch 1): None = no pad handled, gamepad binds inert.
+    var _gamepad: Optional[Pointer[Gamepad, MutUntrackedOrigin]]
     var dt: Float64
     var mouse_pos: Vec2
     var mouse_pressed: Bool  # True on the frame the left button went down
@@ -156,26 +216,26 @@ struct UIContext:
         var keybinds: Dict[String, List[List[Int]]],
         dpi_scale: Float64 = 1.0,
         font_multiplier: Float64 = 1.0,
-        gamepad: Pointer[Gamepad, MutUntrackedOrigin] = null_gamepad_ptr(),
+        gamepad: Optional[Pointer[Gamepad, MutUntrackedOrigin]] = Optional[
+            Pointer[Gamepad, MutUntrackedOrigin]
+        ](),
     ):
-        self.fonts = fonts
-        self.canvas = canvas
-        self.input = input
-        self.gamepad = gamepad
+        self._fonts = fonts
+        self._canvas = canvas
+        self._input = input
+        self._gamepad = gamepad
         self.dt = dt
         # libinput already merges touch into the mouse (TOUCH_DOWN/MOTION
         # simulate press/move/release on the primary slot), so the UI only
         # needs the pointer view; a touch tap surfaces as a normal click.
-        self.mouse_pos = Vec2(
-            input[unsafe_offset=0].mouse_x, input[unsafe_offset=0].mouse_y
-        )
-        self.mouse_pressed = input[unsafe_offset=0].mouse_pressed
-        self.mouse_down = input[unsafe_offset=0].mouse_down
-        self.press_is_touch = input[unsafe_offset=0].press_is_touch
-        self.touch_start = Vec2(
-            input[unsafe_offset=0].touch_start_x,
-            input[unsafe_offset=0].touch_start_y,
-        )
+        # One confined pointer deref here; the frame snapshot fields then
+        # read like plain fields for the rest of the ctor.
+        ref inp = input[unsafe_offset=0]
+        self.mouse_pos = Vec2(inp.mouse_x, inp.mouse_y)
+        self.mouse_pressed = inp.mouse_pressed
+        self.mouse_down = inp.mouse_down
+        self.press_is_touch = inp.press_is_touch
+        self.touch_start = Vec2(inp.touch_start_x, inp.touch_start_y)
         self.screen_w = screen_w
         self.screen_h = screen_h
         # Layout scale = min dimension ratio * dpi. Keeps UI proportional to
@@ -208,14 +268,75 @@ struct UIContext:
         self.keybinds = keybinds^
 
     # ------------------------------------------------------------------
+    # Dependency views — the ONLY pointer derefs in the facade
+    # ------------------------------------------------------------------
+    # Each access point below confines exactly one unsafe-offset deref;
+    # screens/widgets consume plain views and calls instead:
+    #
+    #   ui.canvas().fill_rect(...)              # mutable view of boxed Canvas
+    #   ref atlas = ui.font(22)                 # read-only atlas view (metrics)
+    #   ui.draw_text(t, x, baseline, 22, color) # atlas resolved internally
+    #
+    # This toolchain supports ref-valued function returns (probed) but NOT
+    # reference-typed struct fields or ref params — which is why the raw
+    # pointers remain the storage and each view is minted per call.
+
+    def canvas(mut self) -> ref[MutAnyOrigin] Canvas:
+        """Mutable view into the heap-boxed Canvas (main owns the box and
+        refreshes the frame pointer before each draw pass)."""
+        return self._canvas[unsafe_offset=0]
+
+    def _atlas_ptr(
+        mut self, design_size: Int
+    ) -> Pointer[TextAtlas, MutUntrackedOrigin]:
+        """Raw ladder handle — private bridge to Canvas.draw_text, which
+        (on this toolchain) cannot take reference-typed params. Use
+        `font()` for anything consumers do (metrics reads)."""
+        return self._fonts[unsafe_offset=0].get_atlas(
+            self._atlas_px(design_size)
+        )
+
+    def font(mut self, design_size: Int) -> ref[ImmutAnyOrigin] TextAtlas:
+        """Read-only view of the baked glyph atlas nearest the design size.
+
+        Origin is immutable because atlases are baked once and only read
+        (stale-slot/COW rules in ui/font.mojo) — mutation through the
+        view is rejected at compile time."""
+        return self._atlas_ptr(design_size)[unsafe_offset=0]
+
+    def draw_text(
+        mut self, text: String, x: Float64, y: Float64, size: Int, color: Color
+    ):
+        """Draw `text` with its BASELINE at screen-px (x, y), using the
+        ladder atlas baked for `size`. The atlas pointer is resolved here
+        (single confined deref) so consumers pass no pointers."""
+        self._canvas[unsafe_offset=0].draw_text(
+            self._atlas_ptr(size), text, x, y, color
+        )
+
+    def captured_gamepad_button(self) -> Int:
+        """Pad button with a press edge this frame (rebinding capture), or -1.
+
+        Returns -1 when no pad is connected (gamepad binds inert — batch 1
+        semantics) or another window has keyboard focus — the same
+        honor-keyboard-focus gate the keybind helpers apply."""
+        if not self._gamepad:
+            return -1
+        if not self._input[unsafe_offset=0].focused:
+            return -1
+        ref pad = self._gamepad.value()[unsafe_offset=0]
+        return pad.last_button()
+
+    # ------------------------------------------------------------------
     # Keyboard helpers (libinput state)
     # ------------------------------------------------------------------
 
     def _key_pressed(self, code: Int) -> Bool:
         """True if `code` was pressed this frame (pressed-edge event)."""
-        if not self.input[unsafe_offset=0].last_key_pressed:
+        ref inp = self._input[unsafe_offset=0]
+        if not inp.last_key_pressed:
             return False
-        return Int(self.input[unsafe_offset=0].last_key) == code
+        return Int(inp.last_key) == code
 
     def _key_down(self, code: Int) -> Bool:
         """Approximate key-held test from the event stream.
@@ -226,7 +347,8 @@ struct UIContext:
         OR while any key activity is present (coarse, but single-key
         combos — the overwhelming majority in Quire — are exact).
         """
-        if Int(self.input[unsafe_offset=0].last_key) == code:
+        ref inp = self._input[unsafe_offset=0]
+        if Int(inp.last_key) == code:
             return True
         return self._key_pressed(code)
 
@@ -235,31 +357,27 @@ struct UIContext:
 
         Keyboard codes are plain GLFW keycodes; gamepad codes are stored
         as GAMEPAD_SENTINEL + button and resolve through the evdev gamepad
-        backend (main owns the heap-boxed Gamepad; null = no pad open).
+        backend (main owns the heap-boxed Gamepad; None = no pad handled).
         """
         if code >= GAMEPAD_SENTINEL:
             # Gamepad binds only fire while the window has keyboard focus
             # (otherwise the pad would control the app from another window).
-            if (
-                Int(self.gamepad) == 0
-                or not self.input[unsafe_offset=0].focused
-            ):
+            if not self._gamepad:
                 return False
-            return self.gamepad[unsafe_offset=0].was_pressed(
-                code - GAMEPAD_SENTINEL
-            )
+            if not self._input[unsafe_offset=0].focused:
+                return False
+            ref pad = self._gamepad.value()[unsafe_offset=0]
+            return pad.was_pressed(code - GAMEPAD_SENTINEL)
         return self._key_pressed(code)
 
     def _is_down(self, code: Int) -> Bool:
         if code >= GAMEPAD_SENTINEL:
-            if (
-                Int(self.gamepad) == 0
-                or not self.input[unsafe_offset=0].focused
-            ):
+            if not self._gamepad:
                 return False
-            return self.gamepad[unsafe_offset=0].is_down(
-                code - GAMEPAD_SENTINEL
-            )
+            if not self._input[unsafe_offset=0].focused:
+                return False
+            ref pad = self._gamepad.value()[unsafe_offset=0]
+            return pad.is_down(code - GAMEPAD_SENTINEL)
         return self._key_down(code)
 
     def check_keybind(self, action: String) -> Bool:
@@ -306,8 +424,9 @@ struct UIContext:
     def char_pressed(self) -> Int32:
         """The key that had a press edge this frame, or 0. Only ASCII-range codes are returned for text input.
         """
-        if self.input[unsafe_offset=0].last_key_pressed:
-            var code = Int(self.input[unsafe_offset=0].last_key)
+        ref inp = self._input[unsafe_offset=0]
+        if inp.last_key_pressed:
+            var code = Int(inp.last_key)
             if code >= 32 and code <= 126:
                 return Int32(code)
         return 0
@@ -338,47 +457,11 @@ struct UIContext:
 
         Mirrors the old Font ladder (font_12..font_96) but indexes by the
         RENDER size (design * font_scale), since the baked atlases draw at
-        their native pixel size.
+        their native pixel size. The walk itself is `_ladder_nearest` —
+        static ATLAS_SIZES subscripts, no heap allocation per call.
         """
         var target = Int(Float32(design_size) * self.font_scale)
-        var sizes = List[Int]()
-        sizes.append(12)
-        sizes.append(14)
-        sizes.append(16)
-        sizes.append(18)
-        sizes.append(20)
-        sizes.append(22)
-        sizes.append(26)
-        sizes.append(32)
-        sizes.append(48)
-        sizes.append(56)
-        sizes.append(64)
-        sizes.append(81)
-        sizes.append(96)
-        var best = sizes[0]
-        var best_diff = 1000
-        for i in range(13):
-            var cand = sizes[i]
-            var diff = cand - target
-            if diff < 0:
-                diff = -diff
-            if diff < best_diff:
-                best_diff = diff
-                best = cand
-        return best
-
-    def font(
-        mut self, design_size: Int
-    ) -> Pointer[TextAtlas, MutUntrackedOrigin]:
-        """Baked glyph atlas for a design-pixel size (nearest ladder rung).
-
-        Returns an atlas reference — callers pass it straight into
-        canvas.draw_text / measure helpers.
-        """
-        var px = self._atlas_px(design_size)
-        var fp = self.fonts
-        var fb = fp[unsafe_offset=0].get_atlas(px)
-        return fb
+        return _ladder_nearest(target)
 
     def font_px(mut self, design_size: Int) -> Float32:
         """Render font size in screen pixels (scaled by font_scale, not dpi)."""
@@ -463,23 +546,28 @@ struct UIContext:
         mut self, text: String, x: Float64, y: Float64, size: Int, color: Color
     ):
         """Draw text with the atlas ladder. (x, y) is the TOP-left in design
-        px (raylib convention); convert to a baseline for the rasterizer."""
+        px (raylib convention); convert to a baseline for the rasterizer.
+
+        The atlas rung is resolved ONCE from the design size and passed to
+        both the metrics read and the draw — so measurement, placement, and
+        rendering all hit the identical rung this function would reach.
+        """
         var x_screen = Float64(Float32(x) * self.ui_scale)
         var y_top_screen = Float64(Float32(y) * self.ui_scale)
-        var atlas = self.font(Int(Float64(size) * Float64(self.font_scale)))
-        self.canvas[unsafe_offset=0].draw_text(
-            atlas,
+        ref atlas = self.font(size)
+        self.draw_text(
             text,
             x_screen,
-            y_top_screen + Float64(atlas[unsafe_offset=0].ascent),
+            y_top_screen + Float64(atlas.ascent),
+            size,
             color,
         )
 
     def _measure_text(mut self, text: String, size: Int) -> Vec2:
         """Measured text size at the ladder's native pixels."""
-        var atlas = self.font(size)
-        var w = Float32(atlas[unsafe_offset=0].text_width(text))
-        return Vec2(Float64(w), Float64(atlas[unsafe_offset=0].line_height))
+        ref atlas = self.font(size)
+        var w = Float32(atlas.text_width(text))
+        return Vec2(Float64(w), Float64(atlas.line_height))
 
     # ------------------------------------------------------------------
     # Primitive: label / text
@@ -520,8 +608,8 @@ struct UIContext:
 
     def _label_screen_w(mut self, label: String, fsize: Int) -> Float64:
         """Rendered label width in screen px at the ladder's native size."""
-        var atlas = self.font(fsize)
-        return Float64(atlas[unsafe_offset=0].text_width(label))
+        ref atlas = self.font(fsize)
+        return Float64(atlas.text_width(label))
 
     def fitted_button_w(
         mut self, label: String, fsize: Int, w: Float64
@@ -575,7 +663,7 @@ struct UIContext:
         if hovered:
             color = hover
 
-        self.canvas[unsafe_offset=0].fill_rect_rounded(
+        self.canvas().fill_rect_rounded(
             Float64(r.x),
             Float64(r.y),
             Float64(r.width),
@@ -621,7 +709,7 @@ struct UIContext:
         if hovered:
             color = hover
 
-        self.canvas[0].fill_rect_rounded(
+        self.canvas().fill_rect_rounded(
             Float64(r.x),
             Float64(r.y),
             Float64(r.width),
@@ -669,7 +757,7 @@ struct UIContext:
         if hovered:
             color = hover
 
-        self.canvas[unsafe_offset=0].fill_rect_rounded(
+        self.canvas().fill_rect_rounded(
             Float64(r.x),
             Float64(r.y),
             Float64(r.width),
@@ -685,18 +773,12 @@ struct UIContext:
         mut self, label: String, r: Rect, fsize: Int, fg: Color
     ):
         """Center a label inside a button rect at the ladder's native size."""
-        var atlas = self.font(fsize)
-        var tw = Float64(atlas[unsafe_offset=0].text_width(label))
-        var th = Float64(atlas[unsafe_offset=0].line_height)
+        ref atlas = self.font(fsize)
+        var tw = Float64(atlas.text_width(label))
+        var th = Float64(atlas.line_height)
         var tx = Float64(r.x) + (Float64(r.width) - tw) / 2.0
         var ty = Float64(r.y) + (Float64(r.height) - th) / 2.0
-        self.canvas[unsafe_offset=0].draw_text(
-            atlas,
-            label,
-            tx,
-            ty + Float64(atlas[unsafe_offset=0].ascent),
-            fg,
-        )
+        self.draw_text(label, tx, ty + Float64(atlas.ascent), fsize, fg)
 
     # ------------------------------------------------------------------
     # Primitive: panel / card background
@@ -714,7 +796,7 @@ struct UIContext:
         """Draw a card background at design-pixel coords. Does not move cursor.
         """
         var r = self.rect(x, y, w, h)
-        self.canvas[unsafe_offset=0].fill_rect_rounded(
+        self.canvas().fill_rect_rounded(
             Float64(r.x),
             Float64(r.y),
             Float64(r.width),
@@ -728,7 +810,7 @@ struct UIContext:
     ):
         """Draw a solid rectangle background."""
         var r = self.rect(x, y, w, h)
-        self.canvas[unsafe_offset=0].fill_rect(
+        self.canvas().fill_rect(
             Float64(r.x), Float64(r.y), Float64(r.width), Float64(r.height), bg
         )
 
@@ -743,7 +825,7 @@ struct UIContext:
     ):
         """Draw a vertical gradient rectangle background (design-px coords)."""
         var r = self.rect(x, y, w, h)
-        self.canvas[unsafe_offset=0].fill_rect_gradient(
+        self.canvas().fill_rect_gradient(
             Float64(r.x),
             Float64(r.y),
             Float64(r.width),
@@ -779,7 +861,7 @@ struct UIContext:
         var clicked = self._clicked(r)
 
         # Track background
-        self.canvas[unsafe_offset=0].fill_rect_rounded(
+        self.canvas().fill_rect_rounded(
             Float64(r.x),
             Float64(r.y),
             Float64(r.width),
@@ -799,7 +881,7 @@ struct UIContext:
             pct = 1.0
 
         if pct > 0.0:
-            self.canvas[unsafe_offset=0].fill_rect_rounded(
+            self.canvas().fill_rect_rounded(
                 Float64(r.x),
                 Float64(r.y),
                 Float64(r.width) * Float64(pct),
@@ -811,7 +893,7 @@ struct UIContext:
         # Handle
         var handle_r = self.s(7.0)
         var handle_x = r.x + r.width * pct
-        self.canvas[unsafe_offset=0].fill_rect_rounded(
+        self.canvas().fill_rect_rounded(
             Float64(handle_x - handle_r),
             Float64(r.y + r.height / 2.0 - handle_r),
             Float64(handle_r * 2.0),
@@ -858,7 +940,7 @@ struct UIContext:
         if selected:
             color = selected_bg
 
-        self.canvas[unsafe_offset=0].fill_rect_rounded(
+        self.canvas().fill_rect_rounded(
             Float64(r.x),
             Float64(r.y),
             Float64(r.width),
@@ -877,7 +959,7 @@ struct UIContext:
         var sy = Int(Float32(y) * self.ui_scale)
         var sw = Int(Float32(w) * self.ui_scale)
         var sh = Int(Float32(h) * self.ui_scale)
-        self.canvas[unsafe_offset=0].begin_clip(sx, sy, sw, sh)
+        self.canvas().begin_clip(sx, sy, sw, sh)
 
     def end_clip(mut self):
-        self.canvas[unsafe_offset=0].end_clip()
+        self.canvas().end_clip()

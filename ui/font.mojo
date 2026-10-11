@@ -11,10 +11,11 @@
 # is a non-copyable resource (owns a mask buffer); the heap block lets us
 # hand out Pointer[TextAtlas] handles (the ladder accessor) without
 # needing field-address gymnastics. load() replaces slots in place; unload()
-# closes in place. Moves of FontSet just re-point the block (Movable move
-# ctor nulls the source).
+# closes in place. Moves of FontSet just re-point the block; copies share
+# it (COW-comment below). The block is freed with the matched
+# ThinAllocation/Layout dealloc path — exact sizing, no bitcasts.
 
-from std.memory import alloc, Layout
+from std.memory import alloc, Layout, dealloc, ThinAllocation
 from std.collections import Optional
 from platform.text import TextEngine, TextAtlas
 
@@ -47,7 +48,7 @@ struct FontSet(Copyable, Movable):
     def __moveinit__(mut self, existing: Self):
         # Steal the block. `existing` is consumed by the move — semantic
         # ownership transfers; the source holds a stale pointer but is never
-        # touched again after the move (1.0.0 moveinit has no mutable source).
+        # touched again after the move (Mojo moveinit semantics).
         if existing.slots:
             self.slots = Optional[Pointer[TextAtlas, MutUntrackedOrigin]](
                 existing.slots.value()
@@ -59,7 +60,9 @@ struct FontSet(Copyable, Movable):
     def _ensure_slots(mut self):
         """Lazily allocate the empty-atlas block on first use."""
         if not self.slots:
-            self.slots = alloc(Layout[TextAtlas](count=13)).unsafe_leak()
+            self.slots = alloc(
+                Layout[TextAtlas](count=FONT_SIZE_COUNT)
+            ).unsafe_leak()
             for i in range(FONT_SIZE_COUNT):
                 self.slots.value().unsafe_offset(i).unsafe_write(TextAtlas())
 
@@ -140,7 +143,14 @@ struct FontSet(Copyable, Movable):
             return
         for i in range(FONT_SIZE_COUNT):
             self.slots.value()[unsafe_offset=i].close()
-        self.slots.value().unsafe_free()
+        # Matched free: the block was allocated as
+        # Layout[TextAtlas](count=FONT_SIZE_COUNT); dealloc with the same
+        # Layout keeps sizing exact (no unsafe_free bookkeeping).
+        dealloc(
+            ThinAllocation(
+                unsafe_owned_ptr=self.slots.value()
+            ).unsafe_with_layout(Layout[TextAtlas](count=FONT_SIZE_COUNT))
+        )
         self.slots = Optional[Pointer[TextAtlas, MutUntrackedOrigin]]()
         self.load_ok = False
 

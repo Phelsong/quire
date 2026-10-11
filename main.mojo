@@ -95,7 +95,6 @@ def main() raises:
     # directly into a heap box. UIContext holds a raw pointer; FontSet
     # value copies double-freed the shared atlas mask/List pointers
     # (TCMalloc crash on frame 1), so copies are avoided entirely.
-    var __ = 1.0
     var dpi_for_bake = 1.0  # wl_shm buffer is physical px; scale == 1 for now
     var fonts_box = alloc(Layout[FontSet](count=1)).unsafe_leak()
     fonts_box.unsafe_write(
@@ -629,7 +628,7 @@ def main() raises:
             keybinds.copy(),
             1.0,
             font_multiplier,
-            pad_box,
+            Optional[Pointer[Gamepad, MutUntrackedOrigin]](pad_box),
         )
 
         # Library search input consumes keystrokes via the UI context.

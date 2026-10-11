@@ -7,19 +7,26 @@
 # pa_simple blocks when the server buffer is full — the thread owns that
 # blocking, never the UI loop.
 #
-# Thread-safety: Mutex[RingState] (pthread-backed, from functions/mutex.mojo)
-# guards ring bookkeeping. The mutex lives inside BackendShared, which is
-# move-constructed onto the heap in create() — the writer thread reaches
-# everything through the shared pointer.
-from std.ffi import external_call
+# Thread-safety: Mutex[RingState] (BlockingSpinLock-backed, from
+# functions/mutex.mojo) guards ring bookkeeping. The mutex lives inside
+# BackendShared, which is move-constructed onto the heap in create() — the
+# writer thread reaches everything through the shared pointer.
+from std.ffi import c_int, c_size_t, c_ulong, external_call
+from std.memory import Layout, dealloc, ThinAllocation
 from std.memory import stack_allocation, unsafe_memcpy
 from std.memory.unsafe_pointer import Pointer
-from std.collections import Optional
 from std.time import sleep
 
 from functions.mutex import Mutex
 
-from platform.ffi import c_null as _null, cstr, heap_malloc, heap_free_byte
+from platform.ffi import (
+    c_null as _null,
+    cstr,
+    heap_free_byte,
+    heap_malloc,
+    pthread_create,
+    pthread_join,
+)
 
 # --- PulseAudio constants (pulse/def.h, sample.h) ---
 comptime PA_STREAM_PLAYBACK = 1
@@ -40,14 +47,11 @@ comptime RING_BYTES = RING_FRAMES * BYTES_PER_FRAME
 # Writer drain granularity: matches the AudioPipe chunk size.
 comptime DRAIN_FRAMES = 4096
 
-# BackendShared heap allocation size: 3 x 8B (stream/ring/capacity) + Mutex
-# (2 x 8B ptrs + 40B pthread_mutex_t) = 80B; 96 leaves headroom.
-comptime SIZEOF_BACKEND_SHARED = 96
-
 
 # --- pa_sample_spec: {int format, uint32 rate, uint8 channels} (12 bytes) ---
-# NOTE (Mojo 1.0.0): Array (fixed-size N) is NOT implicitly copyable, so this
+# NOTE (Mojo 1.1.x): Array (fixed-size N) is NOT implicitly copyable, so this
 # struct cannot declare ImplicitlyCopyable and value-copies need an explicit
+# elementwise __copyinit__.
 struct PaSampleSpec(Copyable, Movable):
     var raw: Array[Byte, 12]
 
@@ -130,22 +134,13 @@ def _ring_read(
     var ring = sh_ptr[unsafe_offset=0].ring
     var wrapped = read_pos + take - capacity
     if wrapped <= 0:
-        var src = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=Int(ring) + read_pos
-        )
-        unsafe_memcpy(dest=dest, src=src, count=take)
+        unsafe_memcpy(dest=dest, src=ring.unsafe_offset(read_pos), count=take)
     else:
         var head = capacity - read_pos
-        var src1 = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=Int(ring) + read_pos
-        )
-        unsafe_memcpy(dest=dest, src=src1, count=head)
+        # head segment: read_pos .. capacity, tail wraps to the ring front
+        unsafe_memcpy(dest=dest, src=ring.unsafe_offset(read_pos), count=head)
         unsafe_memcpy(
-            dest=Pointer[Byte, MutUntrackedOrigin](
-                unsafe_from_address=Int(dest) + head
-            ),
-            src=ring,
-            count=take - head,
+            dest=dest.unsafe_offset(head), src=ring, count=take - head
         )
 
 
@@ -161,8 +156,11 @@ def backend_writer_entry(
     arg: Pointer[NoneType, MutUntrackedOrigin],
 ) -> Pointer[NoneType, MutUntrackedOrigin]:
     """Writer thread: drains ring -> pa_simple_write while running."""
-    var sh_ptr = arg.unsafe_bitcast[BackendShared]()
+    var sh_ptr = rebind[Pointer[BackendShared, MutUntrackedOrigin]](arg)
     var chunk = stack_allocation[DRAIN_FRAMES * BYTES_PER_FRAME, Byte]()
+    # Typed f32 view over the same stack bytes (f32le stereo PCM): the
+    # volume pass works per-sample without Byte<->Float32 punning.
+    var chunk_f32 = rebind[Pointer[Float32, MutUntrackedOrigin]](chunk)
     while True:
         var snap = _load_state(sh_ptr)
 
@@ -191,15 +189,16 @@ def backend_writer_entry(
 
         # apply volume in place
         var nsamples = take // 4  # f32 samples (stereo interleaved)
-        var f = chunk.unsafe_bitcast[Float32]()
         for i in range(nsamples):
-            f[unsafe_offset=i] = f[unsafe_offset=i] * snap.volume
+            chunk_f32[unsafe_offset=i] = (
+                chunk_f32[unsafe_offset=i] * snap.volume
+            )
 
         # blocking write to pulse — this thread owns the latency
         var bytes_written = external_call["pa_simple_write", Int32](
             sh_ptr[unsafe_offset=0].stream,
-            chunk.unsafe_bitcast[NoneType](),
-            UInt64(take),
+            rebind[Pointer[NoneType, MutUntrackedOrigin]](chunk),
+            c_size_t(take),
             _null[NoneType](),
         )
         if bytes_written < 0:
@@ -219,13 +218,13 @@ struct AudioBackend(Copyable, Movable):
     var shared: Optional[
         Pointer[BackendShared, MutUntrackedOrigin]
     ]  # heap control block
-    var thread: Optional[Pointer[UInt64, MutUntrackedOrigin]]  # pthread_t
+    var tid: c_ulong  # pthread handle (valid once created)
     var created: Bool
     var active: Bool  # between play() and pause()/stop() — "is_playing"
 
     def __init__(out self):
         self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]]()
-        self.thread = Optional[Pointer[UInt64, MutUntrackedOrigin]]()
+        self.tid = 0
         self.created = False
         self.active = False
 
@@ -240,15 +239,29 @@ struct AudioBackend(Copyable, Movable):
         # pa_simple_new expects a POINTER to pa_sample_spec; passing by-value
         # pushes struct bytes into the arg register where libpulse
         # dereferences it (pa_sample_spec_valid segfault — see ab_smoke saga).
+        #
+        # The spec block MUST be libc-malloc'd, NOT a Mojo-allocator Box:
+        # shim-instrumented regression evidence — bytes written
+        #   05 00 00 00 44 ac 00 00 02 00 00 00  (FLOAT32LE/44100/2ch)
+        # reach pa_simple_new bit-exact when the block comes from malloc(12),
+        # while a Box[PaSampleSpec]'s alloc/Layout block is delivered to
+        # libpulse with its first 8 bytes zeroed (format/rate read as 0/0,
+        # pa_simple_new fails with pulse error 3 = PA_ERROR_INVALID).
+        # Byte-poke the raw Array layout; the C struct is these 12 bytes.
+        var spec_value = PaSampleSpec(
+            PA_SAMPLE_FLOAT32LE, SAMPLE_RATE, CHANNELS
+        )
         var spec_mem: Pointer[PaSampleSpec, MutUntrackedOrigin]
         try:
-            spec_mem = heap_malloc(12).unsafe_bitcast[PaSampleSpec]()
+            spec_mem = rebind[Pointer[PaSampleSpec, MutUntrackedOrigin]](
+                heap_malloc(12)
+            )
         except e:
             # OOM in a 12-byte malloc: nothing to tear down yet.
             return False
-        spec_mem.unsafe_write(
-            PaSampleSpec(PA_SAMPLE_FLOAT32LE, SAMPLE_RATE, CHANNELS)
-        )
+        var spec_poke = rebind[Pointer[Byte, MutUntrackedOrigin]](spec_mem)
+        for i in range(12):
+            spec_poke[unsafe_offset=i] = spec_value.raw[i]
         var app_name = String("quire")
         var stream_name = String("playback")
         var stream = external_call[
@@ -256,7 +269,7 @@ struct AudioBackend(Copyable, Movable):
         ](
             _null[NoneType](),  # server (default)
             cstr(app_name),
-            PA_STREAM_PLAYBACK,
+            c_int(PA_STREAM_PLAYBACK),
             _null[NoneType](),  # device (default)
             cstr(stream_name),
             spec_mem,
@@ -264,73 +277,73 @@ struct AudioBackend(Copyable, Movable):
             _null[NoneType](),  # buffering attrs (defaults)
             _null[NoneType](),  # error
         )
+        # C-boundary null check: pa_simple_new returns NULL on failure; a
+        # runtime-zero address is the true C NULL here. libpulse copies the
+        # sample spec during pa_simple_new, so our copy is freed on both exits.
         if Int(stream) == 0:
-            heap_free_byte(spec_mem.unsafe_bitcast[Byte]())
+            heap_free_byte(spec_poke)
             return False
-        # libpulse copies the sample spec during pa_simple_new; free our copy.
-        heap_free_byte(spec_mem.unsafe_bitcast[Byte]())
+        heap_free_byte(spec_poke)
 
-        var ring: Pointer[Byte, MutUntrackedOrigin]
-        var sh_mem: Pointer[BackendShared, MutUntrackedOrigin]
-        var tid: Pointer[UInt64, MutUntrackedOrigin]
-        try:
-            ring = heap_malloc(RING_BYTES).unsafe_bitcast[Byte]()
+        # BackendShared owns the mutex; move-construct it onto the heap so
+        # both threads reach it through sh_mem. HEAP-allocation is
+        # mandatory: stack_allocation memory lives in create()'s frame and
+        # is clobbered once create() returns (the original writer-thread
+        # segfault). Layout[BackendShared] sizes the control block exactly
+        # (no hand-computed SIZEOF constant, no bitcasts).
+        #
+        # The ring and the control block outlive create() (the writer
+        # thread reads through sh_mem), so they are raw typed allocations
+        # freed by close() with matched Layouts — a Box held here would
+        # free the ring when create() returns.
+        var ring = alloc(Layout[Byte](count=RING_BYTES)).unsafe_leak()
+        var sh_mem = alloc(Layout[BackendShared](count=1)).unsafe_leak()
+        sh_mem.unsafe_write(BackendShared(stream, ring))
+        self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]](
+            sh_mem
+        )
 
-            # BackendShared owns the mutex; move-construct it onto the heap so
-            # both threads reach it through sh_mem. HEAP-allocation is
-            # mandatory: stack_allocation memory lives in create()'s frame and
-            # is clobbered once create() returns (the original writer-thread
-            # segfault).
-            var shared = BackendShared(stream, ring)
-            sh_mem = heap_malloc(SIZEOF_BACKEND_SHARED).unsafe_bitcast[
-                BackendShared
-            ]()
-            sh_mem.unsafe_write(shared^)
-
-            self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]](
-                sh_mem
-            )
-
-            # pthread_t buffer must outlive create() too (close() joins it).
-            tid = heap_malloc(8).unsafe_bitcast[UInt64]()
-        except e:
-            # OOM: release the pulse stream (the only resource acquired so
-            # far); nothing else has been handed to the writer thread.
-            external_call["pa_simple_free", NoneType](stream)
-            return False
-
-        var rc = external_call["pthread_create", Int32](
-            tid,
-            _null[NoneType](),
+        # pthread handle: libc writes the value before pthread_create
+        # returns and close() joins by value — a stack out-param cell is
+        # the sanctioned out-param idiom; the tid is copied out below.
+        var tid_cell = stack_allocation[1, c_ulong]()
+        var rc = pthread_create(
+            tid_cell,
             backend_writer_entry,
-            sh_mem.unsafe_bitcast[NoneType](),
+            rebind[Pointer[NoneType, MutUntrackedOrigin]](sh_mem),
         )
         if rc != 0:
+            # Reader never started — no concurrent access, teardown is plain.
             external_call["pa_simple_free", NoneType](stream)
             sh_mem[unsafe_offset=0].state.close()
-            heap_free_byte(sh_mem.unsafe_bitcast[Byte]())
-            heap_free_byte(ring)
-            heap_free_byte(tid.unsafe_bitcast[Byte]())
+            dealloc(
+                ThinAllocation(
+                    unsafe_owned_ptr=sh_mem[unsafe_offset=0].ring
+                ).unsafe_with_layout(Layout[Byte](count=RING_BYTES))
+            )
+            dealloc(
+                ThinAllocation(unsafe_owned_ptr=sh_mem).unsafe_with_layout(
+                    Layout[BackendShared](count=1)
+                )
+            )
             self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]]()
             return False
 
-        self.thread = Optional[Pointer[UInt64, MutUntrackedOrigin]](tid)
+        self.tid = tid_cell[unsafe_offset=0]
         self.created = True
         self.active = False
         return True
 
     def close(mut self):
         """Stop the writer, drain, free. Mirrors unload_audio_stream."""
-        if not self.created or not self.shared or not self.thread:
+        if not self.created or not self.shared:
             return
         var sh_mem = self.shared.value()
 
         with sh_mem[unsafe_offset=0].state.lock() as p:
             p[unsafe_offset=0].running = 0
 
-        _ = external_call["pthread_join", Int32](
-            self.thread.value()[unsafe_offset=0], _null[NoneType]()
-        )
+        pthread_join(self.tid)
 
         _ = external_call["pa_simple_drain", Int32](
             sh_mem[unsafe_offset=0].stream, _null[NoneType]()
@@ -340,13 +353,22 @@ struct AudioBackend(Copyable, Movable):
         )
         sh_mem[unsafe_offset=0].state.close()
 
-        # free the heap allocations made in create()
-        heap_free_byte(sh_mem[unsafe_offset=0].ring.unsafe_bitcast[Byte]())
-        heap_free_byte(self.thread.value().unsafe_bitcast[Byte]())
-        heap_free_byte(sh_mem.unsafe_bitcast[Byte]())
+        # Free the control block and ring exactly as allocated (matched
+        # Layouts — the Box-style dealloc path, no bitcasts, no libc malloc
+        # bookkeeping).
+        dealloc(
+            ThinAllocation(
+                unsafe_owned_ptr=sh_mem[unsafe_offset=0].ring
+            ).unsafe_with_layout(Layout[Byte](count=RING_BYTES))
+        )
+        dealloc(
+            ThinAllocation(unsafe_owned_ptr=sh_mem).unsafe_with_layout(
+                Layout[BackendShared](count=1)
+            )
+        )
 
         self.shared = Optional[Pointer[BackendShared, MutUntrackedOrigin]]()
-        self.thread = Optional[Pointer[UInt64, MutUntrackedOrigin]]()
+        self.tid = 0
         self.created = False
         self.active = False
 
@@ -409,8 +431,8 @@ struct AudioBackend(Copyable, Movable):
 
     def write_pcm(self, src: Pointer[Float32, MutUntrackedOrigin], frames: Int):
         """Memcpy a chunk into the ring. Caller guarantees frames <=
-        DRAIN_FRAMES and calls needs_data() first. The initial samples are
-        pre-scaled for volume (cheap: 4096 frames per 16ms tick)."""
+        DRAIN_FRAMES and calls needs_data() first. Volume is applied once,
+        in the writer thread at drain time."""
         if not self.created or not self.shared:
             return
         var sh_mem = self.shared.value()
@@ -418,15 +440,11 @@ struct AudioBackend(Copyable, Movable):
         if nbytes == 0:
             return
 
-        # scale volume on the way in (reader applies to its copy too, but a
-        # chunk only passes through here once)
-        var src_bytes = src.unsafe_bitcast[Byte]()
-        with sh_mem[unsafe_offset=0].state.lock() as p:
-            var sh_vol = p[unsafe_offset=0].volume
-            if sh_vol != 1.0:
-                var f = src.unsafe_bitcast[Float32]()
-                for i in range(frames * CHANNELS):
-                    f[unsafe_offset=i] = f[unsafe_offset=i] * sh_vol
+        # Byte view of the same typed chunk for the ring memcpy (rebind, not
+        # a bitcast — same origin, retyped). Do NOT pre-scale here: the
+        # writer thread already applies volume at drain time, and scaling in
+        # both places squares the volume (v^2).
+        var src_bytes = rebind[Pointer[Byte, MutUntrackedOrigin]](src)
 
         with sh_mem[unsafe_offset=0].state.lock() as p:
             var write_pos = p[unsafe_offset=0].write_pos
@@ -434,21 +452,22 @@ struct AudioBackend(Copyable, Movable):
             var ring = sh_mem[unsafe_offset=0].ring
             var wrapped = write_pos + nbytes - capacity
             if wrapped <= 0:
-                var dst = Pointer[Byte, MutUntrackedOrigin](
-                    unsafe_from_address=Int(ring) + write_pos
+                unsafe_memcpy(
+                    dest=ring.unsafe_offset(write_pos),
+                    src=src_bytes,
+                    count=nbytes,
                 )
-                unsafe_memcpy(dest=dst, src=src_bytes, count=nbytes)
             else:
                 var head = capacity - write_pos
-                var dst1 = Pointer[Byte, MutUntrackedOrigin](
-                    unsafe_from_address=Int(ring) + write_pos
+                # head segment: write_pos .. capacity, tail wraps to ring front
+                unsafe_memcpy(
+                    dest=ring.unsafe_offset(write_pos),
+                    src=src_bytes,
+                    count=head,
                 )
-                unsafe_memcpy(dest=dst1, src=src_bytes, count=head)
                 unsafe_memcpy(
                     dest=ring,
-                    src=Pointer[Byte, MutUntrackedOrigin](
-                        unsafe_from_address=Int(src_bytes) + head
-                    ),
+                    src=src_bytes.unsafe_offset(head),
                     count=nbytes - head,
                 )
             p[unsafe_offset=0].write_pos = (write_pos + nbytes) % capacity

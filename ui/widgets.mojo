@@ -2,7 +2,9 @@
 #
 # All rendering routes through the UIContext facade (Canvas + baked glyph
 # atlases); bounds come in as ui.Rect built via ui.rect() (screen px).
-# `font` params on draw() are the atlas for the caller's chosen design size.
+# `design_size` params on draw() pick the atlas rung through ui.font(),
+# whose read-only view feeds metrics; drawing itself goes through
+# ui.draw_text (atlas resolved inside the facade).
 
 from ui.font import FontSet
 from platform.text import TextAtlas
@@ -120,10 +122,8 @@ struct TextInput:
     ):
         """Render the text input each frame. Background/border are in the
         widget's own colors; text is drawn through the facade."""
-        var canvas = ui.canvas
-
         # Background rounded rect
-        canvas[unsafe_offset=0].fill_rect_rounded(
+        ui.canvas().fill_rect_rounded(
             Float64(self.bounds.x),
             Float64(self.bounds.y),
             Float64(self.bounds.width),
@@ -136,7 +136,7 @@ struct TextInput:
         var border_color = BORDER_IDLE
         if self.is_focused:
             border_color = BORDER_FOCUS
-        canvas[unsafe_offset=0].outline_rect_rounded(
+        ui.canvas().outline_rect_rounded(
             Float64(self.bounds.x),
             Float64(self.bounds.y),
             Float64(self.bounds.width),
@@ -153,25 +153,18 @@ struct TextInput:
             draw_text_str = self.placeholder
             draw_color = TEXT_DIM
 
-        var atlas = ui.font(design_size)
-        # var font_px = atlas[unsafe_offset=0].pixel_size
-        var text_w = atlas[unsafe_offset=0].text_width(draw_text_str)
+        ref atlas = ui.font(design_size)
+        # var font_px = atlas.pixel_size
+        var text_w = atlas.text_width(draw_text_str)
 
         # Text position: left-aligned with 12px padding, vertically centered
         # (baseline = top + ascent with half-leading correction).
         var text_x = Float64(self.bounds.x) + 12.0
         var mid = (
-            Float64(self.bounds.height)
-            - Float64(atlas[unsafe_offset=0].line_height)
+            Float64(self.bounds.height) - Float64(atlas.line_height)
         ) / 2.0
-        var baseline = (
-            Float64(self.bounds.y)
-            + mid
-            + Float64(atlas[unsafe_offset=0].ascent)
-        )
-        canvas[unsafe_offset=0].draw_text(
-            atlas, draw_text_str, text_x, baseline, draw_color
-        )
+        var baseline = Float64(self.bounds.y) + mid + Float64(atlas.ascent)
+        ui.draw_text(draw_text_str, text_x, baseline, design_size, draw_color)
 
         # Blinking cursor when focused
         if self.is_focused:
@@ -184,9 +177,7 @@ struct TextInput:
                 var cy_bot = (
                     Float64(self.bounds.y) + Float64(self.bounds.height) - 4.0
                 )
-                canvas[unsafe_offset=0].fill_rect(
-                    cx, cy_top, 2.0, cy_bot - cy_top, GREEN
-                )
+                ui.canvas().fill_rect(cx, cy_top, 2.0, cy_bot - cy_top, GREEN)
 
 
 # ---------------------------------------------------------------------------
@@ -242,14 +233,13 @@ struct Button:
 
     def draw(mut self, mut ui: UIContext, design_size: Int):
         """Render the button through the facade."""
-        var canvas = ui.canvas
         var color = self.bg_color
         if self.is_disabled:
             color = Color(80, 100, 60, 255)
         elif self.is_hovered:
             color = self.hover_color
 
-        canvas[0].fill_rect_rounded(
+        ui.canvas().fill_rect_rounded(
             Float64(self.bounds.x),
             Float64(self.bounds.y),
             Float64(self.bounds.width),
@@ -259,21 +249,21 @@ struct Button:
         )
 
         # Label centered in button
-        var atlas = ui.font(design_size)
-        var text_w = atlas[0].text_width(self.label)
+        ref atlas = ui.font(design_size)
+        var text_w = atlas.text_width(self.label)
         var text_x = (
             Float64(self.bounds.x)
             + (Float64(self.bounds.width) - Float64(text_w)) / 2.0
         )
         var mid = (
-            Float64(self.bounds.height) - Float64(atlas[0].line_height)
+            Float64(self.bounds.height) - Float64(atlas.line_height)
         ) / 2.0
-        var baseline = Float64(self.bounds.y) + mid + Float64(atlas[0].ascent)
+        var baseline = Float64(self.bounds.y) + mid + Float64(atlas.ascent)
 
         var fg = self.fg_color
         if self.is_disabled:
             fg = TEXT_DIM
-        canvas[0].draw_text(atlas, self.label, text_x, baseline, fg)
+        ui.draw_text(self.label, text_x, baseline, design_size, fg)
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +293,8 @@ struct Checkbox:
 
     def draw(mut self, mut ui: UIContext, design_size: Int):
         """Render checkbox through the facade."""
-        var canvas = ui.canvas
         # Outer box
-        canvas[0].fill_rect_rounded(
+        ui.canvas().fill_rect_rounded(
             Float64(self.bounds.x),
             Float64(self.bounds.y),
             Float64(self.bounds.width),
@@ -313,7 +302,7 @@ struct Checkbox:
             0.15,
             Color(22, 24, 28, 255),
         )
-        canvas[0].outline_rect_rounded(
+        ui.canvas().outline_rect_rounded(
             Float64(self.bounds.x),
             Float64(self.bounds.y),
             Float64(self.bounds.width),
@@ -325,7 +314,7 @@ struct Checkbox:
 
         if self.is_checked:
             # Filled green background
-            canvas[0].fill_rect_rounded(
+            ui.canvas().fill_rect_rounded(
                 Float64(self.bounds.x) + 3.0,
                 Float64(self.bounds.y) + 3.0,
                 Float64(self.bounds.width) - 6.0,
@@ -335,16 +324,14 @@ struct Checkbox:
             )
 
             # Checkmark centered in box
-            var atlas = ui.font(design_size)
-            var check_w = atlas[0].text_width(CHECKMARK)
+            ref atlas = ui.font(design_size)
+            var check_w = atlas.text_width(CHECKMARK)
             var cx = (
                 Float64(self.bounds.x)
                 + (Float64(self.bounds.width) - Float64(check_w)) / 2.0
             )
             var mid = (
-                Float64(self.bounds.height) - Float64(atlas[0].line_height)
+                Float64(self.bounds.height) - Float64(atlas.line_height)
             ) / 2.0
-            var baseline = (
-                Float64(self.bounds.y) + mid + Float64(atlas[0].ascent)
-            )
-            canvas[0].draw_text(atlas, CHECKMARK, cx, baseline, ACCENT_DARK)
+            var baseline = Float64(self.bounds.y) + mid + Float64(atlas.ascent)
+            ui.draw_text(CHECKMARK, cx, baseline, design_size, ACCENT_DARK)

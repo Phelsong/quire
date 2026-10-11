@@ -3,16 +3,28 @@
 #   -> create surface -> xdg surface -> toplevel -> wait configure -> ack
 #   -> memfd + wl_shm pool -> ARGB8888 gradient buffer -> attach/damage/commit
 #   -> dispatch loop (answers xdg ping) until closed by compositor.
-from std.ffi import external_call, CStringSpan
-
-from platform.ffi import heap_malloc as _malloc
+from platform.ffi import (
+    c_mmap,
+    c_memfd_create,
+    c_munmap,
+    c_close,
+    c_ftruncate,
+    PROT_READ,
+    PROT_WRITE,
+    MAP_SHARED,
+)
+from platform.wl_args import (
+    wlstring,
+    arg_as_string,
+    arg_as_u32,
+    arg_as_fixed,
+    free_string_arg,
+)
 
 from wayland.core import (
     WLPtr,
     WLArgument,
     MAX_EVENT_ARGS,
-    WLString,
-    _shim_string_free,
     shim_interface,
     wl_display_connect,
     wl_display_disconnect,
@@ -48,95 +60,17 @@ from wayland.gen.xdg_shell import (
     xdg_toplevel_set_title,
 )
 
-# --- tiny libc bindings -------------------------------------------------
-
-
-def _memfd_create(name: String, flags: UInt32) -> Int32:
-    var buf = str_to_cptr(name)
-    return external_call["memfd_create", Int32](buf, flags)
-
-
-def _mmap(
-    addr: Int, length: Int, prot: Int32, flags: Int32, fd: Int32, offset: Int
-) -> WLPtr:
-    # addr is a raw address (0 = NULL for kernel to choose)
-    return external_call["mmap", WLPtr](
-        UInt64(addr),
-        UInt64(length),
-        UInt64(prot),
-        UInt64(flags),
-        UInt64(fd),
-        UInt64(offset),
-    )
-
-
-def _munmap(addr: WLPtr, length: Int):
-    _ = external_call["munmap", Int32](addr, UInt64(length))
-
-
-def _close(fd: Int32):
-    _ = external_call["close", Int32](fd)
-
-
-def _ftruncate(fd: Int32, length: Int) -> Int32:
-    return external_call["ftruncate", Int32](fd, Int64(length))
-
-
-# mmap constants (linux)
-comptime PROT_READ = 1
-comptime PROT_WRITE = 2
-comptime MAP_SHARED = 1
-
 comptime WIDTH = 400
 comptime HEIGHT = 300
 comptime STRIDE = WIDTH * 4
 comptime POOL_SIZE = STRIDE * HEIGHT
 
 
-def str_to_cptr(s: String) -> Pointer[Int8, MutAnyOrigin]:
-    """NUL-terminated heap copy of a Mojo String (leaked — test lifetime)."""
-    # copy into a mutable local so as_c_string_span is usable
-    var tmp: String = s
-    var cs = tmp.as_c_string_span()
-    var n = len(cs)
-    var buf = Pointer[Int8, MutAnyOrigin](
-        unsafe_from_address=Int(_malloc(Int(n) + 1))
-    )
-    var bytes = tmp.as_bytes()
-    for i in range(len(bytes)):
-        buf[i] = Int8(bytes[i])
-    buf[len(bytes)] = Int8(0)
-    return buf
-
-
-def str_to_wlstring(s: String) -> WLString:
-    return str_to_cptr(s).bitcast[Byte]()
-
-
-def arg_as_string(a: WLArgument) -> String:
-    var addr = 0
-    for i in range(8):
-        addr = addr | (Int(a.raw[i]) << (8 * i))
-    var ptr = Pointer[Int8, MutAnyOrigin](unsafe_from_address=addr)
-    return String(CStringSpan(unsafe_from_ptr=ptr))
-
-
-def arg_as_cptr(a: WLArgument) -> Pointer[Byte, MutAnyOrigin]:
-    var addr = 0
-    for i in range(8):
-        addr = addr | (Int(a.raw[i]) << (8 * i))
-    return Pointer[Byte, MutAnyOrigin](unsafe_from_address=addr)
-
-
-def arg_as_uint(a: WLArgument) -> UInt32:
-    var v = 0
-    for i in range(4):
-        v = v | (Int(a.raw[i]) << (8 * i))
-    return UInt32(v)
-
-
-def free_string_arg(a: WLArgument):
-    _shim_string_free(arg_as_cptr(a))
+# The old local str_to_cptr/str_to_wlstring/arg_as_* marshaling helpers and
+# the duplicated libc bindings (memfd/mmap/munmap/ftruncate/close + PROT
+# constants) are gone — shared via platform.wl_args and platform.ffi
+# (byte-identical wire behavior, same names modulo the uint/int spellings:
+# arg_as_u32 / arg_as_i32).
 
 
 struct GlobalInfo(Copyable, Movable):
@@ -159,7 +93,7 @@ def find_global(
             var is_want = iface_name == want
             free_string_arg(args[1])
             if is_want:
-                return GlobalInfo(arg_as_uint(args[0]), arg_as_uint(args[2]))
+                return GlobalInfo(arg_as_u32(args[0]), arg_as_u32(args[2]))
         var n = wl_display_dispatch(display)
         if n <= 0:
             raise Error("dispatch failed while waiting for " + want)
@@ -209,14 +143,14 @@ def main() raises:
     var compositor = wl_registry_bind(
         registry,
         shim_interface("wl_compositor"),
-        str_to_wlstring("wl_compositor"),
+        wlstring("wl_compositor".as_c_string_span()),
         comp_name,
         4,
     )
     var shm = wl_registry_bind(
         registry,
         shim_interface("wl_shm"),
-        str_to_wlstring("wl_shm"),
+        wlstring("wl_shm".as_c_string_span()),
         shm_name,
         1,
     )
@@ -224,7 +158,7 @@ def main() raises:
     var wm_base = wl_registry_bind(
         registry,
         shim_interface("xdg_wm_base"),
-        str_to_wlstring("xdg_wm_base"),
+        wlstring("xdg_wm_base".as_c_string_span()),
         wm_name,
         wm_ver_use,
     )
@@ -236,7 +170,9 @@ def main() raises:
     var surface = wl_compositor_create_surface(compositor)
     var xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface)
     var toplevel = xdg_surface_get_toplevel(xdg_surface)
-    xdg_toplevel_set_title(toplevel, str_to_wlstring("mojo-wayland window"))
+    xdg_toplevel_set_title(
+        toplevel, wlstring("mojo-wayland window".as_c_string_span())
+    )
     print("surface chain created")
 
     # listen for events
@@ -270,19 +206,20 @@ def main() raises:
     var sargs = stack_allocation[MAX_EVENT_ARGS, WLArgument]()
     var serial: UInt32 = 0
     while xdg_surface_next_configure(xs_queue, sargs):
-        serial = arg_as_uint(sargs[0])
+        serial = arg_as_u32(sargs[0])
     if serial != 0:
         xdg_surface_ack_configure(xdg_surface, serial)
     _ = wl_display_roundtrip(display)
     print("configure handshake done, serial =", serial)
 
     # --- framebuffer: memfd + wl_shm pool + ARGB8888 gradient ---
-    var fd = _memfd_create("quire-wl", 0)
+    var fd = c_memfd_create("quire-wl".as_c_string_span(), 0)
     if fd < 0:
         raise Error("memfd_create failed")
-    _ = _ftruncate(fd, POOL_SIZE)
-    var pixels = _mmap(0, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-    if Int(pixels) == 0:
+    _ = c_ftruncate(fd, POOL_SIZE)
+    var pixels = c_mmap(0, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+    # mmap failure is MAP_FAILED = (void*)-1, not null (see c_mmap).
+    if Int(pixels) == -1:
         raise Error("mmap failed")
     paint_gradient(pixels)
 
@@ -293,7 +230,7 @@ def main() raises:
     wl_surface_attach(surface, buffer, 0, 0)
     wl_surface_damage(surface, 0, 0, WIDTH, HEIGHT)
     wl_surface_commit(surface)
-    _close(fd)
+    c_close(fd)
     print("first frame committed — window should be visible now")
 
     # --- event loop: respond to pings, detect close ---
@@ -311,7 +248,7 @@ def main() raises:
         loops += 1
         # answer pings (else compositor kills us after ~10s)
         while xdg_wm_base_next_ping(wm_queue, ping_args):
-            xdg_wm_base_pong(wm_base, arg_as_uint(ping_args[0]))
+            xdg_wm_base_pong(wm_base, arg_as_u32(ping_args[0]))
         # drain configure events (reconfigure: keep current size)
         while xdg_toplevel_next_configure(top_queue, wargs):
             pass
@@ -323,6 +260,6 @@ def main() raises:
             running = False
         _ = wl_display_dispatch(display)
 
-    _munmap(pixels, POOL_SIZE)
+    c_munmap(pixels, POOL_SIZE)
     wl_display_disconnect(display)
     print("TEST OK")

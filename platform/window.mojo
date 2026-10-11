@@ -8,25 +8,34 @@
 #   - window.poll() -> Bool               : dispatch events; False = close
 #   - window.close()                      : munmap + disconnect
 #
-from std.ffi import external_call, CStringSpan
-from std.ffi import c_int
-from std.memory import Layout
+from std.ffi import external_call
+from std.ffi import c_int, c_ulong
 from std.memory.unsafe_pointer import Pointer
 
 from platform.ffi import (
     c_null as _null,
-    heap_malloc as _malloc,
     c_close,
     c_munmap,
     c_ftruncate,
+    c_mmap,
+    c_memfd_create,
+    PROT_READ,
+    PROT_WRITE,
+    MAP_SHARED,
+)
+from platform.wl_args import (
+    wlstring as _wlstring,
+    arg_as_string as _arg_as_string,
+    arg_as_u32 as _arg_as_u32,
+    arg_as_i32 as _arg_as_i32,
+    arg_as_fixed as _arg_as_fixed,
+    free_string_arg as _free_string_arg,
 )
 
 from wayland.core import (
     WLPtr,
     WLArgument,
     MAX_EVENT_ARGS,
-    WLString,
-    _shim_string_free,
     shim_interface,
     wl_display_connect,
     wl_display_disconnect,
@@ -37,7 +46,6 @@ from wayland.core import (
     wl_display_roundtrip,
     stack_allocation,
 )
-from std.ffi import c_int
 from wayland.gen.wayland import (
     wl_display_get_registry,
     wl_registry_bind,
@@ -92,13 +100,8 @@ from wayland.gen.xdg_decoration_unstable_v1 import (
 )
 
 
-# --- tiny libc bindings -------------------------------------------------
+# --- tiny libc bindings moved to platform.ffi (shared with the tests) ----
 
-
-# mmap constants (linux)
-comptime PROT_READ = 1
-comptime PROT_WRITE = 2
-comptime MAP_SHARED = 1
 
 # libc poll(2) constants (POLLIN; -1 = block indefinitely)
 comptime POLLIN = 0x001
@@ -109,25 +112,6 @@ comptime POLL_TIMEOUT_BLOCK = -1
 # artifacts from very frequent buffer re-attach/commits (Hyprland races the
 # repaints); 30fps is plenty for a UI.
 comptime FRAME_TIMEOUT_MS = c_int(33)
-
-
-def _memfd_create(name: String, flags: UInt32) -> Int32:
-    var buf = _cptr(name)
-    return external_call["memfd_create", Int32](buf, flags)
-
-
-def _mmap(
-    addr: Int, length: Int, prot: Int32, flags: Int32, fd: Int32, offset: Int
-) -> WLPtr:
-    # addr is a raw address (0 = NULL for kernel to choose)
-    return external_call["mmap", WLPtr](
-        UInt64(addr),
-        UInt64(length),
-        UInt64(prot),
-        UInt64(flags),
-        UInt64(fd),
-        UInt64(offset),
-    )
 
 
 struct PollFd(Copyable, ImplicitlyCopyable, Movable):
@@ -142,64 +126,6 @@ struct PollFd(Copyable, ImplicitlyCopyable, Movable):
         self.fd = -1
         self.events = 0
         self.revents = 0
-
-
-def _cptr(s: String) -> Pointer[Int8, MutUntrackedOrigin]:
-    """NUL-terminated heap copy of a Mojo String (leaked — process lifetime).
-
-    Uses alloc() rather than malloc: the copy is never freed, so its
-    allocator just has to fail-fast on OOM (alloc aborts) — and this keeps
-    the helper non-raising for its Int32-returning callers.
-    """
-    var tmp: String = s
-    var cs = tmp.as_c_string_span()
-    var n = len(cs)
-    var buf = Pointer[Int8, MutUntrackedOrigin](
-        unsafe_from_address=Int(alloc(Layout[UInt8](count=n + 1)).unsafe_leak())
-    )
-    var bytes = tmp.as_bytes()
-    for i in range(len(bytes)):
-        buf[unsafe_offset=i] = Int8(bytes[i])
-    buf[unsafe_offset=len(bytes)] = Int8(0)
-    return buf
-
-
-def _wlstring(s: String) -> WLString:
-    return _cptr(s).unsafe_bitcast[Byte]()
-
-
-def _arg_as_string(a: WLArgument) -> String:
-    var addr = 0
-    for i in range(8):
-        addr = addr | (Int(a.raw[i]) << (8 * i))
-    var ptr = Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=addr)
-    return String(CStringSpan(unsafe_from_ptr=ptr))
-
-
-def _arg_as_u32(a: WLArgument) -> UInt32:
-    var v = 0
-    for i in range(4):
-        v = v | (Int(a.raw[i]) << (8 * i))
-    return UInt32(v)
-
-
-def _arg_as_i32(a: WLArgument) -> Int:
-    """Signed 32-bit wire arg (toplevel configure width/height are Int)."""
-    var v = 0
-    for i in range(4):
-        v = v | (Int(Int32(a.raw[i]) & 0xFF) << (8 * i))
-    # Reinterpret the 32-bit pattern as signed.
-    var signed = Int32(UInt32(v) & 0xFFFFFFFF)
-    return Int(signed)
-
-
-def _arg_as_fixed(a: WLArgument) -> Float64:
-    """wl_fixed (int24.8) → pixels. Wayland fixed-point = value * 256."""
-    var v = 0
-    for i in range(4):
-        v = v | (Int(Int32(a.raw[i]) & 0xFF) << (8 * i))
-    var signed = Int32(v)
-    return Float64(signed) / 256.0
 
 
 def _evdev_to_glfw(code: Int) -> Int32:
@@ -325,15 +251,6 @@ def _evdev_to_glfw(code: Int) -> Int32:
     return Int32(code)
 
 
-def _free_string_arg(a: WLArgument):
-    var addr = 0
-    for i in range(8):
-        addr = addr | (Int(a.raw[i]) << (8 * i))
-    _shim_string_free(
-        Pointer[Byte, MutUntrackedOrigin](unsafe_from_address=addr)
-    )
-
-
 struct GlobalInfo(Copyable, Movable):
     var name: UInt32
     var version: UInt32
@@ -446,13 +363,13 @@ struct Frame(Copyable, Movable):
         """Allocate a fresh memfd + shm pool + ARGB8888 buffer and attach it.
         Used by open() and resize(). Caller keeps ownership of the fd via the
         pool (the fd is closed right after the pool is created)."""
-        var fd = _memfd_create("quire-wl", 0)
+        var fd = c_memfd_create("quire-wl".as_c_string_span(), 0)
         if fd < 0:
             raise Error("wayland: memfd_create failed")
         var stride = width * 4
         var size = stride * height
         _ = c_ftruncate(fd, size)
-        var pixels = _mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+        var pixels = c_mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
         # mmap signals failure with MAP_FAILED = (void*)-1, NOT a null
         # pointer — the null check everyone reaches for here never fires
         # and a failed mmap would segfault on the first pixel write.
@@ -685,14 +602,14 @@ struct Window(Copyable, Movable):
         var compositor = wl_registry_bind(
             registry,
             shim_interface("wl_compositor"),
-            _wlstring("wl_compositor"),
+            _wlstring("wl_compositor".as_c_string_span()),
             comp_info.name,
             4,
         )
         var shm = wl_registry_bind(
             registry,
             shim_interface("wl_shm"),
-            _wlstring("wl_shm"),
+            _wlstring("wl_shm".as_c_string_span()),
             shm_info.name,
             1,
         )
@@ -700,7 +617,7 @@ struct Window(Copyable, Movable):
         var wm_base = wl_registry_bind(
             registry,
             shim_interface("xdg_wm_base"),
-            _wlstring("xdg_wm_base"),
+            _wlstring("xdg_wm_base".as_c_string_span()),
             wm_info.name,
             wm_ver,
         )
@@ -720,7 +637,7 @@ struct Window(Copyable, Movable):
             var deco_mgr = wl_registry_bind(
                 registry,
                 shim_interface("zxdg_decoration_manager_v1"),
-                _wlstring("zxdg_decoration_manager_v1"),
+                _wlstring("zxdg_decoration_manager_v1".as_c_string_span()),
                 deco_info.name,
                 1,
             )
@@ -730,7 +647,13 @@ struct Window(Copyable, Movable):
         var surface = wl_compositor_create_surface(compositor)
         var xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface)
         var toplevel = xdg_surface_get_toplevel(xdg_surface)
-        xdg_toplevel_set_title(toplevel, _wlstring(title))
+        # Borrowed request title: a mutable copy of the caller's string is
+        # required (as_c_string_span must mutate its source; the borrow only
+        # has to outlive set_title's synchronous wire-buffer copy).
+        var title_view = title
+        xdg_toplevel_set_title(
+            toplevel, _wlstring(title_view.as_c_string_span())
+        )
 
         # Request server-side decorations (title bar drawn by the compositor)
         # before the first commit. Guarded: compositors without
@@ -779,8 +702,8 @@ struct Window(Copyable, Movable):
         var configured = False
         for _ in range(50):
             while xdg_toplevel_next_configure(top_queue, targs):
-                var cw = _arg_as_i32(targs[unsafe_offset=0])
-                var ch = _arg_as_i32(targs[unsafe_offset=1])
+                var cw = Int(_arg_as_i32(targs[unsafe_offset=0]))
+                var ch = Int(_arg_as_i32(targs[unsafe_offset=1]))
                 if cw > 0 and ch > 0:
                     fb_w = cw
                     fb_h = ch
@@ -848,7 +771,7 @@ struct Window(Copyable, Movable):
         var seat = wl_registry_bind(
             reg2,
             shim_interface("wl_seat"),
-            _wlstring("wl_seat"),
+            _wlstring("wl_seat".as_c_string_span()),
             seat_info.name,
             seat_ver,
         )
@@ -1101,7 +1024,9 @@ struct Window(Copyable, Movable):
         pfd[unsafe_offset=0].fd = wl_display_get_fd(self.display)
         pfd[unsafe_offset=0].events = Int16(POLLIN)
         pfd[unsafe_offset=0].revents = Int16(0)
-        var prc = external_call["poll", c_int](pfd, c_int(1), FRAME_TIMEOUT_MS)
+        var prc = external_call["poll", c_int](
+            pfd, c_ulong(1), FRAME_TIMEOUT_MS
+        )
         # Read whatever arrived (if anything); also drain already-queued events.
         _ = wl_display_dispatch_pending(self.display)
         if prc > 0 and (Int(pfd[unsafe_offset=0].revents) & POLLIN) != 0:

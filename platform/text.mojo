@@ -21,7 +21,7 @@
 # Text measurement: sum of advances (round 26.6 → px). Kerning ignored
 # (mono font — CaskaydiaCove — so kerning is ~0 anyway).
 
-from std.ffi import external_call
+from std.ffi import c_int, c_long, c_uint, external_call
 from std.collections import Optional
 from std.memory import stack_allocation
 from std.memory.unsafe_pointer import Pointer
@@ -136,7 +136,7 @@ def ft_new_face(
 ) -> Pointer[NoneType, MutUntrackedOrigin]:
     var face_ptr = stack_allocation[1, Pointer[NoneType, MutUntrackedOrigin]]()
     var rc = external_call["FT_New_Face", Int32](
-        lib, cstr(path), UInt64(0), face_ptr
+        lib, cstr(path), c_long(0), face_ptr
     )
     if rc != 0:
         return c_null[NoneType]()
@@ -147,7 +147,7 @@ def ft_set_pixel_sizes(
     face: Pointer[NoneType, MutUntrackedOrigin], px: UInt32
 ) -> Int32:
     return external_call["FT_Set_Pixel_Sizes", Int32](
-        face, UInt64(0), UInt64(px)
+        face, c_uint(0), c_uint(px)
     )
 
 
@@ -161,7 +161,7 @@ def ft_load_glyph(
     face: Pointer[NoneType, MutUntrackedOrigin], index: UInt32
 ) -> Int32:
     return external_call["FT_Load_Glyph", Int32](
-        face, index, UInt64(FT_LOAD_RENDER)
+        face, index, c_int(FT_LOAD_RENDER)
     )
 
 

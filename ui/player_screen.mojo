@@ -1672,7 +1672,7 @@ struct PlayerScreen:
             else:
                 dst_w = side * aspect
             var scale = Float64(ui.ui_scale)
-            ui.canvas[unsafe_offset=0].blit_rgba(
+            ui.canvas().blit_rgba(
                 self.cover_pixels.value(),
                 self.cover_w,
                 self.cover_h,
@@ -1830,7 +1830,7 @@ struct PlayerScreen:
             # compositing — "transparent" simply means don't paint).
             if chap.is_current:
                 var row_rect = ui.rect(x + 10.0, row_y, w - 20.0, chap_h - 6.0)
-                ui.canvas[unsafe_offset=0].fill_rect(
+                ui.canvas().fill_rect(
                     Float64(row_rect.x),
                     Float64(row_rect.y),
                     Float64(row_rect.width),

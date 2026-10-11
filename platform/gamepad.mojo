@@ -7,7 +7,7 @@ name heuristics match a gamepad (rejects keyboards/pointing devices by
 capability bits), defaulting to any device with an ABS_HAT0 axis and a large
 KEY bitmap.
 
-Design (proven pthread pattern from functions/audio_backend.mojo):
+Design (proven pthread pattern from platform/audio_backend.mojo):
 - A reader thread does blocking read(2) on the event fd, decodes the
   input_event structs (24 bytes on x86_64: tv_sec 8, tv_usec 8, type u16,
   code u16, value i32), and updates two lock-protected masks:
@@ -16,15 +16,21 @@ Design (proven pthread pattern from functions/audio_backend.mojo):
                  UI thread once per frame, mirroring WindowInput edges)
 - last_button records the most recent press for the settings rebinder.
 """
-from std.ffi import external_call
-from std.memory import stack_allocation, alloc, Layout
+from std.ffi import c_int, c_ulong, external_call
+from std.memory import stack_allocation, alloc, Layout, dealloc, ThinAllocation
 from std.memory.unsafe_pointer import Pointer
 from std.collections import List, Optional
 from std.pathlib import Path
 from std.os import path
 
 from functions.mutex import Mutex
-from platform.ffi import c_read, c_close, pthread_create, pthread_join, c_null
+from platform.ffi import (
+    c_read,
+    c_close,
+    pthread_create,
+    pthread_join,
+    c_null,
+)
 
 # --- joystick (js0) structs / constants -------------------------------------
 # hhd's virtual "Xbox Elite" is SILENT on the evdev EV_KEY layer; it only
@@ -51,8 +57,11 @@ comptime DPAD_RIGHT_CODE = 9004
 # predeclared in std.ffi ('existing function with conflicting signature'
 # at legalize time when linked from main). glibc exports __-prefixed
 # aliases of the same syscalls — different symbol names, same behavior.
-def _open_evdev(path: Pointer[Int8, MutAnyOrigin], flags: Int32) -> Int32:
-    return external_call["open64", Int32](path, Int(flags))
+def _open_evdev(path: Pointer[Int8, MutAnyOrigin], flags: c_int) -> Int32:
+    # open64 is VARIADIC (`int open64(const char *, int, ...)`) — the mode
+    # arg is never passed here (O_RDONLY only), but the fixed-arg count is
+    # still an ABI requirement for any C variadic function.
+    return external_call["open64", Int32, num_fixed_args=2](path, flags)
 
 
 # --- reader thread shared state ----------------------------------------------
@@ -61,26 +70,38 @@ comptime MASK_WORDS = 16  # codes up to 511 fit in words 0..15 (32 bits each)
 
 
 struct PadState(Copyable, Movable):
-    """Gamepad state guarded by Mutex[PadState]: the down/edge bitmaps (the
-    pointers themselves are stable heap allocations set once in open()), the
-    hat axes, and the last-button record for the settings rebinder."""
+    """Gamepad state guarded by Mutex[PadState]: the down/edge bitmaps are
+    INLINE fixed-size storage (Array[UInt32, MASK_WORDS] — sized at comptime
+    from MASK_WORDS, no heap indirection), plus the hat axes and the
+    last-button record for the settings rebinder."""
 
-    var down: Pointer[UInt32, MutUntrackedOrigin]  # MASK_WORDS bitmap, held
-    var edge: Pointer[UInt32, MutUntrackedOrigin]  # MASK_WORDS bitmap, edge
+    var down: Array[UInt32, MASK_WORDS]  # button held
+    var edge: Array[UInt32, MASK_WORDS]  # pressed since last end_frame()
     var last_button: Int32
     var hat_x: Int32  # ABS_HAT0X value (-1/0/1)
     var hat_y: Int32  # ABS_HAT0Y value (-1/0/1)
 
     def __init__(out self):
-        self.down = Pointer[UInt32, MutUntrackedOrigin](
-            unsafe_from_address=Int(0)
-        )
-        self.edge = Pointer[UInt32, MutUntrackedOrigin](
-            unsafe_from_address=Int(0)
-        )
+        self.down = Array[UInt32, MASK_WORDS](uninitialized=True)
+        self.edge = Array[UInt32, MASK_WORDS](uninitialized=True)
+        for i in range(MASK_WORDS):
+            self.down[i] = 0
+            self.edge[i] = 0
         self.last_button = -1
         self.hat_x = 0
         self.hat_y = 0
+
+    def __copyinit__(mut self, existing: Self):
+        # Array is not implicitly copyable — elementwise copy (same shape
+        # as PaSampleSpec in audio_backend).
+        self.down = Array[UInt32, MASK_WORDS](uninitialized=True)
+        self.edge = Array[UInt32, MASK_WORDS](uninitialized=True)
+        for i in range(MASK_WORDS):
+            self.down[i] = existing.down[i]
+            self.edge[i] = existing.edge[i]
+        self.last_button = existing.last_button
+        self.hat_x = existing.hat_x
+        self.hat_y = existing.hat_y
 
 
 # Not Copyable (the Mutex cannot be copied): allocated on the heap in open()
@@ -138,20 +159,14 @@ def pad_reader_entry(
                 var gcode = Int(_js_to_gamepad(jnum))
                 if gcode >= 0 and gcode < MASK_WORDS * 32:
                     if jval != 0:
-                        var down_w = p[unsafe_offset=0].down
-                        var edge_w = p[unsafe_offset=0].edge
-                        down_w[unsafe_offset=gcode // 32] = down_w[
-                            unsafe_offset=gcode // 32
-                        ] | (UInt32(1) << UInt32(gcode % 32))
-                        edge_w[unsafe_offset=gcode // 32] = edge_w[
-                            unsafe_offset=gcode // 32
-                        ] | (UInt32(1) << UInt32(gcode % 32))
+                        var bit = UInt32(1) << UInt32(gcode % 32)
+                        p[unsafe_offset=0].down[gcode // 32] |= bit
+                        p[unsafe_offset=0].edge[gcode // 32] |= bit
                         p[unsafe_offset=0].last_button = Int32(gcode)
                     else:
-                        var down_w = p[unsafe_offset=0].down
-                        down_w[unsafe_offset=gcode // 32] = down_w[
-                            unsafe_offset=gcode // 32
-                        ] & ~(UInt32(1) << UInt32(gcode % 32))
+                        p[unsafe_offset=0].down[gcode // 32] &= ~(
+                            UInt32(1) << UInt32(gcode % 32)
+                        )
             elif (jtype & JS_TYPE_AXIS) != 0:
                 if jnum == JS_AXIS_HAT_X:
                     p[unsafe_offset=0].hat_x = Int32(jval)
@@ -236,7 +251,7 @@ struct Gamepad(Copyable, Deinitable, Movable):
 
     var shared: Optional[Pointer[PadShared, MutUntrackedOrigin]]
     var fd: Int32
-    var tid: UInt64
+    var tid: c_ulong  # pthread handle
     var running: Bool
     var open_ok: Bool
 
@@ -269,25 +284,19 @@ struct Gamepad(Copyable, Deinitable, Movable):
         self.fd = fd
 
         # shared state block (heap: reader thread lives beyond this call).
-        # The Mutex owns the PadState; the down/edge bitmap allocations it
-        # points at are set once here and never change for the pad's life.
+        # The Mutex owns the PadState — down/edge masks are inline Array
+        # storage inside it, so there are no separate heap bitmaps.
         var sh_ptr = alloc(Layout[PadShared](count=1)).unsafe_leak()
         sh_ptr.unsafe_write(PadShared(Int32(fd)))
-        var down_mem = alloc(Layout[UInt32](count=MASK_WORDS)).unsafe_leak()
-        var edge_mem = alloc(Layout[UInt32](count=MASK_WORDS)).unsafe_leak()
-        for i in range(MASK_WORDS):
-            down_mem[unsafe_offset=i] = 0
-            edge_mem[unsafe_offset=i] = 0
-        with sh_ptr[unsafe_offset=0].state.lock() as p:
-            p[unsafe_offset=0].down = down_mem
-            p[unsafe_offset=0].edge = edge_mem
 
         self.shared = Optional[Pointer[PadShared, MutUntrackedOrigin]](sh_ptr)
-        var tid_mem = alloc(Layout[UInt64](count=1)).unsafe_leak()
-        tid_mem.unsafe_write(0)
-        var rc = external_call["pthread_create", Int32](
-            tid_mem,
-            c_null[NoneType](),
+
+        # pthread handle: libc writes the value before pthread_create
+        # returns; the tid is copied out below — a stack out-param cell is
+        # the sanctioned idiom, no heap needed.
+        var tid_cell = stack_allocation[1, c_ulong]()
+        var rc = pthread_create(
+            tid_cell,
             pad_reader_entry,
             rebind[Pointer[NoneType, MutUntrackedOrigin]](sh_ptr),
         )
@@ -295,39 +304,47 @@ struct Gamepad(Copyable, Deinitable, Movable):
             # Reader never started — no concurrent access, teardown is plain.
             sh_ptr[unsafe_offset=0].running = 0
             sh_ptr[unsafe_offset=0].state.close()
-            down_mem.unsafe_free()
-            edge_mem.unsafe_free()
-            sh_ptr.unsafe_free()
-            tid_mem.unsafe_free()
+            dealloc(
+                ThinAllocation(unsafe_owned_ptr=sh_ptr).unsafe_with_layout(
+                    Layout[PadShared](count=1)
+                )
+            )
             c_close(fd)
+            # Reset the stored fd: the socket is closed, and a half-open
+            # Gamepad must not report a stale descriptor (parity with
+            # close()).
+            self.fd = -1
             return False
-        self.tid = tid_mem[unsafe_offset=0]
-        # tid was copied by value; the heap cell was only needed across the
-        # pthread_create call (which writes through the pointer).
-        tid_mem.unsafe_free()
+        self.tid = tid_cell[unsafe_offset=0]
         self.running = True
         self.open_ok = True
         return True
 
     def close(mut self):
-        """Stop the reader, join it, free the mutex + masks."""
+        """Stop the reader, join it, free the mutex + shared block."""
         if not self.open_ok:
             return
         var sh_mem = self.shared.value()
         sh_mem[unsafe_offset=0].running = 0
         pthread_join(self.tid)
-        # Reader is joined: free the bitmap allocations under the lock, then
-        # tear the mutex down.
-        with sh_mem[unsafe_offset=0].state.lock() as p:
-            p[unsafe_offset=0].down.unsafe_free()
-            p[unsafe_offset=0].edge.unsafe_free()
+        # Reader is joined: tear the mutex down (frees the item and lock
+        # boxes), then free the shared block exactly as allocated.
         sh_mem[unsafe_offset=0].state.close()
-        sh_mem.unsafe_free()
+        dealloc(
+            ThinAllocation(unsafe_owned_ptr=sh_mem).unsafe_with_layout(
+                Layout[PadShared](count=1)
+            )
+        )
         c_close(self.fd)
         self.fd = -1
         self.tid = 0
         self.running = False
         self.open_ok = False
+        # Clear the optional so no stale shared-pointer survives close
+        # (parity with AudioBackend.close()) — is_down/relaunch paths all
+        # branch on open_ok, but the pointer is dead the moment the block
+        # is freed.
+        self.shared = Optional[Pointer[PadShared, MutUntrackedOrigin]]()
 
     def is_down(mut self, gamepad_code: Int) -> Bool:
         """GAMEPAD_BUTTON_* enum -> held state.
@@ -352,9 +369,9 @@ struct Gamepad(Copyable, Deinitable, Movable):
             return False
         var sh_mem = self.shared.value()
         with sh_mem[unsafe_offset=0].state.lock() as p:
-            var bit = p[unsafe_offset=0].down[
-                unsafe_offset=gamepad_code // 32
-            ] & (UInt32(1) << UInt32(gamepad_code % 32))
+            var bit = p[unsafe_offset=0].down[gamepad_code // 32] & (
+                UInt32(1) << UInt32(gamepad_code % 32)
+            )
             return bit != 0
 
     def was_pressed(mut self, gamepad_code: Int) -> Bool:
@@ -370,9 +387,9 @@ struct Gamepad(Copyable, Deinitable, Movable):
             return False
         var sh_mem = self.shared.value()
         with sh_mem[unsafe_offset=0].state.lock() as p:
-            var bit = p[unsafe_offset=0].edge[
-                unsafe_offset=gamepad_code // 32
-            ] & (UInt32(1) << UInt32(gamepad_code % 32))
+            var bit = p[unsafe_offset=0].edge[gamepad_code // 32] & (
+                UInt32(1) << UInt32(gamepad_code % 32)
+            )
             return bit != 0
 
     def _hat_down(mut self, axis: Int, direction: Int) -> Bool:
@@ -404,7 +421,7 @@ struct Gamepad(Copyable, Deinitable, Movable):
         var sh_mem = self.shared.value()
         with sh_mem[unsafe_offset=0].state.lock() as p:
             for i in range(MASK_WORDS):
-                p[unsafe_offset=0].edge[unsafe_offset=i] = 0
+                p[unsafe_offset=0].edge[i] = 0
             p[unsafe_offset=0].last_button = Int32(-1)
 
 
@@ -448,16 +465,3 @@ def _find_pad_event_node() raises -> String:
     if path.exists(Path("/dev/input/js0")):
         return String("/dev/input/js0")
     return String("")
-
-
-def null_gamepad_ptr() -> Pointer[Gamepad, MutUntrackedOrigin]:
-    """NULL Gamepad pointer for UIContext's defaulted gamepad parameter.
-
-    Built with the address-8-minus-8 trick (Pointer is non-nullable
-    on Mojo 1.0.0); UIContext checks Int(ptr) == 0 before dereferencing.
-    """
-    var tmp = Pointer[Int, MutAnyOrigin](unsafe_from_address=8)
-    var base = Pointer[Int8, MutUntrackedOrigin](
-        unsafe_from_address=Int(tmp) - 8
-    )
-    return rebind[Pointer[Gamepad, MutUntrackedOrigin]](base)

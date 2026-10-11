@@ -655,8 +655,9 @@ struct SettingsScreen:
         """Capture the next pressed key or gamepad button while rebinding.
 
         Gated on rebinding_is_gamepad: if True, only captures gamepad buttons
-        (via get_gamepad_button_pressed). If False, only captures keyboard keys
-        (via is_key_pressed, with Shift as a modifier). Escape always cancels.
+        (via ui.captured_gamepad_button). If False, only captures keyboard
+        keys (via ui.key_pressed, with Shift as a modifier). Escape always
+        cancels.
         """
         # Escape always cancels.
         if ui.key_pressed(KEY_ESCAPE):
@@ -669,21 +670,20 @@ struct SettingsScreen:
 
         if self.rebinding_is_gamepad:
             # --- Gamepad capture only (evdev backend, main-heap-boxed) ---
-            # Focus gate: ignore pad events when another window is focused.
-            if Int(ui.gamepad) != 0 and ui.input[unsafe_offset=0].focused:
-                var gp_button = ui.gamepad[unsafe_offset=0].last_button()
-                if gp_button >= 0:
-                    var gp_name = key_name(GAMEPAD_SENTINEL + Int(gp_button))
-                    if gp_name.byte_length() > 0:
-                        self._set_gp_binding(action, gp_name)
-                        self._cancel_rebind()
-                        self.status_message = (
-                            "Rebound "
-                            + _action_label(action)
-                            + " (pad) to "
-                            + _pretty_binding(gp_name)
-                        )
-                        self.status_color = GREEN
+            # No pad / another window focused both surface as -1.
+            var gp_button = ui.captured_gamepad_button()
+            if gp_button >= 0:
+                var gp_name = key_name(GAMEPAD_SENTINEL + Int(gp_button))
+                if gp_name.byte_length() > 0:
+                    self._set_gp_binding(action, gp_name)
+                    self._cancel_rebind()
+                    self.status_message = (
+                        "Rebound "
+                        + _action_label(action)
+                        + " (pad) to "
+                        + _pretty_binding(gp_name)
+                    )
+                    self.status_color = GREEN
             return
 
         # --- Keyboard capture only ---
@@ -990,7 +990,7 @@ struct SettingsScreen:
 
             # Row card
             var r = ui.rect(row_x, row_y, row_w, row_h)
-            ui.canvas[unsafe_offset=0].fill_rect_rounded(
+            ui.canvas().fill_rect_rounded(
                 Float64(r.x),
                 Float64(r.y),
                 Float64(r.width),
@@ -998,7 +998,7 @@ struct SettingsScreen:
                 0.06,
                 bg,
             )
-            ui.canvas[unsafe_offset=0].outline_rect_rounded(
+            ui.canvas().outline_rect_rounded(
                 Float64(r.x),
                 Float64(r.y),
                 Float64(r.width),
@@ -1213,8 +1213,9 @@ def _pretty_key_name(raw: String) -> String:
 
     if not raw.startswith("KEY_"):
         return raw
-    # Strip the 4-byte "KEY_" prefix. String has no slicing in Mojo 1.0, so
-    # use truncate_string to take the first (byte_length - 4) characters.
+    # Strip the 4-byte "KEY_" prefix. String has no slice syntax on the
+    # pinned toolchain, so use truncate_string to take the first
+    # (byte_length - 4) characters.
     var body = truncate_string(raw, raw.byte_length() - 4)
     # Special-case modifiers to short names.
     if body == "LEFT_SHIFT" or body == "RIGHT_SHIFT":

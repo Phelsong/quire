@@ -6,11 +6,11 @@ via the `atempo` filter, and writes 32-bit float PCM (f32le, 44100 Hz, stereo)
 to stdout. The UI loop polls ffmpeg's stdout non-blocking each frame and
 feeds chunks directly
 
-Mojo 1.0.0 has no threading or sync primitives, so the Python background
-thread + bounded queue is replaced with single-threaded non-blocking reads:
-ffmpeg's stdout fd is set to O_NONBLOCK, stdio is set to unbuffered (_IONBF),
-and `read_chunk()` polls via `fread` each frame — returning whatever bytes
-are available (EAGAIN -> empty result, EOF -> marks end).
+The pipe is deliberately SINGLE-threaded: ffmpeg's stdout fd is set to
+O_NONBLOCK, stdio is set to unbuffered (_IONBF), and `read_chunk()` polls
+via `fread` each frame — returning whatever bytes are available (EAGAIN ->
+empty result, EOF -> marks end). This replaced a Python background thread +
+bounded queue and keeps the player loop in charge of pacing.
 
 Zero per-float FFI crossings: PCM lands in a persistent Mojo heap buffer and
 its raw C address is handed to `update_audio_stream`
@@ -20,11 +20,11 @@ from std.os import path, getenv
 from std.pathlib import Path
 from std.sys._libc import popen, pclose, FILE_ptr
 from std.ffi import external_call, c_int, c_size_t
-from std.memory import Layout
 from std.memory.unsafe_pointer import Pointer
 from std.collections import List
 
 from functions.helpers import _is_executable, _which, _shell_quote
+from platform.ffi import Box, c_null
 
 # Must match load_audio_stream() args on the player side.
 comptime SAMPLE_RATE = 44100
@@ -43,7 +43,8 @@ comptime _IONBF = 2  # setvbuf mode: unbuffered I/O
 
 
 # ---------------------------------------------------------------------------
-# Tuple replacements — Mojo 1.0.0b2 tuples don't construct as types
+# Tuple replacements — tuple types didn't construct reliably on the old
+# toolchain line; these structs also read better at call sites
 # ---------------------------------------------------------------------------
 
 
@@ -108,7 +109,7 @@ def _null_file_ptr() -> FILE_ptr:
 
     Accessing this without `running=True` would be undefined; the `running`
     flag gates all real use. Default value construction (no initializer)
-    yields the zero-valued placeholder on Mojo 1.0.0.
+    yields the zero-valued placeholder on the pinned toolchain.
     """
     var fp = FILE_ptr()
     return fp
@@ -213,8 +214,10 @@ struct AudioPipe:
     var running: Bool
     var reached_eof: Bool
 
-    # CHUNK_FRAMES * CHANNELS floats = CHUNK_BYTES bytes.
-    var buffer: Pointer[UInt8, MutUntrackedOrigin]
+    # CHUNK_FRAMES * CHANNELS floats = CHUNK_BYTES bytes. Owned by the
+    # Box (typed Layout sizing + matched free in __deinit__ — no manual
+    # unsafe_free to roll).
+    var buffer: Box[UInt8]
 
     # Stream parameters retained for restart().
     var source: String
@@ -231,7 +234,7 @@ struct AudioPipe:
         self.fd = -1
         self.running = False
         self.reached_eof = False
-        self.buffer = alloc(Layout[UInt8](count=CHUNK_BYTES)).unsafe_leak()
+        self.buffer = Box[UInt8](count=CHUNK_BYTES)
         self.source = ""
         self.is_local = False
         self.extra_headers = List[HttpHeader]()
@@ -240,7 +243,7 @@ struct AudioPipe:
 
     def __deinit__(deinit self):
         self._terminate()
-        self.buffer.unsafe_free()
+        # the buffer Box frees itself
 
     def __init__(out self, *, copy: Self):
         self.fp = copy.fp
@@ -248,10 +251,12 @@ struct AudioPipe:
         self.running = copy.running
         self.reached_eof = copy.reached_eof
         # Deep copy the buffer so the copy owns independent memory.
-        self.buffer = alloc(Layout[UInt8](count=CHUNK_BYTES)).unsafe_leak()
+        self.buffer = Box[UInt8](count=CHUNK_BYTES)
         if copy.running:
             for i in range(CHUNK_BYTES):
-                self.buffer[unsafe_offset=i] = copy.buffer[unsafe_offset=i]
+                self.buffer.ptr()[unsafe_offset=i] = copy.buffer.ptr()[
+                    unsafe_offset=i
+                ]
         self.source = copy.source
         self.is_local = copy.is_local
         self.extra_headers = copy.extra_headers.copy()
@@ -317,7 +322,9 @@ struct AudioPipe:
         # can surface fresh state.
         _ = external_call["clearerr", c_int](self.fp)
 
-        var buf_ptr = rebind[Pointer[Int8, MutUntrackedOrigin]](self.buffer)
+        var buf_ptr = rebind[Pointer[Int8, MutUntrackedOrigin]](
+            self.buffer.ptr()
+        )
         var n = external_call["fread", c_size_t](
             buf_ptr, c_size_t(1), c_size_t(CHUNK_BYTES), self.fp
         )
@@ -355,11 +362,11 @@ struct AudioPipe:
 
     def pcm_samples(self) -> Pointer[Float32, MutUntrackedOrigin]:
         """The persistent buffer, typed as f32 stereo-interleaved samples."""
-        return self.buffer.unsafe_bitcast[Float32]()
+        return rebind[Pointer[Float32, MutUntrackedOrigin]](self.buffer.ptr())
 
     def get_buffer_address(self) -> Int:
         """Return the persistent buffer's C address (for diagnostics)."""
-        return Int(self.buffer)
+        return Int(self.buffer.ptr())
 
     def get_chunk_frames(self) -> Int:
         """Return the fixed chunk size in frames (CHUNK_FRAMES)."""
@@ -447,19 +454,24 @@ struct AudioPipe:
 
         # Set the stdout fd to non-blocking so read() returns EAGAIN instead
         # of blocking the 60fps UI loop when ffmpeg has no data yet.
-        _ = external_call["fcntl", c_int](
+        # fcntl(2) is VARIADIC (`int fcntl(int fd, int cmd, ...)`) — the
+        # fixed-arg count (fd, cmd) is an ABI requirement; the O_NONBLOCK
+        # arg is the variadic one.
+        _ = external_call["fcntl", c_int, num_fixed_args=2](
             c_int(self.fd), c_int(F_SETFL), c_int(O_NONBLOCK)
         )
 
         # Set stdio to unbuffered (_IONBF) so fread hits the non-blocking fd
         # directly rather than trying to fill a stdio buffer (which would
         # block). Without this, fread on a non-blocking fd sets ferror on
-        # every EAGAIN even when no data was requested.
+        # every EAGAIN even when no data was requested. setvbuf's buf/size
+        # are ignored for _IONBF: true-NULL buf (honest null idiom, c_null)
+        # and size 0 as size_t.
         _ = external_call["setvbuf", c_int](
             self.fp,
-            Pointer[Int8, MutUntrackedOrigin].unsafe_dangling(),
+            c_null[Int8](),
             c_int(_IONBF),
-            c_int(0),
+            c_size_t(0),
         )
 
         self.running = True

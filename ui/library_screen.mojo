@@ -975,7 +975,7 @@ struct LibraryScreen:
                     var src_h = packed % 1000000
                     # canvas is screen-px: scale design coords up.
                     var s = Float64(ui.ui_scale)
-                    ui.canvas[unsafe_offset=0].blit_rgba(
+                    ui.canvas().blit_rgba(
                         pixels,
                         src_w,
                         src_h,
@@ -1185,7 +1185,7 @@ struct LibraryScreen:
                 var np_src_w = np_packed // 1000000
                 var np_src_h = np_packed % 1000000
                 var s = Float64(ui.ui_scale)
-                ui.canvas[unsafe_offset=0].blit_rgba(
+                ui.canvas().blit_rgba(
                     np_pixels,
                     np_src_w,
                     np_src_h,
