@@ -259,3 +259,36 @@ def update_saved_progress(rating_key: String, position_ms: Int) raises:
 
     var payload = to_json[pretty=True](meta)
     file_path.write_bytes(Span[UInt8](payload.as_bytes()))
+
+
+def matches_saved_query(meta: SavedBookMetadata, query: String) -> Bool:
+    """Case-insensitive title/author substring match for offline search.
+
+    The pure half of the offline search (testable without sidecar files).
+    Lowers the query itself — callers cannot misfeed an unlowered needle.
+    An empty query never matches: "" means "clear search", not "match all"."""
+    var query_lower = query.lower()
+    if query_lower.byte_length() == 0:
+        return False
+    if meta.title.lower().find(query_lower) >= 0:
+        return True
+    return meta.author.lower().find(query_lower) >= 0
+
+
+def search_saved_books(query: String) -> List[PlexBookCard]:
+    """Offline search: filter the sidecar store by title/author substring.
+
+    Used by the library screen when the server is unreachable (known-
+    offline session or a failed server search). Order is preserved from
+    load_saved_books (newest download first), mirroring the offline
+    library view. An empty query returns no matches ("clear" semantics)."""
+    var out = List[PlexBookCard]()
+    if query.byte_length() == 0:
+        return out^
+
+    var saved = load_saved_books()
+    for i in range(len(saved)):
+        ref meta = saved[i]
+        if matches_saved_query(meta, query):
+            out.append(meta.to_card())
+    return out^

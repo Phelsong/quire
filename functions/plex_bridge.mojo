@@ -13,6 +13,7 @@ from std.python import Python, PythonObject
 from std.python.conversions import ConvertibleToPython
 from std.os import makedirs, path, remove, getenv
 from std.pathlib import Path
+from std.time import perf_counter
 
 from emberjson import from_json, Value, Object
 from emberjson.array import Array as JsonArray
@@ -63,6 +64,16 @@ struct PlexSession(Movable):
     var username: String
     var logged_in: Bool
 
+    # Known-offline state. Set by a failed boot probe or a failed primary
+    # fetch (load_data, run_search, load_book detail/tracks); cleared by the
+    # next successful server operation or a successful re-probe. While it
+    # holds, the UI paths skip server round-trips entirely (sidecar store
+    # + local audio only) instead of burning HTTP timeouts.
+    var offline: Bool
+    # perf_counter() seconds of the last failed probe/fetch — arms the
+    # re-probe window consumed by LibraryScreen._offline_probe_ok.
+    var last_offline_probe_s: Float64
+
     def __init__(out self):
         self.account_token = ""
         self.server_token = ""
@@ -74,6 +85,14 @@ struct PlexSession(Movable):
         self.library_name = ""
         self.username = ""
         self.logged_in = False
+        self.offline = False
+        self.last_offline_probe_s = 0.0
+
+    def mark_offline(mut self):
+        """Record a failed probe/fetch: flag the session offline and arm
+        the re-probe window (now, so the next allowed probe is 30s out)."""
+        self.offline = True
+        self.last_offline_probe_s = perf_counter()
 
 
 def _hex_digit(n: Int) -> String:
@@ -643,6 +662,42 @@ def test_server(
         result.ok = False
         result.error = error_msg
         return result^
+
+
+def probe_server(
+    server_url: String,
+    token: String,
+    client_id: String = "",
+    timeout_s: Float64 = 2.5,
+) -> ServerTestResult:
+    """Identity check with a short scalar timeout — the offline fast path.
+
+    Same /identity endpoint and result shape as test_server, but the httpx
+    timeout defaults to 2.5s instead of 30 so a boot restore can decide
+    reachable-vs-offline in a few seconds instead of blocking the first
+    frame for 30. Catches its own exceptions and returns ok=False (never
+    raises) — callers branch on the flag, not on exceptions."""
+    var result = ServerTestResult()
+    try:
+        var headers = plex_headers(token=token, client_id=client_id)
+        var data = _http_get(
+            server_url + "/identity", headers, timeout=timeout_s
+        )
+        var container = _container_of(data^)
+        result.ok = True
+        result.name = _vstr(container, "friendlyName", _vstr(container, "name"))
+        result.machine_id = _vstr(container, "machineIdentifier")
+    except e:
+        var error_msg = String(e)
+        print(
+            "[plex_bridge] probe_server failed for "
+            + server_url
+            + ": "
+            + error_msg
+        )
+        result.ok = False
+        result.error = error_msg
+    return result
 
 
 def find_best_connection(

@@ -4,6 +4,7 @@ from std.memory import alloc, Layout, unsafe_memcpy
 from std.memory.unsafe_pointer import Pointer
 from std.os import path
 from std.pathlib import Path
+from std.time import perf_counter
 
 from functions.helpers import (
     format_time,
@@ -24,6 +25,7 @@ from functions.plex_bridge import (
     load_cached_cover,
     save_cached_cover,
     get_audio_cache_dir,
+    probe_server,
     report_progress,
     mark_watched,
 )
@@ -74,7 +76,10 @@ from resources.plex_objects import (
     LibraryItem,
     ServerItem,
 )
-from resources.offline_library import load_saved_books
+from resources.offline_library import (
+    load_saved_books,
+    search_saved_books,
+)
 from ui.widgets import TextInput, Button, Checkbox, PlexBookCard
 from ui.font import FontSet
 from ui import Screen
@@ -91,6 +96,13 @@ comptime TAP_SLOP_PX = 12.0
 # keeps mid-word results from thrashing the server on every keystroke
 # while staying under a natural pause.
 comptime SEARCH_DEBOUNCE_S = 0.35
+
+# Known-offline re-probe window: load_data calls are explicit user
+# actions (login, page turn, search clear), but the reachability probe
+# they trigger is allowed at most once per this many seconds since the
+# last failed probe/fetch — an offline session never re-burns HTTP
+# timeouts on every page turn.
+comptime OFFLINE_REPROBE_S = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +236,7 @@ struct LibraryScreen:
         self.sync_requested = False
         self.sync_done = False
 
-    def load_data(mut self, app_state: PlexSession) raises:
+    def load_data(mut self, mut app_state: PlexSession) raises:
         """Fetch audiobooks from Plex and populate the book list.
 
         Offline-first: saved sidecars (downloads) are loaded BEFORE the
@@ -233,6 +245,11 @@ struct LibraryScreen:
         server page (a downloaded book shows in whatever page holds it, and
         sidecars only surface as standalone rows when the server is
         unreachable).
+
+        Known-offline precedence (app_state.offline): the server fetch is
+        skipped and the sidecar store renders immediately, subject to the
+        re-probe window in _offline_probe_ok — a successful re-probe clears
+        the flag and resumes the normal fetch path (server wins again).
 
         Uses the current page/page_size for server-side pagination via Plex's
         X-Plex-Container-Start/Size headers. Stores total_size for page count.
@@ -257,6 +274,16 @@ struct LibraryScreen:
             # Sidecar rows are known-downloaded; memoize so badges and the
             # sort pass need no filesystem probe this session.
             self.downloaded_cache[meta.rating_key] = True
+
+        # --- Known-offline short-circuit (see docstring precedence) ---
+        # A failed (window-throttled) probe renders the sidecar library;
+        # a successful probe cleared the flag and falls through to fetch.
+        if app_state.offline and not self._offline_probe_ok(app_state):
+            # The restored config knows the library name even offline.
+            if app_state.library_name.byte_length() > 0:
+                self.library_name = app_state.library_name
+            self._show_offline_list(offline_books^)
+            return
 
         var token = app_state.server_token
         if token.byte_length() == 0:
@@ -312,6 +339,10 @@ struct LibraryScreen:
                     self.scroll_offset = 0.0
                     self.active_search = ""
             else:
+                # Server answered — reachable again: clear the offline
+                # state before anything else reads it this session.
+                app_state.offline = False
+
                 # Server online — request the one-time sidecar backfill
                 if not self.sync_done:
                     self.sync_requested = True
@@ -340,24 +371,11 @@ struct LibraryScreen:
                 self.active_search = ""
         except e:
             # Server unreachable (no network, wrong URL, down): degrade to
-            # the offline library instead of an error page.
+            # the offline library instead of an error page, and flag the
+            # session so later loads skip the doomed fetch entirely.
             print("[Quire] library fetch failed, using offline: " + String(e))
-            self.books = offline_books^
-            self.total_size = len(self.books)
-            if len(self.books) > 0:
-                self.status_message = (
-                    "Offline — showing "
-                    + String(len(self.books))
-                    + " downloaded books"
-                )
-                self.status_color = TEXT_DIM
-            else:
-                self.status_message = "Failed to load library"
-                self.status_color = ERROR_COLOR
-            self.scroll_offset = 0.0
-            self.active_search = ""
-            self.cover_queue = List[String]()
-            self.data_loaded = True
+            app_state.mark_offline()
+            self._show_offline_list(offline_books^)
             return
 
         # Hoist in-progress + downloaded books to the top of the list.
@@ -368,6 +386,56 @@ struct LibraryScreen:
         self.cover_queue = List[String]()
 
         self.data_loaded = True
+
+    def _show_offline_list(mut self, var books: List[PlexBookCard]) raises:
+        """Render the sidecar library as the (offline) book list.
+
+        Shared shape of the two failure paths above (no-token, fetch
+        failed) — sidecars when there are any, a short status line when
+        not. Consumes `books` (the caller's list moves here)."""
+        self.books = books^
+        self.total_size = len(self.books)
+        if len(self.books) > 0:
+            self.status_message = (
+                "Offline — showing "
+                + String(len(self.books))
+                + " downloaded books"
+            )
+            self.status_color = TEXT_DIM
+        else:
+            self.status_message = "Offline — no downloaded books"
+            self.status_color = TEXT_DIM
+        self.scroll_offset = 0.0
+        self.active_search = ""
+        self.cover_queue = List[String]()
+        self.data_loaded = True
+
+    def _offline_probe_ok(mut self, mut app_state: PlexSession) -> Bool:
+        """One throttled reachability probe for the known-offline state.
+
+        Policy: a load_data call is a user action, but probing is allowed
+        at most once per OFFLINE_REPROBE_S since the last failed probe or
+        fetch (app_state.last_offline_probe_s) — inside that window the
+        answer is False without any I/O. Outside it, one short-timeout
+        probe runs: success clears the offline state and returns True
+        (the caller falls through to the real fetch); failure re-arms the
+        window and returns False."""
+        var now = perf_counter()
+        if now - app_state.last_offline_probe_s < OFFLINE_REPROBE_S:
+            return False
+        app_state.last_offline_probe_s = now
+
+        var token = app_state.server_token
+        if token.byte_length() == 0:
+            token = app_state.account_token
+        var probe = probe_server(
+            app_state.server_url, token, app_state.client_id
+        )
+        if probe.ok:
+            # Any successful server operation clears the offline flag.
+            app_state.offline = False
+            return True
+        return False
 
     def _page_count(self) -> Int:
         """Total number of pages, or 1 if total_size is unknown (0)."""
@@ -469,11 +537,22 @@ struct LibraryScreen:
             hoisted.append(rest[i])
         self.books = hoisted^
 
-    def run_search(mut self, app_state: PlexSession, query: String) raises:
+    def run_search(mut self, mut app_state: PlexSession, query: String) raises:
         """Fetch server-side search results for `query` and replace `books`.
 
         Called from main.mojo when draw() sets search_query_requested. An
         empty query clears the search and reloads the current page.
+
+        Offline precedence: a known-offline session (app_state.offline)
+        skips the server round-trip and searches the sidecar store
+        directly (_search_downloaded); an unreachable server (exception)
+        flags the session offline and falls back to the same filter. A
+        reachable server that answers but errors keeps the existing
+        error status (it is reachable — only the filter failed). A
+        successful server search clears the offline flag — online results
+        always win when reachable. The client-side match semantics mirror
+        the server path's author fallback (case-insensitive substrings on
+        title + author).
         """
         if query.byte_length() == 0:
             self.active_search = ""
@@ -482,6 +561,11 @@ struct LibraryScreen:
 
         self.status_message = 'Searching "' + query + '"...'
         self.status_color = TEXT_DIM
+
+        # Known-offline: no doomed server round-trip, filter sidecars.
+        if app_state.offline:
+            self._search_downloaded(query)
+            return
 
         var token = app_state.server_token
         if token.byte_length() == 0:
@@ -499,6 +583,8 @@ struct LibraryScreen:
                 self.status_message = "Search failed (server error)"
                 self.status_color = ERROR_COLOR
                 return
+            # Server answered — reachable again: clear the offline state.
+            app_state.offline = False
             self.books = result.items.copy()
             self.active_search = query
             self.status_message = (
@@ -511,8 +597,41 @@ struct LibraryScreen:
             self.status_color = GREEN
             self.scroll_offset = 0.0
         except e:
-            self.status_message = "Search failed: " + String(e)
-            self.status_color = ERROR_COLOR
+            # Server unreachable mid-session: flag it so the next loads
+            # skip the doomed fetch, and surface sidecar matches instead.
+            print("[Quire] search failed, using offline: " + String(e))
+            app_state.mark_offline()
+            self._search_downloaded(query)
+            return
+
+        # Search results use the same hoist ordering as the page view.
+        self._sort_books_for_display()
+
+        # New book list: drop stale cover queue (same as load_data).
+        self.cover_queue = List[String]()
+
+    def _search_downloaded(mut self, query: String) raises:
+        """Offline search fallback: client-side filter over the sidecar
+        store (search_saved_books, newest-saved order preserved).
+
+        Replaces `books` with the matches and keeps the file's status-line
+        wording; an offline result set has no server pagination, so
+        total_size pins to the match count (one page)."""
+        var matches = search_saved_books(query)
+        self.books = matches^
+        self.total_size = len(self.books)
+        self.active_search = query
+        self.scroll_offset = 0.0
+        if len(self.books) > 0:
+            self.status_message = (
+                "Offline — showing "
+                + String(len(self.books))
+                + " matches from downloaded books"
+            )
+            self.status_color = TEXT_DIM
+        else:
+            self.status_message = "Offline — no downloads match"
+            self.status_color = TEXT_DIM
 
         # Search results use the same hoist ordering as the page view.
         self._sort_books_for_display()
@@ -600,9 +719,13 @@ struct LibraryScreen:
             return
 
         # Disk cache first: covers persist across sessions, so a book seen
-        # before renders instantly without touching the network.
+        # before renders instantly without touching the network. While the
+        # session is known-offline the HTTP fetch is skipped (local cache
+        # or placeholder) — the attempt-once covers_done bookkeeping below
+        # is unchanged, so a cover missed offline can still be fetched on
+        # a later online reload (same as a plain cache miss).
         var image_data = load_cached_cover(rating_key, 160, 160)
-        if image_data.byte_length() == 0:
+        if image_data.byte_length() == 0 and not app_state.offline:
             image_data = fetch_thumbnail(thumb_url)
             save_cached_cover(rating_key, 160, 160, image_data)
 

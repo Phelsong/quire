@@ -13,7 +13,7 @@ from functions.plex_bridge import (
     Config,
     load_config,
     get_servers,
-    test_server,
+    probe_server,
     get_account_info,
     save_config,
     get_book_detail,
@@ -156,7 +156,14 @@ def main() raises:
     var was_logged_in = False
 
     # --- Try to restore saved session ---
-    # If we have a valid saved config, skip login and go directly to library
+    # If we have a valid saved config, skip login and go directly to library.
+    #
+    # Offline precedence: the saved session is restored even when the
+    # server is unreachable — config.json + the sidecar store are enough
+    # to run the library fully offline. The test is a SHORT-timeout
+    # identity probe (~2.5s, not test_server's 30s scalar) and a failed
+    # probe only flags the session offline (see PlexSession.offline);
+    # the first-frame transition then loads sidecars immediately.
     try:
         var saved = load_config()
         var saved_token = saved.account_token
@@ -177,55 +184,60 @@ def main() raises:
             if test_token.byte_length() == 0:
                 test_token = saved_token
 
-            var test_result = test_server(
+            var test_result = probe_server(
                 saved_server_url,
                 test_token,
                 saved_client_id,
             )
             var server_ok = test_result.ok
 
-            if server_ok:
-                # Restore session from saved config
-                app_state.account_token = saved_token
-                app_state.server_token = saved_server_token
-                app_state.client_id = saved_client_id
-                app_state.server_url = saved_server_url
-                app_state.server_name = saved.server_name
-                app_state.machine_id = saved.machine_id
-                app_state.library_id = saved_library_id
-                app_state.library_name = saved.library_name
-                app_state.username = saved.username
-                app_state.logged_in = True
-                # was_logged_in stays False so the transition logic fires
-                # on the first frame (loads library data)
-                screen.current = 1  # Skip to library screen
+            # Restore session from saved config — reachable or not.
+            app_state.account_token = saved_token
+            app_state.server_token = saved_server_token
+            app_state.client_id = saved_client_id
+            app_state.server_url = saved_server_url
+            app_state.server_name = saved.server_name
+            app_state.machine_id = saved.machine_id
+            app_state.library_id = saved_library_id
+            app_state.library_name = saved.library_name
+            app_state.username = saved.username
+            app_state.logged_in = True
+            if not server_ok:
+                # Probe failed — flag the session; load_data short-circuits
+                # to the sidecar store until a re-probe succeeds. Token/url
+                # assignment above mirrors the reachable case exactly.
+                app_state.mark_offline()
 
-                # Populate SelectionScreen with saved server/library data
-                # so the back button from Library goes to a populated screen
-                var saved_server = ServerItem()
-                saved_server.name = app_state.server_name
-                saved_server.url = app_state.server_url
-                saved_server.token = app_state.server_token
-                saved_server.machine_id = app_state.machine_id
-                saved_server.is_owned = True
-                selection.servers.append(saved_server)
-                selection.selected_server_idx = 0
-                var saved_library = LibraryItem()
-                saved_library.key = app_state.library_id
-                saved_library.title = app_state.library_name
-                saved_library.lib_type = "artist"
-                selection.libraries.append(saved_library)
-                selection.selected_library_idx = 0
-                selection.phase = 1  # Show library selection phase
-                selection.account_token = app_state.account_token
-                selection.client_id = app_state.client_id
-                selection.status_message = (
-                    "Selected: "
-                    + app_state.server_name
-                    + " / "
-                    + app_state.library_name
-                )
-                selection.status_color = GREEN
+            # was_logged_in stays False so the transition logic fires
+            # on the first frame (loads library data)
+            screen.current = 1  # Skip to library screen
+
+            # Populate SelectionScreen with saved server/library data
+            # so the back button from Library goes to a populated screen
+            var saved_server = ServerItem()
+            saved_server.name = app_state.server_name
+            saved_server.url = app_state.server_url
+            saved_server.token = app_state.server_token
+            saved_server.machine_id = app_state.machine_id
+            saved_server.is_owned = True
+            selection.servers.append(saved_server)
+            selection.selected_server_idx = 0
+            var saved_library = LibraryItem()
+            saved_library.key = app_state.library_id
+            saved_library.title = app_state.library_name
+            saved_library.lib_type = "artist"
+            selection.libraries.append(saved_library)
+            selection.selected_library_idx = 0
+            selection.phase = 1  # Show library selection phase
+            selection.account_token = app_state.account_token
+            selection.client_id = app_state.client_id
+            selection.status_message = (
+                "Selected: "
+                + app_state.server_name
+                + " / "
+                + app_state.library_name
+            )
+            selection.status_color = GREEN
     except:
         pass  # Config load failure — start fresh with login
 
@@ -422,6 +434,20 @@ def main() raises:
                 except:
                     pass
 
+        # --- Library-list request from the selection screen ---
+        # draw() sets libraries_requested when a server card is picked; run
+        # the get_libraries fetch here (outside the render loop — mirror of
+        # search_query_requested above) so the network call doesn't block
+        # mid-draw. Failures land in the selection screen's status line
+        # (load_libraries guards internally).
+        if screen.current == 3:
+            if selection.libraries_requested:
+                selection.libraries_requested = False
+                try:
+                    selection.load_libraries()
+                except:
+                    pass
+
         # --- Settings screen save / reset requests ---
         # draw() sets save_requested / reset_requested; we persist (or
         # restore defaults) here, outside the render loop. On save, the
@@ -486,27 +512,41 @@ def main() raises:
         # --- Auth complete → Selection screen transition ---
         if login.auth_complete and screen.current == 0:
             screen.current = 3  # SelectionScreen
-            # Fetch servers from plex.tv and test connections
-            var servers = get_servers(
-                app_state.account_token,
-                app_state.client_id,
-            )
-            var server_count = len(servers)
-
-            # Guard: no servers found
-            if server_count == 0:
-                selection.status_message = "No Plex servers found"
+            # Guarded: get_servers is the one unguarded network call in
+            # the frame loop — offline it raised straight through and
+            # killed the process. Failures land in the selection screen's
+            # status line (same error-string shape as load_servers').
+            var fetch_ok = False
+            var servers = List[ServerItem]()
+            try:
+                var fetched = get_servers(
+                    app_state.account_token,
+                    app_state.client_id,
+                )
+                servers = fetched^
+                fetch_ok = True
+            except e:
+                selection.status_message = String(e)
                 selection.status_color = ERROR_COLOR
-                login.auth_complete = False
-            else:
-                try:
-                    selection.load_servers(
-                        servers^, app_state.account_token, app_state.client_id
-                    )
-                except e:
-                    selection.status_message = String(e)
+
+            if fetch_ok:
+                var server_count = len(servers)
+
+                # Guard: no servers found
+                if server_count == 0:
+                    selection.status_message = "No Plex servers found"
                     selection.status_color = ERROR_COLOR
-                login.auth_complete = False
+                else:
+                    try:
+                        selection.load_servers(
+                            servers^,
+                            app_state.account_token,
+                            app_state.client_id,
+                        )
+                    except e:
+                        selection.status_message = String(e)
+                        selection.status_color = ERROR_COLOR
+            login.auth_complete = False
 
         # --- Selection complete → Library screen transition ---
         if selection.selection_complete and screen.current == 3:

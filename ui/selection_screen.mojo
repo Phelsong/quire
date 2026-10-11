@@ -87,6 +87,12 @@ struct SelectionScreen:
     var status_color: Color
     var scroll_offset: Float32
     var selection_complete: Bool
+    # Library-list request flag: draw() raises it when a server card is
+    # picked (the old code fetched get_libraries() mid-draw, which both
+    # crashed on an unreachable server and froze the frame for 30s).
+    # Consumed by main.mojo outside the render loop — same plumbing as
+    # the library screen's search_query_requested.
+    var libraries_requested: Bool
 
     def __init__(out self, screen_w: Int, screen_h: Int):
         self.phase = 0
@@ -100,6 +106,7 @@ struct SelectionScreen:
         self.status_color = TEXT_DIM
         self.scroll_offset = 0.0
         self.selection_complete = False
+        self.libraries_requested = False
 
     def load_servers(
         mut self,
@@ -126,11 +133,17 @@ struct SelectionScreen:
             self.status_message = "Server: " + self.servers[0].name
             self.status_color = GREEN
             self.phase = 1
-            self._load_libraries()
+            self.load_libraries()
             return
 
-    def _load_libraries(mut self) raises:
-        """Fetch libraries from the selected server and populate the list."""
+    def load_libraries(mut self) raises:
+        """Fetch libraries from the selected server and populate the list.
+
+        The network call is guarded: a failure lands in the status line
+        instead of raising (it used to propagate through draw() and kill
+        the process). Callers: main.mojo consumes libraries_requested
+        outside the render loop; load_servers calls this directly (both
+        are already outside draw)."""
         if self.selected_server_idx < 0 or self.selected_server_idx >= len(
             self.servers
         ):
@@ -141,12 +154,18 @@ struct SelectionScreen:
         self.status_color = TEXT_LIGHT
         self.libraries = List[LibraryItem]()
 
-        var libraries = get_libraries(
-            server.url,
-            server.token,
-            self.client_id,
-        )
-        self.libraries = libraries.copy()  # COW: shares until one side mutates
+        try:
+            var libraries = get_libraries(
+                server.url,
+                server.token,
+                self.client_id,
+            )
+            # COW: shares until one side mutates
+            self.libraries = libraries.copy()
+        except e:
+            self.status_message = "Library list failed: " + String(e)
+            self.status_color = ERROR_COLOR
+            return
 
         # Guard: no libraries
         if len(self.libraries) == 0:
@@ -306,7 +325,10 @@ struct SelectionScreen:
                     self.selected_server_idx = i
                     self.phase = 1
                     self.scroll_offset = 0.0
-                    self._load_libraries()
+                    # No network here — draw() must never block on HTTP.
+                    # main.mojo consumes the flag next frame and runs
+                    # load_libraries() outside the render loop.
+                    self.libraries_requested = True
                     ui.end_clip()
                     return
 

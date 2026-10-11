@@ -67,7 +67,7 @@ build = { cmd = "mojo build main.mojo -I . -Xlinker -L.pixi/lib -Xlinker -L.pixi
 dist = { cmd = "python3 scripts/make_bundle.py", depends-on = ["build"] }
 appimage = { cmd = "python3 scripts/make_appimage.py", depends-on = ["dist"] }
 # test/debug
-test = "mojo -I . tests/test_config.mojo && mojo -I . tests/test_offline_library.mojo && mojo -I . tests/test_mutex.mojo"
+test = "mojo -I . tests/test_config.mojo && mojo -I . tests/test_offline_library.mojo && mojo -I . tests/test_offline_search.mojo && mojo -I . tests/test_mutex.mojo"
 wayland-test = { cmd = "mojo build tests/test_globals.mojo -I . -o .pixi/test_globals -Xlinker -L.pixi/lib -Xlinker -L.pixi/envs/default/lib -Xlinker -lwayland_shim -Xlinker -lwayland-client && LD_LIBRARY_PATH=.pixi/lib:.pixi/envs/default/lib .pixi/test_globals", depends-on = [
   "shim",
 ] }

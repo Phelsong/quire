@@ -4,6 +4,7 @@ from std.collections import List, Dict, Optional
 from std.memory.unsafe_pointer import Pointer
 from std.memory import alloc, dealloc, Layout, ThinAllocation, unsafe_memcpy
 from std.math import max
+from std.time import perf_counter
 from resources.color import Color
 from resources.imdecode import imdecode
 from resources.keys import (
@@ -23,7 +24,11 @@ from functions.helpers import (
 )
 from functions.audio_pipe import AudioPipe, ChunkResult, HttpHeader
 from platform.audio_backend import AudioBackend
-from resources.offline_library import update_saved_progress
+from resources.offline_library import (
+    update_saved_progress,
+    load_saved_books,
+)
+from resources.plex_api_types import BookDetail
 from functions.plex_bridge import (
     PlexSession,
     get_book_detail,
@@ -278,7 +283,25 @@ struct PlayerScreen:
         self.overlay_mode = OVERLAY_NONE
         self.overlay_armed = False
 
-    def load_book(mut self, book: PlexBookCard, app_state: PlexSession) raises:
+    def load_book(
+        mut self, book: PlexBookCard, mut app_state: PlexSession
+    ) raises:
+        """Load a book into the player. Every server call below is
+        independently guarded — a failure keeps what's already loaded and
+        falls through instead of aborting, so stream preparation ALWAYS
+        runs (a downloaded book plays with no server at all).
+
+        Precedence, field by field:
+          title/author  — the library card (always available, even offline)
+          duration      — card -> server detail -> track sum -> sidecar
+          cover         — server thumb path (sidecars/cache fill offline)
+          resume point  — server detail/track offsets -> sidecar
+                          view_offset_ms (only when the server couldn't
+                          answer for this load)
+          publish year  — server detail -> sidecar
+        A failed fetch marks the session offline (app_state.mark_offline)
+        so later loads skip the doomed round-trips; a successful one
+        clears the flag."""
         # Unload previous cover art before loading a new book
         if self.has_cover:
             var old_pixels = self.cover_pixels.take()
@@ -323,16 +346,47 @@ struct PlayerScreen:
         self.token = token
         self.client_id = app_state.client_id
 
-        var detail = get_book_detail(
-            app_state.server_url,
-            token,
-            book.rating_key,
-            app_state.client_id,
-        )
+        # --- Sidecar for this book (local, cheap, read up front) ---
+        # Written on every player unload (update_saved_progress), so it
+        # carries the freshest offline-known resume point + listing data.
+        # Matched by index in `saved_books` — SavedBookMetadata is
+        # Movable-only, so a copy is hand-work the index avoids.
+        var sidecar_idx = -1
+        var saved_books = load_saved_books()
+        for i in range(len(saved_books)):
+            if saved_books[i].rating_key == book.rating_key:
+                sidecar_idx = i
+                break
+        var have_sidecar = sidecar_idx >= 0
 
+        # --- Book detail (server) — skipped only when known-offline ---
+        var detail = BookDetail()
+        var detail_ok = False
+        if not app_state.offline:
+            try:
+                detail = get_book_detail(
+                    app_state.server_url,
+                    token,
+                    book.rating_key,
+                    app_state.client_id,
+                )
+                detail_ok = True
+                # Successful server operation: clear the offline flag.
+                app_state.offline = False
+            except e:
+                print(
+                    "[player] book detail fetch failed (offline?): " + String(e)
+                )
+                app_state.mark_offline()
+
+        # Cover art: prefer the server thumb path; when the detail fetch
+        # didn't answer the card's thumb path fills the gap.
+        var thumb_path = detail.thumb
+        if not detail_ok:
+            thumb_path = book.thumb
         try:
-            self._load_cover(detail.thumb, app_state)
-            self.book_thumb = detail.thumb
+            self._load_cover(thumb_path, app_state)
+            self.book_thumb = thumb_path
         except e:
             # DIAGNOSTIC: cover art is decorative, but surface why it failed.
             print("cover load failed:", e)
@@ -363,29 +417,46 @@ struct PlayerScreen:
                 self.duration = Float64(detail.duration_ms) / 1000.0
                 self.book_duration = self.duration
 
-        var tracks = get_book_tracks(
-            app_state.server_url,
-            token,
-            book.rating_key,
-            app_state.client_id,
-        )
+        # --- Track list (server) — skipped only when known-offline ---
+        var tracks_ok = False
+        if not app_state.offline:
+            try:
+                var tracks = get_book_tracks(
+                    app_state.server_url,
+                    token,
+                    book.rating_key,
+                    app_state.client_id,
+                )
+                # COW transfer: shares track storage with the API result
+                # until one side mutates — no per-track copy loop.
+                self.tracks = tracks.copy()
+                tracks_ok = True
+            except e:
+                print(
+                    "[player] track list fetch failed (offline?): " + String(e)
+                )
+                app_state.mark_offline()
 
-        # COW transfer: shares track storage with the API result until one
-        # side mutates — no per-track copy loop.
-        self.tracks = tracks.copy()
-
-        for i in range(len(tracks)):
-            var track_chapters = get_track_chapters(
-                app_state.server_url,
-                token,
-                tracks[i].rating_key,
-                app_state.client_id,
-            )
-
-            for j in range(len(track_chapters)):
-                var chapter = track_chapters[j]
-                chapter.is_current = False
-                self.chapters.append(chapter)
+        for i in range(len(self.tracks)):
+            try:
+                var track_chapters = get_track_chapters(
+                    app_state.server_url,
+                    token,
+                    self.tracks[i].rating_key,
+                    app_state.client_id,
+                )
+                for j in range(len(track_chapters)):
+                    var chapter = track_chapters[j]
+                    chapter.is_current = False
+                    self.chapters.append(chapter)
+            except e:
+                # Per-track chapters are optional metadata — keep playing.
+                print(
+                    "[player] chapter fetch failed for track "
+                    + self.tracks[i].rating_key
+                    + ": "
+                    + String(e)
+                )
 
         # Fallback: if neither the book card nor the detail API provided a
         # duration, derive it from the sum of track durations.
@@ -396,6 +467,15 @@ struct PlayerScreen:
             if total_ms > 0:
                 self.duration = Float64(total_ms) / 1000.0
                 self.book_duration = self.duration
+
+        # --- Sidecar gap fills (last resort — server data preferred) ---
+        if have_sidecar:
+            ref fill = saved_books[sidecar_idx]
+            if self.duration <= 0.0 and fill.duration_ms > 0:
+                self.duration = Float64(fill.duration_ms) / 1000.0
+                self.book_duration = self.duration
+            if self.book_publisher_year.byte_length() == 0 and fill.year > 0:
+                self.book_publisher_year = String(fill.year)
 
         # Restore listen position from track-level progress. Plex stores
         # playback progress on individual tracks (leaves), not on the album.
@@ -451,6 +531,23 @@ struct PlayerScreen:
                 # Album-level offset only (single-track or edge case).
                 self.current_time = Float64(detail.view_offset_ms) / 1000.0
 
+        # Offline resume: when the server couldn't answer for this load
+        # (detail or tracks failed or skipped), the sidecar's last-known
+        # position is the resume point — it was written at the previous
+        # unload. A position at/after the duration means the book was
+        # finished; spawn-at-EOF has no audio, so treat it as fresh start.
+        if (not detail_ok or not tracks_ok) and have_sidecar:
+            ref resume = saved_books[sidecar_idx]
+            if (
+                self.current_time <= 0.0
+                and resume.view_offset_ms > 0
+                and (
+                    resume.duration_ms <= 0
+                    or resume.view_offset_ms < resume.duration_ms
+                )
+            ):
+                self.current_time = Float64(resume.view_offset_ms) / 1000.0
+
         if len(self.chapters) == 0 and self.duration > 0.0:
             var full_chapter = PlexChapter()
             full_chapter.id = 0
@@ -462,19 +559,26 @@ struct PlayerScreen:
             self.chapters.append(full_chapter)
             self.current_chapter_idx = 0
 
-        var pq_result = start_play_queue(
-            app_state.server_url,
-            token,
-            app_state.machine_id,
-            book.rating_key,
-            app_state.client_id,
-        )
-        self.play_queue_id = pq_result.play_queue_id
+        # Play queue (server): progress-reporting targets. Skipped offline;
+        # a failed queue costs nothing here — reporting just falls back to
+        # the no-play-queue-item path in _sync_progress.
+        if not app_state.offline:
+            try:
+                var pq_result = start_play_queue(
+                    app_state.server_url,
+                    token,
+                    app_state.machine_id,
+                    book.rating_key,
+                    app_state.client_id,
+                )
+                self.play_queue_id = pq_result.play_queue_id
 
-        for i in range(len(pq_result.items)):
-            var pq_rating_key = pq_result.items[i].rating_key
-            var pq_item_id = pq_result.items[i].play_queue_item_id
-            self.play_queue_items[pq_rating_key] = pq_item_id
+                for i in range(len(pq_result.items)):
+                    var pq_rating_key = pq_result.items[i].rating_key
+                    var pq_item_id = pq_result.items[i].play_queue_item_id
+                    self.play_queue_items[pq_rating_key] = pq_item_id
+            except e:
+                print("[player] play queue unavailable: " + String(e))
 
         if len(self.tracks) > 0:
             self.current_track_rating_key = self.tracks[0].rating_key
@@ -696,8 +800,12 @@ struct PlayerScreen:
             self.cover_loaded = True
             return
 
+        # Disk cache first — cached bytes work with no server at all.
         var image_data = load_cached_cover(self.book_id, COVER_PX, COVER_PX)
-        if image_data.byte_length() == 0:
+        # The HTTP fetch doubles as the cache fill; while the session is
+        # known-offline it is skipped (placeholder renders instead, same
+        # one-attempt-per-load bookkeeping via cover_loaded below).
+        if image_data.byte_length() == 0 and not app_state.offline:
             image_data = fetch_thumbnail(thumb_url)
             save_cached_cover(self.book_id, COVER_PX, COVER_PX, image_data)
 
