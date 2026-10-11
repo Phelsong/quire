@@ -110,6 +110,21 @@ def c_ftruncate(fd: Int32, length: Int) -> Int32:
     return external_call["ftruncate", Int32](fd, c_long(length))
 
 
+def c_memcmp_same(
+    a: Pointer[UInt8, MutUntrackedOrigin],
+    b: Pointer[UInt8, MutUntrackedOrigin],
+    n: Int,
+) -> Bool:
+    """libc memcmp — True iff the two byte buffers hold identical content.
+
+    Borrowed pointers, sized by `n` (callers pass equal-sized data; both
+    origins must outlive the call, which holds for mmap'd frame buffers).
+    Replaces per-byte comparison loops on hot paths such as
+    Window.present() — one native call instead of `n` derefs.
+    """
+    return Int(external_call["memcmp", c_int](a, b, c_size_t(n))) == 0
+
+
 # mmap constants (linux)
 comptime PROT_READ = c_int(1)
 comptime PROT_WRITE = c_int(2)

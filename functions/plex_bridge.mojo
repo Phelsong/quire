@@ -142,15 +142,32 @@ struct PlexHeaders(ConvertibleToPython, Copyable, Movable):
 
 def gethostname() -> String:
     """The machine's hostname, read from /proc/sys/kernel/hostname.
-    the header is optional — an empty X-Plex-Device-Name is valid).
+
+    Memoized on Python `builtins` (the process-live cache pattern from
+    _downloader_module — this toolchain has no module-scoped Mojo state).
+    Every plex_headers() call embeds the name in X-Plex-Device-Name, so
+    re-reading /proc per request was per-request kernel churn on the UI
+    thread. HTTP runs in main's frame loop only (single thread), so the
+    cached attribute has no race. An empty read is NOT memoized: the
+    header is optional, so a failed read just retries on the next
+    request.
     """
     try:
+        var builtins = Python.import_module("builtins")
+        try:
+            var cached = builtins._QUIRE_HOSTNAME
+            if Bool(cached) and String(cached).byte_length() > 0:
+                return String(cached)
+        except:
+            pass
         var raw = Path("/proc/sys/kernel/hostname").read_bytes()
         var name = String()
         for i in range(len(raw)):
             if raw[i] == UInt8(10):  # '\n'
                 break
             name += String(chr(Int(raw[i])))
+        if name.byte_length() > 0:
+            builtins._QUIRE_HOSTNAME = PythonObject(name)
         return name
     except:
         return ""
@@ -198,6 +215,29 @@ def plex_headers(
 # ---------------------------------------------------------------------------
 
 
+def _httpx_module() raises -> PythonObject:
+    """The httpx module, imported once per process and cached on
+    `builtins` — the same process-live pattern as _downloader_module down
+    below (this toolchain has no module-scoped Mojo state).
+
+    Every request used to call Python.import_module("httpx") afresh;
+    requests here fire from the render loop (progress pushes) and behind
+    keystrokes (search), so the module is resolved once and the per-call
+    cost drops to an attribute lookup. HTTP runs on the app's UI thread
+    only (driven from main's frame loop), so the cache has no race.
+    """
+    var builtins = Python.import_module("builtins")
+    try:
+        var cached = builtins._QUIRE_HTTPX_MODULE
+        if Bool(cached):
+            return cached
+    except:
+        pass
+    var mod = Python.import_module("httpx")
+    builtins._QUIRE_HTTPX_MODULE = mod
+    return mod
+
+
 def _http_get(
     url: String, headers: PlexHeaders, timeout: Float64 = 30.0
 ) raises -> Value:
@@ -207,7 +247,7 @@ def _http_get(
     back as a String exactly once. Callers get a parsed Value — checked,
     native Mojo from here down.
     """
-    var httpx = Python.import_module("httpx")
+    var httpx = _httpx_module()
 
     var logger = Logger[LOG_LEVEL]()
     var resp = httpx.get(
@@ -241,7 +281,7 @@ def _http_post_form(
 
     Companion to _http_get — same Python boundary, native Mojo inputs.
     """
-    var httpx = Python.import_module("httpx")
+    var httpx = _httpx_module()
 
     # Build the urlencoded body natively (matches requests' data=dict form).
     var encoded = String()
@@ -1344,19 +1384,16 @@ def load_cached_cover(
 
     Reads via native Path.read_bytes() — no Python file IO on the draw
     path (the file may be tens of KB; the Python `open` round-trip cost a
-    full interpreter bootstrapping per call).
+    full interpreter bootstrapping per call). read_bytes() already yields
+    the owned List[UInt8] the caller expects — returned as-is, with none
+    of the per-byte re-copy the old hand loop did.
     """
     var path_str = _cover_cache_path(rating_key, width, height)
     var p = Path(path_str)
     if not path.exists(p):
         return List[UInt8]()
     try:
-        var raw = p.read_bytes()
-        var out = List[UInt8]()
-        out.reserve(len(raw))
-        for i in range(len(raw)):
-            out.append(raw[i])
-        return out^
+        return p.read_bytes()
     except e:
         print("[Quire] load_cached_cover error: " + String(e))
         return List[UInt8]()
@@ -1499,7 +1536,7 @@ def fetch_thumbnail(url: String) raises -> List[UInt8]:
     deterministic (the ctypes from_buffer route races the GC).
     """
     try:
-        var httpx = Python.import_module("httpx")
+        var httpx = _httpx_module()
 
         # (connect, read) tuple timeout
         var resp = httpx.get(

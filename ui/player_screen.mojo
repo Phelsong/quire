@@ -188,6 +188,9 @@ struct PlayerScreen:
     # Progress sync state
     var progress_sync_timer: Float64
     var progress_sync_interval: Float64
+    # Minimum silence after a FAILED push before the next attempt: a
+    # down/slow server must not get a blocking HTTP retry per frame.
+    var progress_sync_retry_delay: Float64
     var current_track_rating_key: String
 
     # Stored session data for playback URL resolution
@@ -255,6 +258,7 @@ struct PlayerScreen:
         self.play_queue_items = Dict[String, Int]()
         self.progress_sync_timer = 0.0
         self.progress_sync_interval = 5.0
+        self.progress_sync_retry_delay = 1.0
         self.current_track_rating_key = ""
         self.server_url = ""
         self.token = ""
@@ -928,10 +932,21 @@ struct PlayerScreen:
         except:
             pass
 
-        # Only reset the timer on success — a failed push (server hiccup)
-        # retries next frame instead of going dark for another 15s.
+        # Reset the timer on success; on a failed push (down server), park
+        # the timer just below the threshold so the next attempt comes
+        # progress_sync_retry_delay of accumulated dt later — a retry
+        # every 1s instead of the per-frame blocking HTTP a hiccup used
+        # to produce. Deliberate state changes still force a push
+        # (toggle_playback → force=True bypasses the timer).
         if pushed:
             self.progress_sync_timer = 0.0
+        else:
+            var retry_at = (
+                self.progress_sync_interval - self.progress_sync_retry_delay
+            )
+            if retry_at < 0.0:
+                retry_at = 0.0
+            self.progress_sync_timer = retry_at
 
     def _mark_track_watched(mut self):
         """Mark the current track as watched on the Plex server (best-effort).

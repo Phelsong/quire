@@ -19,6 +19,7 @@ from platform.ffi import (
     c_ftruncate,
     c_mmap,
     c_memfd_create,
+    c_memcmp_same as _c_memcmp_same,
     PROT_READ,
     PROT_WRITE,
     MAP_SHARED,
@@ -401,15 +402,36 @@ struct Frame(Copyable, Movable):
 
 
 # Window-relative input state fed by wl_seat events. Mirrors the fields
-# UIContext reads (mouse pose + button state, last key, wheel delta), with
+# UIContext reads (mouse pose + button state, key events, wheel delta), with
 # GLFW keycodes
+#
+# Key-event queue capacity. 32 slots ≈ 32 presses inside one 16-33ms
+# frame (≈1000 cps sustained) — no real keyboard does that; on overflow
+# the OLDEST queued press is dropped so consumers always see the recent
+# tail. (The old single-slot model dropped every event but the very last
+# instead, which swallowed keystrokes whenever a frame ran long.) Presses
+# queue inline — no heap, no allocation per event.
+comptime KEY_QUEUE_CAP = 32
+
+
 struct WindowInput(Copyable, Movable):
     var mouse_x: Float64
     var mouse_y: Float64
     var mouse_down: Bool
     var mouse_pressed: Bool
-    var last_key: Int32
-    var last_key_pressed: Bool
+    # Frame-scoped ring of pressed keys (inline slots — no heap churn per
+    # event): poll() appends each press; consumers drain it per frame; the
+    # ring resets with the other press edges at the start of the next poll
+    # (pending_clear). Releases update `last_event_key` but don't queue —
+    # no consumer reads release edges.
+    var key_ring: Array[Int32, KEY_QUEUE_CAP]
+    var key_ring_head: Int  # oldest queued event (ring buffer)
+    var key_ring_count: Int  # events queued this frame
+    # Cross-frame "most recent key event" (press OR release — never
+    # cleared by pending_clear): the key_down() held-modifier
+    # approximation reads this, since a held key emits one press and no
+    # events until released or replaced by a newer event.
+    var last_event_key: Int32
     var any_key_pressed: Bool
     var wheel_delta: Float64
     # True while the window has keyboard focus (wl_keyboard enter/leave).
@@ -431,8 +453,10 @@ struct WindowInput(Copyable, Movable):
         self.mouse_y = 0.0
         self.mouse_down = False
         self.mouse_pressed = False
-        self.last_key = 0
-        self.last_key_pressed = False
+        self.key_ring = Array[Int32, KEY_QUEUE_CAP]()
+        self.key_ring_head = 0
+        self.key_ring_count = 0
+        self.last_event_key = 0
         self.any_key_pressed = False
         self.wheel_delta = 0.0
         self.focused = False
@@ -446,8 +470,10 @@ struct WindowInput(Copyable, Movable):
         self.mouse_y = existing.mouse_y
         self.mouse_down = existing.mouse_down
         self.mouse_pressed = existing.mouse_pressed
-        self.last_key = existing.last_key
-        self.last_key_pressed = existing.last_key_pressed
+        self.key_ring = existing.key_ring.copy()
+        self.key_ring_head = existing.key_ring_head
+        self.key_ring_count = existing.key_ring_count
+        self.last_event_key = existing.last_event_key
         self.any_key_pressed = existing.any_key_pressed
         self.wheel_delta = existing.wheel_delta
         self.focused = existing.focused
@@ -455,6 +481,44 @@ struct WindowInput(Copyable, Movable):
         self.touch_start_x = existing.touch_start_x
         self.touch_start_y = existing.touch_start_y
         self.pending_clear = existing.pending_clear
+
+    def queue_key_event(mut self, key: Int32, pressed: Bool):
+        """Record one raw key event (poll-side, one call per Wayland event).
+
+        Presses AND releases update `last_event_key` (key_down()'s
+        held-modifier approximation); only presses join this frame's ring.
+        On overflow the oldest press is dropped (see KEY_QUEUE_CAP)."""
+        self.last_event_key = key
+        if not pressed:
+            return
+        if self.key_ring_count == KEY_QUEUE_CAP:
+            self.key_ring_head = (self.key_ring_head + 1) % KEY_QUEUE_CAP
+            self.key_ring_count -= 1
+        self.key_ring[
+            (self.key_ring_head + self.key_ring_count) % KEY_QUEUE_CAP
+        ] = key
+        self.key_ring_count += 1
+
+    def frame_key_press(self, j: Int) -> Int32:
+        """The j-th queued press of this frame, oldest first (j < count)."""
+        return self.key_ring[(self.key_ring_head + j) % KEY_QUEUE_CAP]
+
+    def frame_key_pressed(self, code: Int) -> Bool:
+        """True if `code` was pressed among this frame's queued events.
+
+        Scans the WHOLE ring, so every press the frame collected is
+        visible — not just one (coalescing in the old single-slot model
+        dropped all but the last). Non-consuming: other consumers may
+        still test other codes against the same events this frame."""
+        for j in range(self.key_ring_count):
+            if Int(self.frame_key_press(j)) == code:
+                return True
+        return False
+
+    def clear_frame_keys(mut self):
+        """Empty the frame's event ring (next-poll edge reset)."""
+        self.key_ring_head = 0
+        self.key_ring_count = 0
 
 
 # Wayland window + framebuffer. One per process.
@@ -876,29 +940,24 @@ struct Window(Copyable, Movable):
 
     def present(mut self) raises:
         """Commit the frame ONLY when the draw buffer differs from what the
-        compositor shows (byte-exact memcmp). On change: attach the DRAW
-        buffer (re-attach per commit is required on Hyprland — damage-only
-        commits on an attached buffer can be skipped), damage, commit, then
-        swap the two Frames; the old shown buffer becomes the next draw
-        target. The compositor therefore never reads the buffer being
-        rasterized, and idle screens issue zero commits (no teardown races =
-        no repaint artifacts)."""
+        compositor shows (byte-exact memcmp, one native call). On change:
+        attach the DRAW buffer (re-attach per commit is required on
+        Hyprland — damage-only commits on an attached buffer can be
+        skipped), damage, commit, then swap the two Frames; the old shown
+        buffer becomes the next draw target. The compositor therefore
+        never reads the buffer being rasterized, and idle screens issue
+        zero commits (no teardown races = no repaint artifacts)."""
         if self.frame.size != self.back.size or self.frame.size == 0:
             return
-        var n = self.frame.size
-        var same = True
-        var a = Pointer[UInt8, MutUntrackedOrigin](
-            unsafe_from_address=Int(self.frame.data)
+        var same = _c_memcmp_same(
+            Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(self.frame.data)
+            ),
+            Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(self.back.data)
+            ),
+            self.frame.size,
         )
-        var b = Pointer[UInt8, MutUntrackedOrigin](
-            unsafe_from_address=Int(self.back.data)
-        )
-        var i = 0
-        while i < n:
-            if a[unsafe_offset=i] != b[unsafe_offset=i]:
-                same = False
-                break
-            i += 1
         if same:
             self.committed_last_frame = False
             return
@@ -949,11 +1008,12 @@ struct Window(Copyable, Movable):
             self.xdg_ack_configure_serial = _arg_as_u32(wargs[unsafe_offset=0])
         # --- input drain (window-relative pointer coords, GLFW keycodes) ---
         # Edge bookkeeping: press edges are true for exactly one frame; the
-        # pending_clear flag clears them at the START of the next poll.
+        # pending_clear flag clears them (and the frame's key ring) at the
+        # START of the next poll, so no press edge leaks across frames.
         if self.input.pending_clear:
             self.input.mouse_pressed = False
-            self.input.last_key_pressed = False
             self.input.any_key_pressed = False
+            self.input.clear_frame_keys()
             self.input.pending_clear = False
         self.input.pending_clear = True
         # pointer: enter gives initial position; motion updates it
@@ -987,14 +1047,14 @@ struct Window(Copyable, Movable):
         while wl_keyboard_next_leave(self.kb_queue, wargs):
             self.input.focused = False
             self.input.any_key_pressed = False
-        # keyboard: evdev code → GLFW value (resources/keys values)
+        # keyboard: evdev code → GLFW value (resources/keys values).
+        # Every event joins the frame's ring (queue_key_event), so a
+        # burst typed across a slow poll keeps ALL its presses instead
+        # of collapsing to the last one.
         while wl_keyboard_next_key(self.kb_queue, wargs):
             var evdev = Int(_arg_as_u32(wargs[unsafe_offset=2]))
             var st = _arg_as_u32(wargs[unsafe_offset=3])
-            self.input.last_key = _evdev_to_glfw(evdev)
-            if st == 1:
-                self.input.last_key_pressed = True
-                self.input.any_key_pressed = True
+            self.input.queue_key_event(_evdev_to_glfw(evdev), st == 1)
         # touch: simulate mouse on the primary touching slot.
         # down(serial, time, surface, id, x, y) / motion(time, id, x, y) /
         # up(serial, time, id)

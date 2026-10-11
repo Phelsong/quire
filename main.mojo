@@ -279,7 +279,7 @@ def main() raises:
         # Keyboard (retained-tate paths only; draw() reads ui for the rest)
         if screen.current == 0:
             login.handle_keyboard(
-                win.input.last_key_pressed and win.input.last_key == KEY_ENTER,
+                win.input.frame_key_pressed(KEY_ENTER),
                 app_state,
             )
 
@@ -467,8 +467,8 @@ def main() raises:
                     settings.status_message = "Save failed"
                     settings.status_color = ERROR_COLOR
 
-        # Escape key — navigation (libinput: pressed-this-frame edge)
-        if win.input.last_key_pressed and win.input.last_key == KEY_ESCAPE:
+        # Escape key — navigation (frame's queued key events, press edge)
+        if win.input.frame_key_pressed(KEY_ESCAPE):
             if screen.current == 3:
                 # Selection screen: back to login
                 screen.current = 0
@@ -696,6 +696,15 @@ def main() raises:
             settings.draw(ui, app_state, screen)
 
         win.present()
+
+        # Lazy cover fetch — deliberately AFTER present: the fetch (HTTP
+        # timeout, disk read, imdecode) can stall the NEXT frame's input
+        # processing, but it no longer delays this frame's presentation.
+        # draw() queued the visible rows + the now-playing art above; the
+        # blit of already-decoded covers still happens in the row loop.
+        # Library-screen parity: only library.draw() fetched before.
+        if screen.current == 1:
+            library._fetch_next_cover(app_state, player)
 
         # Clear the gamepad pressed-edge mask (edge true for exactly one
         # frame, mirroring the keyboard pending_clear model).

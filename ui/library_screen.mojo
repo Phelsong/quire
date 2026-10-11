@@ -86,6 +86,12 @@ from ui.player_screen import PlayerScreen
 # above it is a scroll drag.
 comptime TAP_SLOP_PX = 12.0
 
+# Search debounce: the server-side search fires once the query has sat
+# idle this long since the last keystroke (Enter clears the wait). 350ms
+# keeps mid-word results from thrashing the server on every keystroke
+# while staying under a natural pause.
+comptime SEARCH_DEBOUNCE_S = 0.35
+
 
 # ---------------------------------------------------------------------------
 # Library screen — browse audiobooks (immediate-mode UI)
@@ -119,14 +125,20 @@ struct LibraryScreen:
     var prev_page_requested: Bool
 
     # Server-side search. When the search bar text changes, draw() sets
-    # search_query_requested + pending_search_query; main.mojo consumes the
-    # flag and calls run_search() (outside the render loop so the network
-    # call doesn't block mid-draw). `active_search` is the query currently
-    # reflected in `books` (empty = normal paginated view).
+    # search_query_requested + pending_search_query after an idle window
+    # (typed characters re-arm the wait, Enter or focus loss ships it
+    # early); main.mojo consumes the flag and calls run_search() (outside
+    # the render loop so the network call doesn't block mid-draw).
+    # `active_search` is the query currently reflected in `books`
+    # (empty = normal paginated view).
     var search_input: TextInput
     var active_search: String  # query reflected in `books` ("" = page mode)
     var search_query_requested: Bool
     var pending_search_query: String
+    # Idle since the last keystroke while the bar's text differs from the
+    # last executed query (re-armed by every keystroke; the trigger is in
+    # draw() because it must also fire on focus loss).
+    var search_idle_timer: Float64
 
     # One-time sidecar backfill request: draw() raises this when it loads a
     # library; main.mojo runs sync_saved_sidecars() (network) then reloads.
@@ -208,6 +220,7 @@ struct LibraryScreen:
         self.active_search = ""
         self.search_query_requested = False
         self.pending_search_query = ""
+        self.search_idle_timer = 0.0
         self.sync_requested = False
         self.sync_done = False
 
@@ -542,11 +555,11 @@ struct LibraryScreen:
     ) raises:
         """Fetch ONE queued cover per call (blocking HTTP).
 
-        Called from draw() AFTER the frame's rows are drawn, so a slow
-        thumbnail never delays rendering — it just appears on a later
-        frame. Queue is rebuilt each frame from currently-visible rows;
-        the now-playing bar queues the playing book even when its row is
-        off-page, resolved via player.book_thumb.
+        Called from main.mojo AFTER win.present(), so a slow thumbnail
+        delays the next frame's input processing, never the presentation
+        of the frame that just rendered. Queue is rebuilt each frame from
+        currently-visible rows; the now-playing bar queues the playing
+        book even when its row is off-page, resolved via player.book_thumb.
         """
         # Skip entries already fetched; drop them from the queue.
         while len(self.cover_queue) > 0:
@@ -601,22 +614,42 @@ struct LibraryScreen:
     def handle_keyboard(mut self, mut ui: UIContext, ascii: AsciiTable):
         """Route keyboard input to the search bar when it has focus.
 
-        Called from main.mojo every frame while the library screen is active.
-        Only consumes input when the search bar is focused (so ESC still works
-        for screen navigation, handled in main.mojo).
+        Called from main.mojo every frame while the library screen is
+        active. Only consumes input when the search bar is focused (so
+        ESC still works for screen navigation, handled in main.mojo).
+        Each keystroke re-arms the search debounce.
         """
         if not self.search_input.is_focused:
             return
 
-        # One character press per frame (libinput state model).
+        # Drain EVERY printable press queued this frame — the key-event
+        # ring queues all of them, so a burst typed across a slow frame
+        # arrives intact instead of collapsing to its last key (the old
+        # single-slot model dropped them, one char per frame). Ordering
+        # across the frame is preserved between chars; a backspace is
+        # applied after same-frame chars (rare: a char+backspace inside
+        # one ~30ms frame nets one deleted char — the single-slot model
+        # netted arbitrary survivors).
         var cp = ui.char_pressed()
-        if cp != 0:
+        while cp != 0:
             self.search_input.handle_char(Int(cp), ascii)
+            self.search_idle_timer = 0.0  # typing re-arms the debounce
+            cp = ui.char_pressed()
 
         if ui.key_pressed(KEY_BACKSPACE):
             self.search_input.handle_backspace()
-        # elif ui.key_pressed(KEY_DELETE):
-        # self.search_input.handle_delete()
+            self.search_idle_timer = 0.0
+
+        # Enter is the escape hatch: fire the pending query immediately,
+        # without waiting out the idle window (also ships a fresh edit
+        # made after the last query already completed — text still
+        # differs from active_search). GLFW: KEY_ENTER/KEY_RETURN share
+        # code 257, matching the keybind capture path.
+        if ui.key_pressed(KEY_ENTER):
+            if self.search_input.text != self.active_search:
+                self.search_query_requested = True
+                self.pending_search_query = self.search_input.text
+            self.search_idle_timer = 0.0
 
     def clear_teardown(mut self):
         """Drop big container state before scope exit (see main() teardown).
@@ -861,15 +894,32 @@ struct LibraryScreen:
                 CARD_BG,
             )
 
-        # --- Request a server-side search when the query changes ---
-        # draw() can't run the network call (blocks the render loop); set a
-        # flag for main.mojo to consume. Debounce: only request when the
-        # query differs from the active search (avoids re-fetching the same
-        # query every frame).
+        # --- Server-side search: debounced request to main.mojo ---
+        # (draw() can't run the network call — it blocks the render loop —
+        # so a flag routes the query to main.mojo. It is a REAL debounce:
+        # a time-based idle window of SEARCH_DEBOUNCE_S, re-armed by every
+        # keystroke in handle_keyboard, so rapid typing sends one query
+        # when the keyboard goes quiet instead of one per keystroke. Enter
+        # or focus loss ships the pending query immediately; the initial
+        # entry into the field never arms the timer because an unchanged
+        # text never differs from active_search.)
+        # The pending query is captured at fire time; main consumes the
+        # flag before the next frame's keystroke processing, so a query
+        # can never go stale — text changed again just pushes the fire
+        # timer out while `books` keeps showing the last results.
         if self.search_input.text != self.active_search:
             if not self.search_query_requested:
-                self.search_query_requested = True
-                self.pending_search_query = self.search_input.text
+                self.search_idle_timer += ui.dt
+                if (
+                    self.search_idle_timer >= SEARCH_DEBOUNCE_S
+                    or not self.search_input.is_focused
+                ):
+                    self.search_query_requested = True
+                    self.pending_search_query = self.search_input.text
+        else:
+            # Query executed (or reverted): re-arm the idle window for
+            # the next edit.
+            self.search_idle_timer = 0.0
 
         # --- Scrollable book list (compact Plex-style rows) ---
         # Reserve the bottom strip for the now-playing bar when a book is
@@ -1135,9 +1185,11 @@ struct LibraryScreen:
                 ui.item_clicked = True
                 return
 
-        # Queue the now-playing book's cover before the fetch pass: the
-        # playing book may not be among the visible rows (user paged away),
-        # and covers_done dedups repeat queueing.
+        # Queue the now-playing book's cover before the draw ends: the
+        # playing book may not be among the visible rows (user paged
+        # away), and covers_done dedups repeat queueing. The FETCH
+        # itself moved to main.mojo (after win.present()) so a slow
+        # thumbnail delays the next frame, never this one's present.
         if has_now_playing:
             var np_queued = False
             for queued_key in self.cover_queue:
@@ -1146,12 +1198,6 @@ struct LibraryScreen:
                     break
             if not np_queued and player.book_id not in self.covers_done:
                 self.cover_queue.append(player.book_id)
-
-        # Lazy cover fetch: one blocking HTTP fetch per frame, after the
-        # list has rendered. Runs here — before the now-playing early
-        # return — so the fetch pipeline keeps draining on every frame
-        # regardless of whether a book is playing.
-        self._fetch_next_cover(app_state, player)
 
         # ------------------------------------------------------------------
         # Now-playing bar (bottom of screen) — 2x row height; click the bar

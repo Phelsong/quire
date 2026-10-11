@@ -152,10 +152,12 @@ struct UIResult(Copyable, ImplicitlyCopyable, Movable):
 # ---------------------------------------------------------------------------
 # Key state helpers (libinput keyboard state)
 # ---------------------------------------------------------------------------
-# Keyboard handling: the main loop pumps libinput events into an WindowInput
-# before building the UIContext. WindowInput tracks last_key + pressed-edge
-# only (single event granularity), which matches how the UI consumes keys:
-# one trigger per action per frame.
+# Keyboard handling: the main loop pumps Wayland key events into a frame-
+# scoped ring inside WindowInput (platform/window.mojo). Every press the
+# frame collected stays queued until the next poll clears it, so no event
+# is lost when a frame runs long. The UI drains it through the helpers
+# below: `key_pressed(K)` reports any press of K in the frame, and
+# `char_pressed()` yields queued printable presses one call at a time.
 
 
 struct UIContext:
@@ -204,6 +206,10 @@ struct UIContext:
     var panel_stack: List[Float32]  # Saved cursor_x/w values for nesting
     var item_clicked: Bool  # True if any element consumed the click this frame
     var keybinds: Dict[String, List[List[Int]]]  # action -> resolved combos
+    # char_pressed() drain cursor: next not-yet-yielded ring index (
+    # frame-local — a fresh UIContext starts draining at 0). Only text
+    # input consumes this.
+    var char_cursor: Int
 
     def __init__(
         out self,
@@ -265,6 +271,7 @@ struct UIContext:
         self.line_h = 0.0
         self.panel_stack = List[Float32]()
         self.item_clicked = False
+        self.char_cursor = 0
         self.keybinds = keybinds^
 
     # ------------------------------------------------------------------
@@ -332,23 +339,22 @@ struct UIContext:
     # ------------------------------------------------------------------
 
     def _key_pressed(self, code: Int) -> Bool:
-        """True if `code` was pressed this frame (pressed-edge event)."""
+        """True if `code` was pressed this frame (press-edge event)."""
         ref inp = self._input[unsafe_offset=0]
-        if not inp.last_key_pressed:
-            return False
-        return Int(inp.last_key) == code
+        return inp.frame_key_pressed(code)
 
     def _key_down(self, code: Int) -> Bool:
         """Approximate key-held test from the event stream.
 
-        The libinput shim tracks the last key event only, so a true
-        held-down map does not exist yet. A modifier is treated as held
-        while the most recent key event for it is still the last one seen
-        OR while any key activity is present (coarse, but single-key
-        combos — the overwhelming majority in Quire — are exact).
+        The Wayland shim queues discrete events only, so a true held-down
+        map does not exist yet. A modifier is treated as held while the
+        most recent key event (`last_event_key`, cross-frame) is still
+        this code OR while the code had a press edge this frame (coarse,
+        but single-key combos — the overwhelming majority in Quire — are
+        exact).
         """
         ref inp = self._input[unsafe_offset=0]
-        if Int(inp.last_key) == code:
+        if Int(inp.last_event_key) == code:
             return True
         return self._key_pressed(code)
 
@@ -421,14 +427,21 @@ struct UIContext:
         """Held-key approximation (see _key_down notes)."""
         return self._key_down(code)
 
-    def char_pressed(self) -> Int32:
-        """The key that had a press edge this frame, or 0. Only ASCII-range codes are returned for text input.
-        """
+    def char_pressed(mut self) -> Int32:
+        """Next printable-char press queued this frame, or 0 — one per call.
+
+        Repeated calls drain the frame's ring in arrival order, so a burst
+        typed across a slow frame arrives intact instead of collapsing to
+        its last key. Non-printable presses are skipped here but stay
+        visible to key_pressed(); the cursor is frame-local (a fresh
+        UIContext drains from the oldest event)."""
         ref inp = self._input[unsafe_offset=0]
-        if inp.last_key_pressed:
-            var code = Int(inp.last_key)
+        for j in range(self.char_cursor, inp.key_ring_count):
+            var code = Int(inp.frame_key_press(j))
             if code >= 32 and code <= 126:
+                self.char_cursor = j + 1
                 return Int32(code)
+        self.char_cursor = inp.key_ring_count
         return 0
 
     # ------------------------------------------------------------------
