@@ -36,7 +36,6 @@ from resources.keys import (
     KEY_TAB,
     KEY_ENTER,
     KEY_DELETE,
-    KEY_ESCAPE,
 )
 from resources.palette import (
     WHITE,
@@ -124,6 +123,11 @@ struct LibraryScreen:
     # the audio cache so playback prefers the local copy.
     var download_requested: Bool
     var download_book_index: Int
+    # Delete request (DELETE button shown in place of SAVE for downloaded
+    # books). Consumed by main.mojo outside the render loop: removes the
+    # sidecar + cached audio files from disk.
+    var delete_requested: Bool
+    var delete_book_index: Int
 
     # Pagination (server-side via Plex X-Plex-Container-Start/Size).
     # page is 0-based; page_size is the fetch chunk; total_size is the
@@ -197,6 +201,8 @@ struct LibraryScreen:
         self.play_book_index = -1
         self.download_requested = False
         self.download_book_index = -1
+        self.delete_requested = False
+        self.delete_book_index = -1
         self.touch_scroll_active = False
         self.touch_last_y = 0.0
         self.touch_row_index = -1
@@ -1229,31 +1235,45 @@ struct LibraryScreen:
             ui.move_to(info_x, title_y + 70.0)
             ui.label(badge_text, 14, GREEN)
 
-            # --- Row actions (right side): SAVE + PLAY ---
+            # --- Row actions (right side): SAVE/DELETE + PLAY ---
+            # A downloaded book swaps SAVE for DELETE (red): one click frees
+            # the disk space (sidecar + audio files). Non-downloaded rows
+            # keep the blue SAVE prompt.
+            var downloaded = self._is_downloaded(book.rating_key)
+            var action_label = "SAVE"
+            var action_color = DOWNLOAD_BLUE
+            if downloaded:
+                action_label = "DELETE"
+                action_color = LOGOUT_RED
             var play_w = 60.0
             var play_h = 60.0
             var save_w = 60.0
             var save_gap = 40.0
-            # SAVE auto-widens to fit its label (see imui.fitted_button_w);
-            # reserve the grown width so it doesn't overlap the PLAY button.
-            var save_fit_w = ui.fitted_button_w("SAVE", 26, save_w)
+            # The action button auto-widens to fit its label (see
+            # imui.fitted_button_w); reserve the grown width so it doesn't
+            # overlap the PLAY button.
+            var save_fit_w = ui.fitted_button_w(action_label, 26, save_w)
             var play_x = row_pad + row_w - inner_pad - play_w - 100
             var play_y = row_y + (row_h - play_h) / 2.0
             var save_x = play_x - save_gap - save_fit_w
 
             var save_result = ui.button_at(
-                "SAVE",
+                action_label,
                 save_x,
                 play_y,
                 save_w,
                 play_h,
-                DOWNLOAD_BLUE,
+                action_color,
                 TEXT_LIGHT,
                 SELECTED_BG,
             )
             if save_result.clicked:
-                self.download_requested = True
-                self.download_book_index = i
+                if downloaded:
+                    self.delete_requested = True
+                    self.delete_book_index = i
+                else:
+                    self.download_requested = True
+                    self.download_book_index = i
                 ui.item_clicked = True
                 ui.end_clip()
                 return

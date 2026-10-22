@@ -11,7 +11,7 @@ lives here so callers never touch raw fields.
 
 from emberjson import try_from_json, to_json
 from std.collections import List
-from std.os import makedirs, path, listdir
+from std.os import makedirs, path, listdir, remove
 from std.pathlib import Path
 
 from resources.plex_objects import PlexBookCard
@@ -239,6 +239,51 @@ def downloaded_rating_keys(audio_dir: String) -> List[String]:
                     out.append(stem^)
                 break
     return out^
+
+
+def delete_saved_book(rating_key: String, audio_dir: String) -> Bool:
+    """Delete one saved book: its metadata sidecar + cached audio files.
+
+    Removes <saved>/<rating_key>.json and every audio file in `audio_dir`
+    whose stem is the rating key (the same extension set the download/
+    probe paths use, so nothing a SAVE could have written is left
+    behind). Also the ground truth for a book that has audio on disk but
+    no sidecar (pre-sidecar download) — the audio deletion is unconditional.
+
+    Returns True when at least one file was removed; False means the book
+    was already gone (nothing saved, or a previous delete raced this one).
+    Per-file failures are swallowed: one unremovable file must never
+    block deleting the rest."""
+    var anything_removed = False
+
+    var sidecar_path = Path(_saved_dir()) / (rating_key + ".json")
+    if path.exists(sidecar_path):
+        try:
+            remove(sidecar_path)
+            anything_removed = True
+        except e:
+            print("[Quire] delete sidecar failed: " + String(e))
+
+    var extensions = List[String]()
+    extensions.append(".mp3")
+    extensions.append(".ogg")
+    extensions.append(".wav")
+    extensions.append(".m4b")
+    extensions.append(".m4a")
+    extensions.append(".aac")
+    extensions.append(".flac")
+
+    var audio_path = Path(audio_dir)
+    for i in range(len(extensions)):
+        var candidate = audio_path / (rating_key + String(extensions[i]))
+        if path.exists(candidate):
+            try:
+                remove(candidate)
+                anything_removed = True
+            except e:
+                print("[Quire] delete audio failed: " + String(e))
+
+    return anything_removed
 
 
 def update_saved_progress(rating_key: String, position_ms: Int) raises:

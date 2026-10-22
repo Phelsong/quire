@@ -19,6 +19,7 @@ from functions.plex_bridge import (
     get_book_detail,
     get_book_tracks,
     download_track,
+    get_audio_cache_dir,
 )
 from functions.ascii import AsciiTable
 from resources.config import Config, load_config, save_config, LOG_LEVEL
@@ -30,11 +31,12 @@ from resources.palette import (
     GREEN,
     ERROR_COLOR,
 )
-from resources.plex_objects import LibraryItem, ServerItem
+from resources.plex_objects import LibraryItem, ServerItem, PlexBookCard
 from resources.offline_library import (
     from_card,
     save_book_metadata,
     load_saved_books,
+    delete_saved_book,
 )
 from functions.offline_sync import sync_saved_sidecars
 from render.imui import UIContext
@@ -422,6 +424,48 @@ def main() raises:
                         library.status_message = "Download error: " + String(e)
                         library.status_color = ERROR_COLOR
 
+            # --- Delete request from the library screen ---
+            # Frees the book's local copy (sidecar + audio cache files).
+            # Filesystem-only: no network, but still handled outside the
+            # render loop (mirrors the SAVE request above) so draw() stays
+            # non-blocking.
+            if library.delete_requested:
+                library.delete_requested = False
+                var del_idx = library.delete_book_index
+                library.delete_book_index = -1
+                if del_idx >= 0 and del_idx < len(library.books):
+                    var del_book = library.books[del_idx]
+                    # delete_saved_book swallows per-file failures itself
+                    # (never raises); its return value reports whether
+                    # anything was actually on disk.
+                    var removed = delete_saved_book(
+                        del_book.rating_key, get_audio_cache_dir()
+                    )
+                    if removed:
+                        # Refresh the badge memo so the row flips back to
+                        # SAVE this frame, and drop the card from the pinned
+                        # head (a deleted book isn't "recently saved" anymore).
+                        library.downloaded_cache[del_book.rating_key] = False
+                        var kept = List[PlexBookCard]()
+                        for j in range(len(library.pinned_books)):
+                            if (
+                                library.pinned_books[j].rating_key
+                                != del_book.rating_key
+                            ):
+                                kept.append(library.pinned_books[j])
+                        library.pinned_books = kept^
+                        library.status_message = "Deleted: " + del_book.title
+                        library.status_color = GREEN
+                        try:
+                            library._sort_books_for_display()
+                        except:
+                            pass
+                    else:
+                        library.status_message = (
+                            "Nothing saved for: " + del_book.title
+                        )
+                        library.status_color = ERROR_COLOR
+
             # --- Server-side search request from the library screen ---
             # draw() sets search_query_requested + pending_search_query when
             # the search bar text changes; run the query here so the network
@@ -494,13 +538,13 @@ def main() raises:
                     settings.status_color = ERROR_COLOR
 
         # Escape key — navigation (frame's queued key events, press edge)
+        # NOTE: library (1) has no escape-back on purpose — the Selection
+        # screen is reachable only via the Settings screen's SELECT LIBRARY
+        # button, so a stray Esc can't bounce the user out of the library.
         if win.input.frame_key_pressed(KEY_ESCAPE):
             if screen.current == 3:
                 # Selection screen: back to login
                 screen.current = 0
-            elif screen.current == 1:
-                # Library → Selection (pick different server/library)
-                screen.current = 3
             elif screen.current == 2:
                 # Player → Library, stop audio
                 player.stop_and_unload_stream()
