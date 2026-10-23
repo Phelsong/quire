@@ -583,7 +583,7 @@ def main() raises:
                 else:
                     try:
                         selection.load_servers(
-                            servers^,
+                            servers,
                             app_state.account_token,
                             app_state.client_id,
                         )

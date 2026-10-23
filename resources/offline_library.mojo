@@ -144,10 +144,7 @@ def load_saved_books() -> List[SavedBookMetadata]:
 
     for i in range(len(names)):
         var name = String(names[i])
-        # rfind: this String has no ends_with; require the name to end in
-        # ".json" (its last '.' must open that suffix).
-        var json_dot = name.rfind(".json")
-        if json_dot < 0 or name.rfind(".") != json_dot:
+        if not name.endswith(".json"):
             continue
         var parsed = _read_sidecar(dir_path / names[i])
         if parsed:
@@ -224,17 +221,14 @@ def downloaded_rating_keys(audio_dir: String) -> List[String]:
         var dot = name.rfind(".")
         if dot <= 0:
             continue  # no extension (or dotfile) — not a cache file
+        # ends_with costs O(affix) in 1.2; the arm buys a cheap membership
+        # test, and the stem is a prefix slice (rating keys are numeric, so
+        # byte index == codepoint index here).
         for e in range(len(extensions)):
-            if name.rfind(extensions[e]) == dot:
-                # Stem = everything before the extension (rating keys are
-                # numeric, so byte index == codepoint index here).
-                var stem = String("")
-                var count = 0
-                for cp_slice in name.codepoint_slices():
-                    if count >= dot:
-                        break
-                    stem += String(cp_slice)
-                    count += 1
+            if name.endswith(extensions[e]):
+                # Prefix slice up to the dot; rating keys are numeric, so
+                # byte index == codepoint index here.
+                var stem = String(name[byte=0:dot])
                 if stem.byte_length() > 0:
                     out.append(stem^)
                 break

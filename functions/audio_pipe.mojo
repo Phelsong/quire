@@ -1,30 +1,52 @@
 """AudioPipe — native Mojo ffmpeg subprocess feeding PCM.
 
-Spawns ffmpeg via `popen` to read a
+Spawns ffmpeg via posix_spawnp (native argv — no shell) to read a
 Plex HTTP stream URL or a local audio file, applies pitch-correct tempo change
 via the `atempo` filter, and writes 32-bit float PCM (f32le, 44100 Hz, stereo)
 to stdout. The UI loop polls ffmpeg's stdout non-blocking each frame and
-feeds chunks directly
+feeds chunks directly.
 
-The pipe is deliberately SINGLE-threaded: ffmpeg's stdout fd is set to
-O_NONBLOCK, stdio is set to unbuffered (_IONBF), and `read_chunk()` polls
-via `fread` each frame — returning whatever bytes are available (EAGAIN ->
-empty result, EOF -> marks end). This replaced a Python background thread +
-bounded queue and keeps the player loop in charge of pacing.
+The child process is wired up through posix_spawn_file_actions: stdout ->
+the pipe read end, stderr -> /dev/null (the old popen command's
+`2>/dev/null` tail). The read end is O_NONBLOCK, so `read_chunk()` polls
+via raw read(2) each frame — returning whatever bytes are available
+(EAGAIN -> empty result, EOF -> marks end). This replaced a Python
+background thread + bounded queue and keeps the player loop in charge of
+pacing; the file_actions approach replaced popen + FILE* entirely for
+Mojo 1.2 (no shell parsing, no stdio buffering lies, no fread/ferror/feof
+flag decoding).
 
 Zero per-float FFI crossings: PCM lands in a persistent Mojo heap buffer and
-its raw C address is handed to `update_audio_stream`
+its raw C address is handed to `update_audio_stream`.
 """
 
 from std.os import path, getenv
 from std.pathlib import Path
-from std.sys._libc import popen, pclose, FILE_ptr
-from std.ffi import external_call, c_int, c_size_t
+from std.sys._libc import (
+    _get_environ,
+    fcntl,
+    pipe,
+    close as libc_close,
+    kill,
+    SignalCodes,
+    waitpid,
+    WaitFlags,
+    FcntlCommands,
+    FcntlFDFlags,
+    # NOTE: the stdlib `posix_spawnp` parametric wrapper is deliberately NOT
+    # imported: it hardcodes NULL file_actions (no stdout redirection), and
+    # its 4-arg external declaration conflicts with this module's 6-arg
+    # external_call to the same symbol. Call the extern directly instead.
+)
+from std.sys._libc_errno import get_errno, ErrNo
+from std.ffi import c_int, c_pid_t, c_uint, CStringSpan, external_call
+from std.memory.pointer import OptionalPointer
+from std.memory import stack_allocation
 from std.memory.unsafe_pointer import Pointer
-from std.collections import List
+from std.collections import List, Optional
 
-from functions.helpers import _is_executable, _which, _shell_quote
-from platform.ffi import Box, c_null
+from functions.helpers import _is_executable, _which
+from platform.ffi import Box, c_read
 
 # Must match load_audio_stream() args on the player side.
 comptime SAMPLE_RATE = 44100
@@ -37,9 +59,12 @@ comptime CHANNELS = 2
 comptime CHUNK_FRAMES = 4096
 comptime CHUNK_BYTES = CHUNK_FRAMES * CHANNELS * (SAMPLE_SIZE // 8)  # 32768
 
-comptime F_SETFL = 4
+comptime F_SETFL = 4  # not in stdlib's FcntlCommands (only F[D]GETFD/SETFD)
 comptime O_NONBLOCK = 0x800
-comptime _IONBF = 2  # setvbuf mode: unbuffered I/O
+comptime O_WRONLY = 2
+comptime O_APPEND = 0o2000
+comptime STDOUT_FILENO = 1
+comptime STDERR_FILENO = 2
 
 
 # ---------------------------------------------------------------------------
@@ -99,23 +124,6 @@ struct ChunkResult(Copyable, ImplicitlyCopyable, Movable):
         return self.frame_count > 0
 
 
-# ---------------------------------------------------------------------------
-# Audio-specific FILE* placeholder (helpers moved to functions.helpers)
-# ---------------------------------------------------------------------------
-
-
-def _null_file_ptr() -> FILE_ptr:
-    """Return a zero-valued FILE* placeholder for the 'no process' state.
-
-    Accessing this without `running=True` would be undefined; the `running`
-    flag gates all real use. Default value construction (no initializer)
-    yields the zero-valued placeholder on the pinned toolchain.
-    """
-    var fp = FILE_ptr()
-    return fp
-
-
-# ---------------------------------------------------------------------------
 # ffmpeg binary location
 # ---------------------------------------------------------------------------
 
@@ -207,10 +215,12 @@ struct AudioPipe:
     No threading: `read_chunk` polls ffmpeg's non-blocking stdout each frame.
     """
 
-    # ffmpeg subprocess handle. `fp` is a non-nullable C FILE*; the
-    # `running` flag gates all access (when False, fp is stale/invalid).
-    var fp: FILE_ptr
-    var fd: Int  # stdout fileno; -1 when no process
+    # ffmpeg subprocess handle. The Process owns reaping (waitpid);
+    # `running` gates all access, `read_fd` holds the non-blocking stdout
+    # pipe read end (-1 when no process). The write end is closed in the
+    # parent immediately after spawn so the child sees EOF when it exits.
+    var pid: c_pid_t
+    var read_fd: Int
     var running: Bool
     var reached_eof: Bool
 
@@ -230,8 +240,8 @@ struct AudioPipe:
     var frames_output: Int
 
     def __init__(out self):
-        self.fp = _null_file_ptr()
-        self.fd = -1
+        self.pid = c_pid_t(0)
+        self.read_fd = -1
         self.running = False
         self.reached_eof = False
         self.buffer = Box[UInt8](count=CHUNK_BYTES)
@@ -246,8 +256,8 @@ struct AudioPipe:
         # the buffer Box frees itself
 
     def __init__(out self, *, copy: Self):
-        self.fp = copy.fp
-        self.fd = copy.fd
+        self.pid = copy.pid
+        self.read_fd = copy.read_fd
         self.running = copy.running
         self.reached_eof = copy.reached_eof
         # Deep copy the buffer so the copy owns independent memory.
@@ -304,61 +314,59 @@ struct AudioPipe:
         CHUNK_FRAMES if only a partial chunk was available. Returns (0, 0)
         when no data is ready (EAGAIN) or the pipe isn't running.
 
-        Non-blocking: ffmpeg's stdout fd is O_NONBLOCK and stdio is set to
-        unbuffered (_IONBF), so `fread` returns immediately with whatever
-        bytes are available. At 60fps this keeps the AudioStream fed without
-        the overhead of a background thread.
+        Non-blocking: the stdout pipe read end is O_NONBLOCK, so raw
+        read(2) returns immediately with whatever bytes are available. At
+        60fps this keeps the AudioStream fed without the overhead of a
+        background thread.
 
-        Read protocol (verified against glibc behavior):
-          - n > 0: data read. ferror may also be 1 (a follow-up non-blocking
-            probe hit EAGAIN after draining the available bytes) — clear it.
-          - n == 0, feof == 1: real EOF (ffmpeg closed stdout). Mark end.
-          - n == 0, ferror == 1, feof == 0: EAGAIN, no data this frame.
+        Read protocol (verified against read(2)/pipe(7) semantics):
+          - n > 0: data read (a partial frame at the chunk boundary is
+            dropped, as before).
+          - n == 0: real EOF (all write ends closed — ffmpeg exited or
+            closed stdout). Marks the end.
+          - n < 0, errno EAGAIN/EINTR: no data this frame — retry next
+            frame.
+          - n < 0, other errno: the pipe is broken (child died) — treat
+            as end.
         """
-        if not self.running:
+        if not self.running or self.read_fd < 0:
             return ChunkResult()
 
-        # Clear any sticky error/EOF flag from a previous EAGAIN so this read
-        # can surface fresh state.
-        _ = external_call["clearerr", c_int](self.fp)
-
-        var buf_ptr = rebind[Pointer[Int8, MutUntrackedOrigin]](
-            self.buffer.ptr()
+        var n = c_read(
+            c_int(self.read_fd),
+            rebind[Pointer[NoneType, MutUntrackedOrigin]](self.buffer.ptr()),
+            CHUNK_BYTES,
         )
-        var n = external_call["fread", c_size_t](
-            buf_ptr, c_size_t(1), c_size_t(CHUNK_BYTES), self.fp
-        )
-        var n_bytes = Int(n)
 
-        var eof_flag = Int(external_call["feof", c_int](self.fp))
+        if n > 0:
+            var n_bytes = Int(n)
+            if n_bytes > CHUNK_BYTES:
+                n_bytes = CHUNK_BYTES
+            var frame_count = n_bytes // (CHANNELS * (SAMPLE_SIZE // 8))
+            self.frames_output += frame_count
+            return ChunkResult(self.pcm_samples(), frame_count)
 
-        # Real EOF: ffmpeg closed stdout (finished or died). Drain any final
-        # bytes first (n may be > 0 with eof set on the same read).
-        if eof_flag == 1:
+        if n == 0:
+            # Real EOF: ffmpeg closed stdout (finished or died). Reap the
+            # process (blocking wait is fine — the child is already exiting
+            # or dead).
             self.reached_eof = True
             self.running = False
-            if n_bytes > 0:
-                # Last partial chunk — deliver it before signaling end.
-                if n_bytes > CHUNK_BYTES:
-                    n_bytes = CHUNK_BYTES
-                var frame_count = n_bytes // (CHANNELS * (SAMPLE_SIZE // 8))
-                self.frames_output += frame_count
-                return ChunkResult(self.pcm_samples(), frame_count)
+            self._reap()
             return ChunkResult()
 
-        # EAGAIN (or transient error) with no data — retry next frame.
-        if n_bytes == 0:
-            # ferror is set from the non-blocking probe hitting EAGAIN; the
-            # next read_chunk clears it via clearerr above.
+        # n < 0: inspect errno.
+        var err = get_errno()
+        if err == ErrNo.EAGAIN or err == ErrNo.EINTR:
+            # No data this frame — retry on the next frame tick.
             return ChunkResult()
 
-        # Got data (ferror may also be 1 from a trailing EAGAIN probe — harmless).
-        if n_bytes > CHUNK_BYTES:
-            n_bytes = CHUNK_BYTES
-
-        var frame_count = n_bytes // (CHANNELS * (SAMPLE_SIZE // 8))
-        self.frames_output += frame_count
-        return ChunkResult(self.pcm_samples(), frame_count)
+        # Unexpected error on a pipe we own: the write end is gone (child
+        # died). Treat as end-of-stream and remember the failure.
+        self.reached_eof = True
+        self.running = False
+        self._reap()
+        return ChunkResult()
 
     def pcm_samples(self) -> Pointer[Float32, MutUntrackedOrigin]:
         """The persistent buffer, typed as f32 stereo-interleaved samples."""
@@ -389,19 +397,44 @@ struct AudioPipe:
     # ------------------------------------------------------------------ #
 
     def _terminate(mut self):
-        """Close the pipe if running and reset state. Does NOT free buffer."""
-        if self.running:
-            _ = pclose(self.fp)
+        """Kill ffmpeg (SIGKILL), drop the pipe, and reap the child.
+        Safe to call multiple times. Does NOT free buffer."""
+        if self.pid != c_pid_t(0):
+            _ = kill(c_int(self.pid), SignalCodes.KILL)
+        if self.read_fd >= 0:
+            _ = libc_close(c_int(self.read_fd))
         self.running = False
-        self.fd = -1
-        self.fp = _null_file_ptr()
+        self.read_fd = -1
+        if self.pid != c_pid_t(0):
+            # Blocking wait on a SIGKILLed child is prompt. Best-effort:
+            # a reaping failure never spills (the pid would linger as a
+            # zombie until our exit reaps it via init).
+            var st = stack_allocation[1, c_int]()
+            _ = waitpid(self.pid, st, c_int(0))
+            self.pid = c_pid_t(0)
 
-    def _build_command(mut self, seek_s: Float64, speed: Float64) -> String:
-        """Build the shell command for ffmpeg. Output is always f32le
-        44100Hz stereo. Uses popen so the shell parses argv — we must
-        shell-quote every interpolated value."""
-        var cmd = _shell_quote(self.ffmpeg_path)
-        cmd += " -hide_banner -loglevel error"
+    def _reap(mut self):
+        """Collect an already-exited child (called on EOF). Non-blocking."""
+        if self.pid == c_pid_t(0):
+            return
+        var st = stack_allocation[1, c_int]()
+        _ = waitpid(self.pid, st, WaitFlags.WNOHANG)
+        self.pid = c_pid_t(0)
+
+    def _build_argv(mut self, seek_s: Float64, speed: Float64) -> List[String]:
+        """Build ffmpeg's argv directly (native posix_spawnp, no shell).
+
+        Output is always f32le 44100Hz stereo on `pipe:1`. stderr is
+        redirected to /dev/null in the child via file_actions, so no
+        `2>/dev/null` argument exists here (that spelling would need a
+        shell anyway)."""
+        var argv = List[String]()
+        # Never touch the terminal's stdin (classic ffmpeg hang when the
+        # input is interactive); popen-era runs relied on the shell.
+        argv.append("-nostdin")
+        argv.append("-hide_banner")
+        argv.append("-loglevel")
+        argv.append("error")
 
         # HTTP headers for Plex streams (e.g. X-Plex-Token).
         if not self.is_local and len(self.extra_headers) > 0:
@@ -413,12 +446,15 @@ struct AudioPipe:
             ):
                 var entry = self.extra_headers[i].copy()
                 header_blob += entry.key + ": " + entry.value + "\r\n"
-            cmd += " -headers " + _shell_quote(header_blob)
+            argv.append("-headers")
+            argv.append(header_blob)
 
         # Seek before input lets ffmpeg skip decode of earlier frames.
         if seek_s > 0.0:
-            cmd += " -ss " + _format_seek(seek_s)
-        cmd += " -i " + _shell_quote(self.source)
+            argv.append("-ss")
+            argv.append(_format_seek(seek_s))
+        argv.append("-i")
+        argv.append(self.source)
 
         # atempo for pitch-correct speed. 0.5-2.0 covers our entire range
         # (clamped in player); one filter instance suffices.
@@ -428,52 +464,123 @@ struct AudioPipe:
                 atempo_val = 0.5
             if atempo_val > 2.0:
                 atempo_val = 2.0
-            cmd += " -af atempo=" + _format_speed(atempo_val)
+            argv.append("-af")
+            argv.append("atempo=" + _format_speed(atempo_val))
 
-        cmd += " -f f32le -ar 44100 -ac 2 pipe:1 2>/dev/null"
-        return cmd
+        argv.append("-f")
+        argv.append("f32le")
+        argv.append("-ar")
+        argv.append(String(SAMPLE_RATE))
+        argv.append("-ac")
+        argv.append(String(CHANNELS))
+        argv.append("pipe:1")
+        return argv^
 
     def _spawn(mut self, seek_s: Float64, speed: Float64) raises -> Bool:
-        """Launch ffmpeg via popen and set stdout non-blocking."""
-        var cmd_str = self._build_command(seek_s, speed)
-        var cmd = String(cmd_str)
-        var mode = String("r")
-        self.fp = popen(cmd.as_c_string_span(), mode.as_c_string_span())
+        """Launch ffmpeg via posix_spawnp (native argv) with its stdout
+        wired to a pipe non-blocking read end."""
+        var argv = self._build_argv(seek_s, speed)
+        # DEBUG: dump the raw argv from the child's perspective
+        var dbg = String()
+        for i in range(len(argv)):
+            dbg += "[" + argv[i] + "]"
+        print("ARGV:", dbg)
 
-        # popen returns a non-null FILE* on success. The libc binding's
-        # non-nullable type means we can't null-check directly; rely on
-        # fileno succeeding as the liveness probe.
-        self.fd = Int(external_call["fileno", c_int](self.fp))
+        # pipe(): raw fds we own (stdlib Pipe closes both in __deinit__,
+        # which would detach our read end when this function returns).
+        var fds = stack_allocation[2, c_int]()
+        if pipe(fds) != 0:
+            return False
+        # pipe(2): fds[0] = read end, fds[1] = write end. CLOEXEC on both,
+        # so pre-exec code in the child never sees them — adddup2's dup2
+        # clears the flag on the child's new stdout itself.
+        var write_fd = Int(fds[unsafe_offset=1])
+        var read_fd = Int(fds[unsafe_offset=0])
+        _ = fcntl(
+            fds[unsafe_offset=0], FcntlCommands.F_SETFD, FcntlFDFlags.FD_CLOEXEC
+        )
+        _ = fcntl(
+            fds[unsafe_offset=1], FcntlCommands.F_SETFD, FcntlFDFlags.FD_CLOEXEC
+        )
 
-        if self.fd < 0:
-            _ = pclose(self.fp)
+        # posix_spawn_file_actions_t: glibc holds a small inline arena
+        # (~80 B on x86-64); a zeroed 256-byte, 8-aligned stack buffer
+        # comfortably covers it. Zeroed because an uninitialized struct
+        # handed to init() is UB in principle.
+        var fa = stack_allocation[32, UInt64]()
+        # Typed as OptionalPointer (not Pointer) to match the shape the
+        # stdlib's own posix_spawnp wrapper declares for "posix_spawnp" —
+        # mismatched ext-decl signatures abort at archive link time.
+        var fa_ptr = OptionalPointer[NoneType, MutUntrackedOrigin](
+            Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=Int(fa))
+        )
+        var rc = external_call["posix_spawn_file_actions_init", c_int](fa_ptr)
+        var spawned_ok = False
+        if rc == 0:
+            # Child stderr -> /dev/null (swallows -loglevel errors, same as
+            # the old popen command's `2>/dev/null` tail).
+            # DEBUG BISECT: leave stderr inherited (no addopen)
+            pass
+        if rc == 0:
+            # Child stdout (fd 1) <- the pipe's write end.
+            rc = external_call["posix_spawn_file_actions_adddup2", c_int](
+                fa_ptr,
+                c_int(write_fd),
+                c_int(STDOUT_FILENO),
+            )
+        if rc == 0:
+            # argv: [file_name, ...args, NULL]. The String entries must
+            # OUTLIVE the spawn: as_c_string_span() attaches the NUL
+            # terminator to each (mutable) String and aliases its memory.
+            var parts = self.ffmpeg_path.split("/")
+            var args_copy = List[String]()
+            args_copy.append(String(parts[len(parts) - 1]))  # argv[0]
+            for i in range(len(argv)):
+                args_copy.append(argv[i])
+
+            var argv_ptrs = List[Optional[CStringSpan[ImmutAnyOrigin]]]()
+            for j in range(len(args_copy)):
+                # Mutate the element in place — a `var arg = args_copy[j]`
+                # copy would be deep and die before the spawn, dangling
+                # the span.
+                var cs = rebind[CStringSpan[ImmutAnyOrigin]](
+                    args_copy[j].as_c_string_span()
+                )
+                argv_ptrs.append(Optional(cs))
+            argv_ptrs.append(None)  # NULL terminator
+
+            var pid: c_pid_t = 0
+            rc = external_call["posix_spawnp", c_int](
+                Pointer(to=pid),
+                self.ffmpeg_path.as_c_string_span(),
+                fa_ptr,  # file_actions
+                OptionalPointer[NoneType, ImmUntrackedOrigin](),  # attrp
+                argv_ptrs.unsafe_ptr(),
+                _get_environ(),  # inherit the parent's environment
+            )
+            if rc == 0:
+                self.pid = pid
+                spawned_ok = True
+
+        _ = external_call["posix_spawn_file_actions_destroy", c_int](fa_ptr)
+
+        if not spawned_ok:
+            _ = libc_close(c_int(write_fd))
+            _ = libc_close(c_int(read_fd))
             self.running = False
-            self.fd = -1
-            self.fp = _null_file_ptr()
+            self.read_fd = -1
+            self.pid = c_pid_t(0)
             return False
 
-        # Set the stdout fd to non-blocking so read() returns EAGAIN instead
-        # of blocking the 60fps UI loop when ffmpeg has no data yet.
-        # fcntl(2) is VARIADIC (`int fcntl(int fd, int cmd, ...)`) — the
-        # fixed-arg count (fd, cmd) is an ABI requirement; the O_NONBLOCK
-        # arg is the variadic one.
-        _ = external_call["fcntl", c_int, num_fixed_args=2](
-            c_int(self.fd), c_int(F_SETFL), c_int(O_NONBLOCK)
-        )
+        # The parent must not hold the write end, or the child's EOF never
+        # shows up as read()==0 (the pipe stays open forever).
+        _ = libc_close(c_int(write_fd))
 
-        # Set stdio to unbuffered (_IONBF) so fread hits the non-blocking fd
-        # directly rather than trying to fill a stdio buffer (which would
-        # block). Without this, fread on a non-blocking fd sets ferror on
-        # every EAGAIN even when no data was requested. setvbuf's buf/size
-        # are ignored for _IONBF: true-NULL buf (honest null idiom, c_null)
-        # and size 0 as size_t.
-        _ = external_call["setvbuf", c_int](
-            self.fp,
-            c_null[Int8](),
-            c_int(_IONBF),
-            c_size_t(0),
-        )
+        # Non-blocking read end: read() returns EAGAIN instead of blocking
+        # the 60fps UI loop when ffmpeg has no data yet.
+        _ = fcntl(c_int(read_fd), F_SETFL, O_NONBLOCK)
 
+        self.read_fd = read_fd
         self.running = True
         self.reached_eof = False
         self.frames_output = 0

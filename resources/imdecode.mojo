@@ -407,14 +407,14 @@ def _fixed_tables() raises -> Tuple[Huffman, Huffman]:
         lengths.append(7)
     for _ in range(288 - 280):
         lengths.append(8)
-    var lit = Huffman.build(lengths^)
+    var lit = Huffman.build(lengths)
 
     # Fixed distance table: 32 codes of 5 bits.
     var dist_lengths = List[UInt8]()
     dist_lengths.reserve(30)
     for _ in range(30):
         dist_lengths.append(5)
-    var dist = Huffman.build(dist_lengths^)
+    var dist = Huffman.build(dist_lengths)
     return (lit^, dist^)
 
 
@@ -433,7 +433,7 @@ def _dynamic_tables(mut br: LsbBitReader) raises -> Tuple[Huffman, Huffman]:
     for i in range(hclen):
         cl_lengths[order[i]] = UInt8(br.get_bits(3))
 
-    var cl_table = Huffman.build(cl_lengths^)
+    var cl_table = Huffman.build(cl_lengths)
 
     var lengths = List[UInt8]()
     lengths.reserve(hlit + hdist)
@@ -467,8 +467,8 @@ def _dynamic_tables(mut br: LsbBitReader) raises -> Tuple[Huffman, Huffman]:
     for i in range(hdist):
         dist_lengths.append(lengths[hlit + i])
 
-    var lit = Huffman.build(lit_lengths^)
-    var dist = Huffman.build(dist_lengths^)
+    var lit = Huffman.build(lit_lengths)
+    var dist = Huffman.build(dist_lengths)
     return (lit^, dist^)
 
 
@@ -830,7 +830,7 @@ def imdecode_png(data: List[UInt8]) raises -> DecodedImage:
     if len(idat) == 0:
         raise "png: no IDAT chunks"
 
-    var recon_compressed = zlib_inflate(idat^)
+    var recon_compressed = zlib_inflate(idat)
     var channels_in: Int
     if color_type == 0:
         channels_in = 1
@@ -852,7 +852,7 @@ def imdecode_png(data: List[UInt8]) raises -> DecodedImage:
         recon_compressed, width, height, channels_in, depth
     )
     var rgba = _png_to_rgba(
-        unfiltered^, width, height, channels_in, depth, palette^, trns^
+        unfiltered, width, height, channels_in, depth, palette, trns
     )
     return DecodedImage(pixels=rgba^, width=width, height=height)
 
@@ -870,9 +870,9 @@ def imdecode(var data: List[UInt8]) raises -> DecodedImage:
     decoders receive it by move, not by copy.
     """
     if len(data) >= 8 and Int(data[0]) == 0x89 and Int(data[1]) == 0x50:
-        return imdecode_png(data^)
+        return imdecode_png(data)
     if len(data) >= 2 and Int(data[0]) == 0xFF and Int(data[1]) == 0xD8:
-        return imdecode_jpeg(data^)
+        return imdecode_jpeg(data)
     raise "imdecode: unsupported format (need PNG or JPEG)"
 
 
@@ -1104,7 +1104,7 @@ def _no_table() raises -> Huffman:
     lengths.append(0)
     for _ in range(254):
         lengths.append(0)
-    return Huffman.build(lengths^)
+    return Huffman.build(lengths)
 
 
 def _syms_to_int(symbols: List[UInt8]) raises -> List[Int]:
@@ -1199,7 +1199,7 @@ def imdecode_jpeg(data: List[UInt8]) raises -> DecodedImage:
                 for length in range(16):
                     for _ in range(Int(lengths[length])):
                         per_sym.append(UInt8(length + 1))
-                var table = Huffman.build(per_sym^)
+                var table = Huffman.build(per_sym)
                 table.symbols = _syms_to_int(symbols)
                 if tc == 0:
                     dc_tables[th] = table.copy()
@@ -1497,7 +1497,7 @@ def _jpeg_planes_to_rgba(
             cb_up.copy(), cb_stride, cb_rows, cb_cols, width
         )
         var cb_h = t[0].copy()
-        t = _fancy_upsample_v(cb_h^, width, cb_rows, width)
+        t = _fancy_upsample_v(cb_h, width, cb_rows, width)
         cb_up = t[0].copy()
         cb_stride = t[1]
     elif cb_x_div == 2 and cb_y_div == 1:
@@ -1519,7 +1519,7 @@ def _jpeg_planes_to_rgba(
             cr_up.copy(), cr_stride, cr_rows, cr_cols, width
         )
         var cr_h = t2[0].copy()
-        var t3 = _fancy_upsample_v(cr_h^, width, cr_rows, width)
+        var t3 = _fancy_upsample_v(cr_h, width, cr_rows, width)
         cr_up = t3[0].copy()
         cr_stride = t3[1]
     elif cr_x_div == 2 and cr_y_div == 1:

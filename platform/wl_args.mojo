@@ -22,7 +22,9 @@
 #
 # Byte layout matches wl_argument: little-endian slots, 8B strings, 4B
 # uint/int/fixed. wl_fixed is int24.8 (value * 256).
-from std.ffi import CStringSpan
+# `c_char` (not `Int8`) is 1.2-correct here: c_char's signedness now
+# follows the target ABI. `String(...)` conversions go through `as_bytes()`.
+from std.ffi import c_char, CStringSpan
 from std.ffi.unsafe_union import UnsafeUnion
 from std.memory import unsafe_memcpy
 from std.memory.unsafe_pointer import Pointer
@@ -65,13 +67,16 @@ def _arg_addr(a: WLArgument) -> Int:
     return Int(arg_view(a).unsafe_get[Int64]())
 
 
-def arg_as_string(a: WLArgument) -> String:
+def arg_as_string(a: WLArgument) raises -> String:
     """Decode a shim-owned malloc'd NUL-terminated 's' WLArgument into a
     Mojo String (the shim retains the copy until it is freed)."""
-    var ptr = Pointer[Int8, MutUntrackedOrigin](
+    var ptr = Pointer[c_char, MutUntrackedOrigin](
         unsafe_from_address=_arg_addr(a)
     )
-    return String(CStringSpan(unsafe_from_ptr=ptr))
+    # 1.2: `String(...)` has no implicit from-bytes init (it would hit the
+    # Writable overload and render "[104,101,...]"); the explicit byte
+    # converter is the `from_utf8` kwarg.
+    return String(from_utf8=CStringSpan(unsafe_from_ptr=ptr).as_bytes())
 
 
 def arg_as_u32(a: WLArgument) -> UInt32:

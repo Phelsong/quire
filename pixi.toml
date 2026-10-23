@@ -29,7 +29,7 @@ experimental = true
 emberjson = { path = "../EmberJson" }
 mojo-wayland = { path = "../mojo-wayland" }
 httpx = ">=0.28.1,<0.29"
-mojo = ">=1.1.0,<1.1.9"
+mojo = ">=1.2.0,<1.3"
 ffmpeg = ">=9.0.2,<10"
 mojo_csv = ">=1.8.0,<2"
 # uuid = { git = "https://github.com/ehsanmok/uuid.git", branch = "main" }
@@ -68,6 +68,9 @@ dist = { cmd = "python3 scripts/make_bundle.py", depends-on = ["build"] }
 appimage = { cmd = "python3 scripts/make_appimage.py", depends-on = ["dist"] }
 # test/debug
 test = "mojo -I . tests/test_config.mojo && mojo -I . tests/test_offline_library.mojo && mojo -I . tests/test_offline_search.mojo && mojo -I . tests/test_mutex.mojo"
+# Audio pipe end-to-end (spawns a real ffmpeg; ~4s). Kept out of `test`
+# to keep the default suite network/ffmpeg-free.
+test-audio = "mojo -I . tests/test_audio_pipe.mojo"
 wayland-test = { cmd = "mojo build tests/test_globals.mojo -I . -o .pixi/test_globals -Xlinker -L.pixi/lib -Xlinker -L.pixi/envs/default/lib -Xlinker -lwayland_shim -Xlinker -lwayland-client && LD_LIBRARY_PATH=.pixi/lib:.pixi/envs/default/lib .pixi/test_globals", depends-on = [
   "shim",
 ] }
