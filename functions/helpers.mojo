@@ -53,15 +53,17 @@ def _shell_quote(s: String) -> String:
 
     Wraps the value in single quotes and escapes any internal single quotes
     using the standard `'\''` sequence. Safe for URLs, file paths, and
-    multi-line header blobs.
+    multi-line header blobs. Multibyte UTF-8 passes through verbatim —
+    a byte walk here panics on the first non-ASCII byte
+    ("String span index ... does not lie on a codepoint boundary").
     """
     var out = String("'")
-    for i in range(s.byte_length()):
-        var ch = s[byte=i]
+    for cp_slice in s.codepoint_slices():
+        var ch = String(cp_slice)
         if ch == "'":
             out += "'\\''"
         else:
-            out += String(ch)
+            out += ch
     out += "'"
     return out
 

@@ -36,7 +36,9 @@ from resources.plex_api_types import (
 def start_oauth(client_id: String = "") raises -> OAuthPin:
     """Start the Plex OAuth PIN flow.
 
-    POST https://plex.tv/api/v2/pins.json?strong=true
+    POST https://plex.tv/api/v2/pins?strong=true
+    (the .json route stays JSON-only; Accept: application/xml serves the
+    same keys as attributes on a root <pin> element — verified live.)
 
     Returns OAuthPin struct with id, code, client_identifier, error.
     """
@@ -47,7 +49,7 @@ def start_oauth(client_id: String = "") raises -> OAuthPin:
     var headers = plex_headers(client_id=cid)
     headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    var url = "https://plex.tv/api/v2/pins.json?strong=true"
+    var url = "https://plex.tv/api/v2/pins?strong=true"
 
     try:
         var data = _http_post_form(url, headers, Dict[String, String](), 30.0)
@@ -103,7 +105,7 @@ def open_browser(pin_code: String, client_id: String = "") raises -> Bool:
 def poll_pin(pin_id: Int, client_id: String = "") raises -> AuthResult:
     """Poll for the OAuth token after the user authorizes in the browser.
 
-    GET https://plex.tv/api/v2/pins/{id}.json
+    GET https://plex.tv/api/v2/pins/{id}
 
     Returns AuthResult struct with auth_token, expired, error.
     """
@@ -112,7 +114,7 @@ def poll_pin(pin_id: Int, client_id: String = "") raises -> AuthResult:
         cid = get_or_create_client_id()
 
     var headers = plex_headers(client_id=cid)
-    var url = "https://plex.tv/api/v2/pins/{}.json".format(String(pin_id))
+    var url = "https://plex.tv/api/v2/pins/{}".format(String(pin_id))
 
     try:
         var data = _http_get(url, headers, 15.0)
@@ -193,9 +195,7 @@ def get_managed_users(
     try:
         var data = _http_get(url, headers, 15.0)
 
-        var user_list = _vitems(
-            data, "users", default_items=_vitems(data, "User")
-        )
+        var user_list = _vitems(data, "user", alt="User")
 
         var result = List[ManagedUser]()
         for i in range(len(user_list)):

@@ -48,6 +48,6 @@ def main() raises:
         raise Error("saved sidecar not found by load_saved_books")
 
     # self-cleanup
-    _ = remove(Path("/home/joshs/.config/quire/saved/99999990.json"))
+    _ = remove(Path("/home/joshs/.config/quire/saved/99999990.toml"))
 
     print("All offline library tests passed.")

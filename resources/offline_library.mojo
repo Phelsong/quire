@@ -1,15 +1,19 @@
 """Offline library — per-book metadata sidecars on disk.
 
-Each SAVE (download) writes one JSON sidecar next to the config so the
+Each SAVE (download) writes one TOML sidecar next to the config so the
 library screen can render downloaded books with NO server connection.
-Sidecars live in ~/.config/quire/saved/<rating_key>.json and mirror the
+Sidecars live in ~/.config/quire/saved/<rating_key>.toml and mirror the
 PlexBookCard listing fields plus a saved_at stamp (ordering).
+
+Serialization is hand-rolled TOML (resources.minitoml) — the JSON
+dependency (emberjson/emberserde) is gone; pre-TOML .json sidecars are
+skipped by the reader (they self-clean on delete).
 
 conversion to/from PlexBookCard
 lives here so callers never touch raw fields.
 """
 
-from emberjson import try_from_json, to_json
+from resources.minitoml import TomlDoc, TomlSection, parse_toml, utf8_string
 from std.collections import List
 from std.os import makedirs, path, listdir, remove
 from std.pathlib import Path
@@ -93,23 +97,48 @@ def get_saved_library_dir() -> String:
     return String(_saved_dir())
 
 
+def _sidecar_toml(meta: SavedBookMetadata) -> String:
+    """One sidecar record's TOML text (flat root-table fields)."""
+    var doc = TomlDoc()
+    doc.add("rating_key", meta.rating_key)
+    doc.add("title", meta.title)
+    doc.add("author", meta.author)
+    doc.add("thumb", meta.thumb)
+    doc.add("duration_ms", meta.duration_ms)
+    doc.add("view_offset_ms", meta.view_offset_ms)
+    doc.add("leaf_count", meta.leaf_count)
+    doc.add("viewed_leaf_count", meta.viewed_leaf_count)
+    doc.add("year", meta.year)
+    doc.add("saved_at", meta.saved_at)
+    return doc.dump()
+
+
 def _read_sidecar(file_path: Path) -> Optional[SavedBookMetadata]:
     """Parse one sidecar file. Corrupt/unknown content returns None."""
     try:
         var raw = file_path.read_bytes()
-        var data = String()
-        for b in range(len(raw)):
-            data += String(chr(Int(raw[b])))
-        var parsed: Optional[SavedBookMetadata] = try_from_json[
-            SavedBookMetadata
-        ](data)
-        return parsed^
+        var tables = parse_toml(utf8_string(raw))
+        var root = tables.get("", TomlSection())
+        var meta = SavedBookMetadata()
+        meta.rating_key = root.strings.get("rating_key", "")
+        meta.title = root.strings.get("title", "")
+        meta.author = root.strings.get("author", "")
+        meta.thumb = root.strings.get("thumb", "")
+        meta.duration_ms = root.ints.get("duration_ms", 0)
+        meta.view_offset_ms = root.ints.get("view_offset_ms", 0)
+        meta.leaf_count = root.ints.get("leaf_count", 0)
+        meta.viewed_leaf_count = root.ints.get("viewed_leaf_count", 0)
+        meta.year = root.ints.get("year", 0)
+        meta.saved_at = root.ints.get("saved_at", 0)
+        if meta.rating_key.byte_length() == 0:
+            return None
+        return meta^
     except:
         return None
 
 
 def save_book_metadata(mut meta: SavedBookMetadata) raises:
-    """Write one book's sidecar JSON (called after a successful download).
+    """Write one book's sidecar TOML (called after a successful download).
 
     Sidecars are tiny (<1 KB)"""
     var dir_path = Path(_saved_dir())
@@ -118,8 +147,8 @@ def save_book_metadata(mut meta: SavedBookMetadata) raises:
     # A fresh download starts unlistened; progress accrues via
     # update_saved_progress as the user listens.
     meta.view_offset_ms = 0
-    var payload = to_json[pretty=True](meta)
-    var out_path = dir_path / (meta.rating_key + ".json")
+    var payload = _sidecar_toml(meta)
+    var out_path = dir_path / (meta.rating_key + ".toml")
     out_path.write_bytes(Span[UInt8](payload.as_bytes()))
 
 
@@ -130,7 +159,8 @@ def load_saved_books() -> List[SavedBookMetadata]:
     opened with no server still leads with what you grabbed last. Corrupt
     sidecars are skipped silently — one bad file must never take down the
     offline library. Directory absence (nothing ever saved) is normal and
-    returns an empty list, not an error."""
+    returns an empty list, not an error. Legacy .json sidecars (pre-TOML
+    store) are skipped."""
     var out = List[SavedBookMetadata]()
     var dir_path = Path(_saved_dir())
     if not path.exists(dir_path):
@@ -144,7 +174,7 @@ def load_saved_books() -> List[SavedBookMetadata]:
 
     for i in range(len(names)):
         var name = String(names[i])
-        if not name.endswith(".json"):
+        if not name.endswith(".toml"):
             continue
         var parsed = _read_sidecar(dir_path / names[i])
         if parsed:
@@ -186,7 +216,7 @@ def load_saved_books() -> List[SavedBookMetadata]:
 
 def has_sidecar(rating_key: String) -> Bool:
     """True if a metadata sidecar exists for this book."""
-    var file_path = Path(_saved_dir()) / (rating_key + ".json")
+    var file_path = Path(_saved_dir()) / (rating_key + ".toml")
     return path.exists(file_path)
 
 
@@ -238,11 +268,8 @@ def downloaded_rating_keys(audio_dir: String) -> List[String]:
 def delete_saved_book(rating_key: String, audio_dir: String) -> Bool:
     """Delete one saved book: its metadata sidecar + cached audio files.
 
-    Removes <saved>/<rating_key>.json and every audio file in `audio_dir`
-    whose stem is the rating key (the same extension set the download/
-    probe paths use, so nothing a SAVE could have written is left
-    behind). Also the ground truth for a book that has audio on disk but
-    no sidecar (pre-sidecar download) — the audio deletion is unconditional.
+    Removes <saved>/<rating_key>.toml and every audio file in `audio_dir` whose stem is the rating
+    key.
 
     Returns True when at least one file was removed; False means the book
     was already gone (nothing saved, or a previous delete raced this one).
@@ -250,13 +277,14 @@ def delete_saved_book(rating_key: String, audio_dir: String) -> Bool:
     block deleting the rest."""
     var anything_removed = False
 
-    var sidecar_path = Path(_saved_dir()) / (rating_key + ".json")
+    var sidecar_path = Path(_saved_dir()) / (rating_key + ".toml")
     if path.exists(sidecar_path):
         try:
             remove(sidecar_path)
             anything_removed = True
         except e:
             print("[Quire] delete sidecar failed: " + String(e))
+
 
     var extensions = List[String]()
     extensions.append(".mp3")
@@ -285,7 +313,7 @@ def update_saved_progress(rating_key: String, position_ms: Int) raises:
 
     Keeps the offline library's resume point current without a server.
     Skips silently when the sidecar doesn't exist (book not downloaded)."""
-    var file_path = Path(_saved_dir()) / (rating_key + ".json")
+    var file_path = Path(_saved_dir()) / (rating_key + ".toml")
     if not path.exists(file_path):
         return
 
@@ -296,7 +324,7 @@ def update_saved_progress(rating_key: String, position_ms: Int) raises:
     meta.view_offset_ms = position_ms
     # viewedLeafCount can't be derived from a byte offset offline; leave it.
 
-    var payload = to_json[pretty=True](meta)
+    var payload = _sidecar_toml(meta)
     file_path.write_bytes(Span[UInt8](payload.as_bytes()))
 
 

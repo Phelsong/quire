@@ -14,7 +14,9 @@ is set. The screen never touches the config file directly (single source
 of truth lives in main.mojo / resources.config).
 """
 
+from render.imui import NAV_DOWN, NAV_UP, UIContext, UIResult, Vec2, Rect
 from std.collections import List, Dict
+from std.math import max
 
 from functions.helpers import truncate_string
 from functions.plex_bridge import PlexSession
@@ -165,6 +167,13 @@ def _action_keys() -> List[String]:
     keys.append("speed_up")
     keys.append("back_button")
     keys.append("home")
+    keys.append("select")
+    keys.append("nav_up")
+    keys.append("nav_down")
+    keys.append("nav_left")
+    keys.append("nav_right")
+    keys.append("page_prev")
+    keys.append("page_next")
     return keys^
 
 
@@ -180,6 +189,13 @@ def _action_labels() -> List[String]:
     labels.append("Speed Up")
     labels.append("Back")
     labels.append("Home")
+    labels.append("Select")
+    labels.append("Navigate Up")
+    labels.append("Navigate Down")
+    labels.append("Navigate Left")
+    labels.append("Navigate Right")
+    labels.append("Previous Page")
+    labels.append("Next Page")
     return labels^
 
 
@@ -955,6 +971,34 @@ struct SettingsScreen:
         var actions = _action_names()
         var row_h = 56.0
         var row_gap = 8.0
+        # Scroll region for the spatial-nav engine: the keybind rows are
+        # nav region 1; a held dpad walks the rows and scrolls at the
+        # edges instead of escaping into the header.
+        var nav_item_count = len(actions)
+        var nav_total = Float64(nav_item_count) * (row_h + row_gap) - row_gap
+        var nav_scroll_design = Float64(self.scroll_offset) / Float64(
+            ui.ui_scale
+        )
+        ui.nav_scroll_hint(
+            1,
+            nav_scroll_design > 0.5,
+            (nav_total - nav_scroll_design) > Float64(list_height) + 0.5,
+        )
+        var nav_stride = row_h + row_gap
+        if ui.nav_scroll_edge(1, NAV_DOWN):
+            self.scroll_offset = Float32(
+                Float64(self.scroll_offset) + nav_stride * Float64(ui.ui_scale)
+            )
+            var nav_max = Float32(max(nav_total - Float64(list_height), 0.0))
+            if self.scroll_offset > nav_max:
+                self.scroll_offset = nav_max
+        elif ui.nav_scroll_edge(1, NAV_UP):
+            self.scroll_offset = Float32(
+                Float64(self.scroll_offset) - nav_stride * Float64(ui.ui_scale)
+            )
+            if self.scroll_offset < 0.0:
+                self.scroll_offset = 0.0
+
         var scroll_design = Float64(self.scroll_offset) / Float64(ui.ui_scale)
         var row_x = 20.0
         var row_w = sw_design - 40.0
@@ -1040,6 +1084,7 @@ struct SettingsScreen:
                 bg=BTN_DARK_LIB if not is_kb_rebinding else LOGOUT_RED,
                 fg=TEXT_LIGHT,
                 hover=Color(55, 64, 80, 255),
+                region=1,
             )
             if kb_btn.clicked:
                 if is_kb_rebinding:
@@ -1074,6 +1119,7 @@ struct SettingsScreen:
                 bg=BTN_DARK_LIB if not is_gp_rebinding else LOGOUT_RED,
                 fg=TEXT_LIGHT,
                 hover=Color(55, 64, 80, 255),
+                region=1,
             )
             if gp_btn.clicked:
                 if is_gp_rebinding:

@@ -34,7 +34,7 @@ def _meta(
 
 
 def _probe_path(rating_key: String) -> String:
-    return get_saved_library_dir() + "/" + rating_key + ".json"
+    return get_saved_library_dir() + "/" + rating_key + ".toml"
 
 
 def _cleanup(rating_key: String) raises:

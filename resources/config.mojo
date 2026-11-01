@@ -3,6 +3,11 @@
 Replaces the former Config defined in functions/plex_bridge.mojo.
 All modules import Config, load_config, save_config, and
 get_or_create_client_id from here.
+
+The file is hand-rolled TOML (~/.config/quire/config.toml, resources/
+minitoml): the ten flat fields ride the root table, the keybind map is
+the [keybinds] section. No JSON parser anywhere — save/load map fields
+straight onto the struct, and a corrupt file degrades to defaults.
 """
 
 from std.os import makedirs, path
@@ -11,16 +16,10 @@ from std.logger import Logger, Level
 from std.random import random_ui64, seed
 from std.time import perf_counter_ns
 
-from emberjson import try_from_json, to_json
-from emberserde.serialize import serialize
-from emberserde.deserialize import (
-    deserialize,
-    Deserializer,
-    SelfDescribingDeserializer,
-)
+from resources.minitoml import TomlDoc, TomlSection, parse_toml, utf8_string
 
 
-comptime _CONFIG_FILE = "~/.config/quire/config.json"
+comptime _CONFIG_FILE = "~/.config/quire/config.toml"
 
 comptime LOG_LEVEL = Level(Int(30))
 
@@ -95,7 +94,13 @@ struct Config(Copyable, Defaultable, Deinitable, Movable, Writable):
 
 
 def _default_keybinds() -> Dict[String, List[String]]:
-    """Sensible default keybinds for audiobook playback."""
+    """Sensible default keybinds for audiobook playback.
+
+    Spatial-navigation actions (nav_*/select) drive the gamepad focus
+    engine in render/imui — the dpad moves focus between UI elements and
+    the A face button activates the focused one. LEFT_FACE_* are the
+    dpad, RIGHT_FACE_* the ABXY cluster (A=DOWN, B=RIGHT, X=LEFT, Y=UP).
+    """
     return {
         "play_pause": ["KEY_SPACE", "GAMEPAD_BUTTON_RIGHT_FACE_UP"],
         "skip_back": ["KEY_LEFT", "GAMEPAD_BUTTON_LEFT_FACE_RIGHT"],
@@ -106,6 +111,11 @@ def _default_keybinds() -> Dict[String, List[String]]:
         "speed_up": ["KEY_EQUAL"],
         "back_button": ["KEY_ESCAPE", "GAMEPAD_BUTTON_RIGHT_FACE_RIGHT"],
         "home": ["KEY_HOME"],
+        "nav_up": ["KEY_UP", "GAMEPAD_BUTTON_LEFT_FACE_UP"],
+        "nav_down": ["KEY_DOWN", "GAMEPAD_BUTTON_LEFT_FACE_DOWN"],
+        "nav_left": ["KEY_LEFT", "GAMEPAD_BUTTON_LEFT_FACE_LEFT"],
+        "nav_right": ["KEY_RIGHT", "GAMEPAD_BUTTON_LEFT_FACE_RIGHT"],
+        "select": ["KEY_ENTER", "GAMEPAD_BUTTON_RIGHT_FACE_DOWN"],
     }
 
 
@@ -155,7 +165,7 @@ def uuid4() -> String:
 def get_or_create_client_id() raises -> String:
     """Return a persistent UUID for X-Plex-Client-Identifier.
 
-    Stored in ~/.config/quire/config.json. Generated once, reused forever.
+    Stored in ~/.config/quire/config.toml. Generated once, reused forever.
     """
     var config = load_config()
     if config.client_identifier.byte_length() == 36:
@@ -166,33 +176,77 @@ def get_or_create_client_id() raises -> String:
     return config.client_identifier
 
 
+def _toml_serialize(config: Config) -> String:
+    """The config file text: flat fields on the root, keybinds section."""
+    var doc = TomlDoc()
+    doc.add("client_identifier", config.client_identifier)
+    doc.add("account_token", config.account_token)
+    doc.add("server_token", config.server_token)
+    doc.add("client_id", config.client_id)
+    doc.add("server_url", config.server_url)
+    doc.add("server_name", config.server_name)
+    doc.add("machine_id", config.machine_id)
+    doc.add("library_id", config.library_id)
+    doc.add("library_name", config.library_name)
+    doc.add("username", config.username)
+    doc.add("font_multiplier", config.font_multiplier)
+    doc.set_section("keybinds")
+    for entry in config.keybinds.items():
+        doc.add(entry.key, entry.value.copy())
+    return doc.dump()
+
+
+def _config_from_toml(text: String) raises -> Config:
+    """Rebuild Config from TOML text.
+
+    Unknown keys are ignored; missing keys keep their struct defaults
+    (the keybind map starts from _default_keybinds, and a keybind present
+    in the file per-action replaces the default list)."""
+    var tables = parse_toml(text)
+    var cfg = Config()
+    var root = tables.get("", TomlSection())
+    cfg.client_identifier = root.strings.get("client_identifier", "")
+    cfg.account_token = root.strings.get("account_token", "")
+    cfg.server_token = root.strings.get("server_token", "")
+    cfg.client_id = root.strings.get("client_id", "")
+    cfg.server_url = root.strings.get("server_url", "")
+    cfg.server_name = root.strings.get("server_name", "")
+    cfg.machine_id = root.strings.get("machine_id", "")
+    cfg.library_id = root.strings.get("library_id", "")
+    cfg.library_name = root.strings.get("library_name", "")
+    cfg.username = root.strings.get("username", "")
+    cfg.font_multiplier = root.floats.get("font_multiplier", 1.0)
+    var kb = tables.get("keybinds", TomlSection())
+    for entry in kb.str_arrays.items():
+        cfg.keybinds[entry.key] = entry.value.copy()
+    return cfg^
+
+
 def save_config(config: Config) raises:
     """Save config struct to config file.
 
     Writes via native Path.write_bytes() — no Python file object (the
-    config is a few KB; the `with open` round-trip cost a file-object
-    dance on every save, and saves happen on every settings change).
+    config is a few hundred bytes; saves happen on every settings
+    change). Keys are stable TOML, readable by hand.
     """
     _ensure_config_dir()
     var config_path = Path(path.expanduser(_CONFIG_FILE))
-    var payload = to_json[pretty=True](config)
+    var payload = _toml_serialize(config)
     config_path.write_bytes(Span[UInt8](payload.as_bytes()))
 
 
 def load_config() raises -> Config:
-    """Load config from file as a native Config struct."""
+    """Load config from file as a native Config struct.
+
+    A missing, corrupt, or half-written file returns defaults — same
+    contract as before: the app self-heals to a fresh install state
+    rather than crashing on startup."""
     _ensure_config_dir()
     var config_path = Path(path.expanduser(_CONFIG_FILE))
     if path.exists(config_path):
         try:
             var raw = config_path.read_bytes()
-            # bytes -> String for the JSON parser (config files are small)
-            var data = String()
-            for i in range(len(raw)):
-                data += String(chr(Int(raw[i])))
-            var cfg: Optional[Config] = try_from_json[Config](data)
-            if cfg:
-                return cfg.take()
+            return _config_from_toml(utf8_string(raw))
         except:
             pass
     return Config()

@@ -29,7 +29,7 @@ from functions.plex_bridge import (
     report_progress,
     mark_watched,
 )
-from render.imui import UIContext, UIResult, Vec2, Rect
+from render.imui import UIContext, UIResult, Vec2, Rect, NAV_DOWN, NAV_UP
 from resources.imdecode import imdecode
 from resources.keys import (
     KEY_BACKSPACE,
@@ -940,6 +940,19 @@ struct LibraryScreen:
         var search_w = sw_design * 0.6
         var search_x = (sw_design - search_w) / 2.0
         var search_bounds = ui.rect(search_x, search_y, search_w, search_h)
+        # Spatial-nav: the search field is a chrome node; A focuses it for
+        # typing (gamepad users get the on-screen keyboard via a keyboard
+        # device, mouse users click as before).
+        var search_nav = ui.nav_node(search_bounds)
+        if ui.nav_focused(search_nav):
+            ui.focus_ring(search_bounds)
+        if ui.nav_activated(search_nav):
+            var search_center = Vec2(
+                Float64(search_bounds.x + search_bounds.width / 2.0),
+                Float64(search_bounds.y + search_bounds.height / 2.0),
+            )
+            self.search_input.handle_click(search_center)
+            ui.item_clicked = True
         # Update the TextInput bounds each frame to track DPI/resize.
         self.search_input.bounds = search_bounds
         # Click focus handling: consume the click so card buttons underneath
@@ -956,6 +969,18 @@ struct LibraryScreen:
         # --- Status + pagination line ---
         var status_y = search_y + search_h + 4.0
         var page_count = self._page_count()
+
+        # Bumper page-turns (LB/RB on the pad, PgUp/PgDn on the keyboard) —
+        # the PREV/NEXT buttons stay for the pointer; this is the gamepad
+        # path so a long library pages without walking to the buttons.
+        if ui.check_keybind("page_prev") and self.page > 0:
+            self.prev_page_requested = True
+        if (
+            ui.check_keybind("page_next")
+            and self.page + 1 < page_count
+            and len(self.books) > 0
+        ):
+            self.next_page_requested = True
 
         # PREV button (left of status) — disabled on first page.
         # Fitted width: the grown rect is what's drawn AND what the status
@@ -976,7 +1001,9 @@ struct LibraryScreen:
             if prev_result.clicked:
                 self.prev_page_requested = True
         else:
-            # Dim disabled PREV for visual consistency.
+            # Dim disabled PREV for visual consistency; NOT focusable
+            # (region -1): a dead control must never trap a spatial-nav
+            # walk in the header.
             _ = ui.button_at(
                 "PREV",
                 20.0,
@@ -986,6 +1013,7 @@ struct LibraryScreen:
                 CARD_BG,
                 TEXT_MUTED,
                 CARD_BG,
+                region=-1,
             )
 
         # Status message (center).
@@ -1021,6 +1049,7 @@ struct LibraryScreen:
                 CARD_BG,
                 TEXT_MUTED,
                 CARD_BG,
+                region=-1,
             )
 
         # --- Server-side search: debounced request to main.mojo ---
@@ -1095,6 +1124,38 @@ struct LibraryScreen:
             ui, list_top, list_bottom, touch_max_scroll, row_hit
         )
 
+        # --- Scroll region for the spatial-nav engine (gamepad list walk) ---
+        # The row list is nav region 1; the hint tells the engine whether
+        # more content exists beyond either edge so held-dpad walks
+        # scroll instead of escaping into the chrome above/below.
+        var nav_scroll_design = Float64(self.scroll_offset) / Float64(
+            ui.ui_scale
+        )
+        var nav_has_above = nav_scroll_design > 0.5
+        var nav_has_below = (touch_total_h - nav_scroll_design) > Float64(
+            list_height
+        ) + 0.5
+        ui.nav_scroll_hint(1, nav_has_above, nav_has_below)
+
+        # Row geometry the nav edge-scroll must match (the loop below uses
+        # the same constants).
+        var nav_stride = 196.0  # row_h 180 + row_gap 16
+
+        # Gamepad edge-scroll: a nav step at the row-region edge holds
+        # focus at its window position and flags here; scrolling by one
+        # row stride slides the window so the same position names the
+        # next row (cursor-at-the-edge list walking).
+        if ui.nav_scroll_edge(1, NAV_DOWN):
+            self.scroll_offset = Float32(
+                Float64(self.scroll_offset) + nav_stride * Float64(ui.ui_scale)
+            )
+            self._clamp_scroll(touch_max_scroll)
+        elif ui.nav_scroll_edge(1, NAV_UP):
+            self.scroll_offset = Float32(
+                Float64(self.scroll_offset) - nav_stride * Float64(ui.ui_scale)
+            )
+            self._clamp_scroll(touch_max_scroll)
+
         ui.begin_clip(0.0, list_top, sw_design, list_height)
 
         var row_pad = 20.0
@@ -1132,11 +1193,15 @@ struct LibraryScreen:
             # compositing, so "transparent" = don't paint.
             var row_w = sw_design - row_pad * 4.0
             var row_rect = ui.rect(row_pad, row_y, row_w, row_h)
+            var row_nav = ui.nav_node(row_rect, 1)
+            var row_activated = ui.nav_activated(row_nav)
             var row_hover = ui._hit(row_rect)
             if row_hover:
                 ui.card(
                     row_pad, row_y, row_w, row_h, SELECTED_BG, roundness=0.08
                 )
+            if ui.nav_focused(row_nav):
+                ui.focus_ring(row_rect)
 
             # --- Square cover (left) ---
             var cover_size = row_h - inner_pad * 2.0
@@ -1266,6 +1331,7 @@ struct LibraryScreen:
                 action_color,
                 TEXT_LIGHT,
                 SELECTED_BG,
+                region=1,
             )
             if save_result.clicked:
                 if downloaded:
@@ -1287,6 +1353,7 @@ struct LibraryScreen:
                 GREEN,
                 ACCENT_DARK,
                 SELECTED_BG,
+                region=1,
             )
             if play_result.clicked:
                 self.play_requested = True
@@ -1304,7 +1371,7 @@ struct LibraryScreen:
             # (drag = scroll would otherwise open a book mid-scroll) and
             # complete as taps on release.
             var row_click_allowed = not ui.press_is_touch
-            if row_click_allowed and ui._clicked(row_rect):
+            if row_activated or (row_click_allowed and ui._clicked(row_rect)):
                 self.play_requested = True
                 # `books` holds either the page or search results; direct.
                 self.play_book_index = i

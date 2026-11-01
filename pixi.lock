@@ -236,9 +236,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/wayland-protocols-1.49-hd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
       - conda: https://repo.prefix.dev/modular-community/linux-64/mojo_csv-1.8.0-h6f44653_0.conda
-      - conda_source: emberjson[a274493a] @ ../EmberJson
-      - conda_source: emberserde[1555327a] @ ../EmberSerde
-      - conda_source: mojo-wayland[48f675ce] @ ../mojo-wayland
+      - conda_source: mojo-wayland[fae48cd5] @ ../mojo-wayland
       - pypi: https://files.pythonhosted.org/packages/18/24/bad3ac4271589df29cf5ce2f5ae490518a5739358052bd0d61209e6fea54/charset_normalizer-3.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/1a/f1/b474e930c4d910328780e3940da76f5aa5cbc48ce1fc14e44d239d9ea9db/cryptography-50.0.2-cp311-abi3-manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/47/d8/a29e4e3991765e7ce4ed1f7e4074fe1ba9da03e0048639734de60f9cadb9/mutagen-1.48.1-py3-none-any.whl
@@ -453,9 +451,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
       - conda: https://repo.prefix.dev/modular-community/linux-aarch64/mojo_csv-1.8.0-h8dc4c6c_0.conda
-      - conda_source: emberjson[19480e41] @ ../EmberJson
-      - conda_source: emberserde[e43e04f8] @ ../EmberSerde
-      - conda_source: mojo-wayland[639e2477] @ ../mojo-wayland
+      - conda_source: mojo-wayland[b2c8d957] @ ../mojo-wayland
       - pypi: https://files.pythonhosted.org/packages/19/b0/5aa186d56ce2334dabe29b70bd99dc8ae926ee44184c0de64a53d415a4f3/aiohttp-3.14.5-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/38/6b/61a3f8d8c5e1e49a6cddccafc4015cc1c0021360ab0acb4080e7a423644a/cryptography-50.0.2-cp311-abi3-manylinux_2_28_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/3a/3b/d9b1e0b0eed36e70477ffb8360c49c85c8ca8ef9700a4e6711f39a6e8b45/frozenlist-1.8.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
@@ -635,9 +631,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/osx-arm64/zeromq-4.3.5-h6eb0046_12.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
       - conda: https://repo.prefix.dev/modular-community/osx-arm64/mojo_csv-1.8.0-hcef96cb_0.conda
-      - conda_source: emberjson[f2005282] @ ../EmberJson
-      - conda_source: emberserde[6e645af1] @ ../EmberSerde
-      - conda_source: mojo-wayland[b6f5d084] @ ../mojo-wayland
+      - conda_source: mojo-wayland[54f09b4b] @ ../mojo-wayland
       - pypi: https://files.pythonhosted.org/packages/47/d8/a29e4e3991765e7ce4ed1f7e4074fe1ba9da03e0048639734de60f9cadb9/mutagen-1.48.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/6b/e3/ff58ecad5161baa98dec05716e2745449446f2424a9c727464bf452f7fd1/multidict-7.1.0-cp314-cp314-macosx_11_0_arm64.whl
@@ -7996,298 +7990,16 @@ packages:
   run_exports: {}
   size: 1769712
   timestamp: 1791046204361
-- conda_source: emberjson[19480e41] @ ../EmberJson
-  variants:
-    target_platform: linux-aarch64
-  depends:
-  - emberserde
-  - mojo-compiler ==1.2.0
-  source_depends:
-    emberserde:
-      path: ../EmberSerde
-  build_packages:
-  - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/ld_impl_linux-aarch64-2.46.1-default_h1979696_103.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libexpat-2.8.5-h4154aff_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libffi-3.7.0-hdaad0be_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libgcc-16.2.0-h205dda4_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libgomp-16.2.0-h8acb6b2_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/liblzma-5.8.3-he30d5cf_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libmpdec-4.0.0-he30d5cf_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libpython-3.14.9-h150030a_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libsqlite-3.54.1-hd26f1b6_100.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libuuid-2.42.4-hd6fdeab_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libzlib-1.3.2-hdc9db2a_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/ncurses-6.6-h2b6f883_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/openssl-3.6.5-he6ad1d5_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/python-3.14.9-hbec3b18_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/readline-8.3-ha7194a6_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/zstd-1.5.7-h9d15635_7.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-  - conda_source: emberserde[e43e04f8] @ ../EmberSerde
-  host_packages:
-  - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/ld_impl_linux-aarch64-2.46.1-default_h1979696_103.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libexpat-2.8.5-h4154aff_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libffi-3.7.0-hdaad0be_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libgcc-16.2.0-h205dda4_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libgomp-16.2.0-h8acb6b2_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/liblzma-5.8.3-he30d5cf_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libmpdec-4.0.0-he30d5cf_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libpython-3.14.9-h150030a_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libsqlite-3.54.1-hd26f1b6_100.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libuuid-2.42.4-hd6fdeab_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libzlib-1.3.2-hdc9db2a_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/ncurses-6.6-h2b6f883_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/openssl-3.6.5-he6ad1d5_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/python-3.14.9-hbec3b18_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/readline-8.3-ha7194a6_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/zstd-1.5.7-h9d15635_7.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-- conda_source: emberjson[a274493a] @ ../EmberJson
-  variants:
-    target_platform: linux-64
-  depends:
-  - emberserde
-  - mojo-compiler ==1.2.0
-  source_depends:
-    emberserde:
-      path: ../EmberSerde
-  build_packages:
-  - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_103.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgcc-16.2.0-ha9f2e26_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgomp-16.2.0-he0feb66_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libmpdec-4.0.0-hb03c661_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.9-hd51c5da_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libsqlite-3.54.1-h0737f62_100.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/openssl-3.6.5-h781a0a9_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/python-3.14.9-hcd007b5_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-  - conda_source: emberserde[1555327a] @ ../EmberSerde
-  host_packages:
-  - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_103.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgcc-16.2.0-ha9f2e26_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgomp-16.2.0-he0feb66_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libmpdec-4.0.0-hb03c661_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.9-hd51c5da_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libsqlite-3.54.1-h0737f62_100.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/openssl-3.6.5-h781a0a9_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/python-3.14.9-hcd007b5_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-- conda_source: emberjson[f2005282] @ ../EmberJson
+- conda_source: mojo-wayland[54f09b4b] @ ../mojo-wayland
   variants:
     target_platform: osx-arm64
-  depends:
-  - emberserde
-  - mojo-compiler ==1.2.0
-  source_depends:
-    emberserde:
-      path: ../EmberSerde
-  build_packages:
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/bzip2-1.0.8-h4e30115_10.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libexpat-2.8.5-h6111c0a_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libffi-3.7.0-h47dc5ef_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/liblzma-5.8.3-h8088a28_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libmpdec-4.0.0-h84a0fba_2.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libpython-3.14.9-h281bc5c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libsqlite-3.54.1-h34a968b_100.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libzlib-1.3.2-h8088a28_3.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/ncurses-6.6-he64c551_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/openssl-3.6.5-h55eecbc_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/python-3.14.9-h0ae1c2c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/readline-8.3-h8b90a29_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/tk-8.6.13-hbeba79b_4.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
-  - conda_source: emberserde[6e645af1] @ ../EmberSerde
-  host_packages:
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/bzip2-1.0.8-h4e30115_10.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libexpat-2.8.5-h6111c0a_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libffi-3.7.0-h47dc5ef_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/liblzma-5.8.3-h8088a28_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libmpdec-4.0.0-h84a0fba_2.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libpython-3.14.9-h281bc5c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libsqlite-3.54.1-h34a968b_100.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libzlib-1.3.2-h8088a28_3.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/ncurses-6.6-he64c551_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/openssl-3.6.5-h55eecbc_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/python-3.14.9-h0ae1c2c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/readline-8.3-h8b90a29_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/tk-8.6.13-hbeba79b_4.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
-- conda_source: emberserde[1555327a] @ ../EmberSerde
-  variants:
-    target_platform: linux-64
-  depends:
-  - mojo-compiler >=1.2.0.dev2026092805,<2
-  build_packages:
-  - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_103.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgcc-16.2.0-ha9f2e26_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgomp-16.2.0-he0feb66_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libmpdec-4.0.0-hb03c661_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.9-hd51c5da_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libsqlite-3.54.1-h0737f62_100.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/openssl-3.6.5-h781a0a9_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/python-3.14.9-hcd007b5_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-- conda_source: emberserde[6e645af1] @ ../EmberSerde
-  variants:
-    target_platform: osx-arm64
-  depends:
-  - mojo-compiler >=1.2.0.dev2026092805,<2
-  build_packages:
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/bzip2-1.0.8-h4e30115_10.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libexpat-2.8.5-h6111c0a_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libffi-3.7.0-h47dc5ef_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/liblzma-5.8.3-h8088a28_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libmpdec-4.0.0-h84a0fba_2.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libpython-3.14.9-h281bc5c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libsqlite-3.54.1-h34a968b_100.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libzlib-1.3.2-h8088a28_3.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/ncurses-6.6-he64c551_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/openssl-3.6.5-h55eecbc_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/python-3.14.9-h0ae1c2c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/readline-8.3-h8b90a29_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/tk-8.6.13-hbeba79b_4.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
-- conda_source: emberserde[e43e04f8] @ ../EmberSerde
-  variants:
-    target_platform: linux-aarch64
-  depends:
-  - mojo-compiler >=1.2.0.dev2026092805,<2
-  build_packages:
-  - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/ld_impl_linux-aarch64-2.46.1-default_h1979696_103.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libexpat-2.8.5-h4154aff_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libffi-3.7.0-hdaad0be_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libgcc-16.2.0-h205dda4_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libgomp-16.2.0-h8acb6b2_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/liblzma-5.8.3-he30d5cf_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libmpdec-4.0.0-he30d5cf_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libpython-3.14.9-h150030a_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libsqlite-3.54.1-hd26f1b6_100.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libuuid-2.42.4-hd6fdeab_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/libzlib-1.3.2-hdc9db2a_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/ncurses-6.6-h2b6f883_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/openssl-3.6.5-he6ad1d5_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/python-3.14.9-hbec3b18_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/readline-8.3-ha7194a6_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
-  - conda: https://prefix.dev/conda-forge/linux-aarch64/zstd-1.5.7-h9d15635_7.conda
-  - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
-  - conda: https://prefix.dev/conda-forge/noarch/python_abi-3.14-9_cp314.conda
-  - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-- conda_source: mojo-wayland[48f675ce] @ ../mojo-wayland
-  variants:
-    target_platform: linux-64
   depends:
   - mojo ==1.2.0
   host_packages:
-  - conda: https://conda.modular.com/max/linux-64/mojo-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.2.0-release.conda
   - conda: https://conda.modular.com/max/noarch/mblack-26.7.0-release.conda
   - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/keyutils-1.6.3-h7cc23a3_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/krb5-1.22.2-hbc21106_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_103.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libedit-3.1.20260512-pl5321h373387f_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgcc-16.2.0-ha9f2e26_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libgomp-16.2.0-he0feb66_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libmpdec-4.0.0-hb03c661_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.9-hd51c5da_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libsodium-1.0.22-hebe6cf0_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libsqlite-3.54.1-h0737f62_100.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libstdcxx-16.2.0-h934c35e_7.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_3.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/openssl-3.6.5-h781a0a9_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/python-3.14.9-hcd007b5_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/pyzmq-27.2.0-py312h8a5ba0d_2.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/tornado-6.5.10-py314h89acca1_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/zeromq-4.3.5-h901266b_12.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
+  - conda: https://conda.modular.com/max/osx-arm64/mojo-1.2.0-release.conda
+  - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.2.0-release.conda
   - conda: https://prefix.dev/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
   - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/click-8.5.0-pyh5ded981_0.conda
@@ -8308,7 +8020,28 @@ packages:
   - conda: https://prefix.dev/conda-forge/noarch/traitlets-5.16.1-pyhcf101f3_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
-- conda_source: mojo-wayland[639e2477] @ ../mojo-wayland
+  - conda: https://prefix.dev/conda-forge/osx-arm64/bzip2-1.0.8-h4e30115_10.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/krb5-1.22.2-h34f8a20_2.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libcxx-23.1.4-h55c6f16_2.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libedit-3.1.20260512-pl5321h26f1114_0.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libexpat-2.8.5-h6111c0a_0.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libffi-3.7.0-h47dc5ef_1.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/liblzma-5.8.3-h8088a28_1.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libmpdec-4.0.0-h84a0fba_2.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libpython-3.14.9-h281bc5c_100_cp314.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libsodium-1.0.22-h74c22ad_3.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libsqlite-3.54.1-h34a968b_100.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/libzlib-1.3.2-h8088a28_3.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/ncurses-6.6-he64c551_1.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/openssl-3.6.5-h55eecbc_0.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/python-3.14.9-h0ae1c2c_100_cp314.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/pyzmq-27.2.0-py312hdfb5542_2.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/readline-8.3-h8b90a29_1.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/tk-8.6.13-hbeba79b_4.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/tornado-6.5.10-py314hcd3153d_0.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/zeromq-4.3.5-h6eb0046_12.conda
+  - conda: https://prefix.dev/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
+- conda_source: mojo-wayland[b2c8d957] @ ../mojo-wayland
   variants:
     target_platform: linux-aarch64
   depends:
@@ -8365,16 +8098,43 @@ packages:
   - conda: https://prefix.dev/conda-forge/noarch/traitlets-5.16.1-pyhcf101f3_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
-- conda_source: mojo-wayland[b6f5d084] @ ../mojo-wayland
+- conda_source: mojo-wayland[fae48cd5] @ ../mojo-wayland
   variants:
-    target_platform: osx-arm64
+    target_platform: linux-64
   depends:
   - mojo ==1.2.0
   host_packages:
+  - conda: https://conda.modular.com/max/linux-64/mojo-1.2.0-release.conda
+  - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.2.0-release.conda
   - conda: https://conda.modular.com/max/noarch/mblack-26.7.0-release.conda
   - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/osx-arm64/mojo-1.2.0-release.conda
-  - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.2.0-release.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/keyutils-1.6.3-h7cc23a3_1.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/krb5-1.22.2-hbc21106_2.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_103.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libedit-3.1.20260512-pl5321h373387f_0.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libgcc-16.2.0-ha9f2e26_7.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libgomp-16.2.0-he0feb66_7.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libmpdec-4.0.0-hb03c661_2.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.9-hd51c5da_100_cp314.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libsodium-1.0.22-hebe6cf0_3.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libsqlite-3.54.1-h0737f62_100.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libstdcxx-16.2.0-h934c35e_7.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_3.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/openssl-3.6.5-h781a0a9_0.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/python-3.14.9-hcd007b5_100_cp314.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/pyzmq-27.2.0-py312h8a5ba0d_2.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/tornado-6.5.10-py314h89acca1_0.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/zeromq-4.3.5-h901266b_12.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
   - conda: https://prefix.dev/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
   - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/click-8.5.0-pyh5ded981_0.conda
@@ -8395,27 +8155,6 @@ packages:
   - conda: https://prefix.dev/conda-forge/noarch/traitlets-5.16.1-pyhcf101f3_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
   - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/bzip2-1.0.8-h4e30115_10.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/krb5-1.22.2-h34f8a20_2.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libcxx-23.1.4-h55c6f16_2.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libedit-3.1.20260512-pl5321h26f1114_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libexpat-2.8.5-h6111c0a_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libffi-3.7.0-h47dc5ef_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/liblzma-5.8.3-h8088a28_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libmpdec-4.0.0-h84a0fba_2.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libpython-3.14.9-h281bc5c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libsodium-1.0.22-h74c22ad_3.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libsqlite-3.54.1-h34a968b_100.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/libzlib-1.3.2-h8088a28_3.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/ncurses-6.6-he64c551_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/openssl-3.6.5-h55eecbc_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/python-3.14.9-h0ae1c2c_100_cp314.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/pyzmq-27.2.0-py312hdfb5542_2.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/readline-8.3-h8b90a29_1.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/tk-8.6.13-hbeba79b_4.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/tornado-6.5.10-py314hcd3153d_0.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/zeromq-4.3.5-h6eb0046_12.conda
-  - conda: https://prefix.dev/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
 - pypi: https://files.pythonhosted.org/packages/18/24/bad3ac4271589df29cf5ce2f5ae490518a5739358052bd0d61209e6fea54/charset_normalizer-3.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
   name: charset-normalizer
   version: 3.5.2

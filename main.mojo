@@ -30,6 +30,7 @@ from resources.palette import (
     BG_GRADIENT_TOP,
     GREEN,
     ERROR_COLOR,
+    TEXT_DIM,
 )
 from resources.plex_objects import LibraryItem, ServerItem, PlexBookCard
 from resources.offline_library import (
@@ -39,12 +40,12 @@ from resources.offline_library import (
     delete_saved_book,
 )
 from functions.offline_sync import sync_saved_sidecars
-from render.imui import UIContext
+from render.imui import UIContext, NavState
 from ui import Screen
 from ui.font import FontSet
 from ui.library_screen import LibraryScreen
 from ui.login_screen import LoginScreen
-from ui.player_screen import PlayerScreen
+from ui.player_screen import PlayerScreen, OVERLAY_NONE
 from ui.selection_screen import SelectionScreen
 from ui.settings_screen import SettingsScreen
 
@@ -269,6 +270,12 @@ def main() raises:
     var pad_box = alloc(Layout[Gamepad](count=1)).unsafe_leak()
     pad_box.unsafe_write(pad^)
 
+    # Spatial navigation state (gamepad dpad + arrow keys): heap-boxed,
+    # same pattern as the boxes above (the engine needs cross-frame rect
+    # memory; UIContext is rebuilt every frame and borrows the box).
+    var nav_box = alloc(Layout[NavState](count=1)).unsafe_leak()
+    nav_box.unsafe_write(NavState())
+
     # Main loop — poll libinput + Wayland events, dispatch, render to the
     # wl_shm buffer, present. The window.poll() close signal exits.
     var frame_n = 0
@@ -283,19 +290,7 @@ def main() raises:
 
         # IMUI handles clicks inside each screen's draw() method — no
         # separate click dispatch is needed. Keyboard routing below only
-        # covers retained-state paths (Enter-to-connect, search typing).
-
-        # --- Window size (compositor reconfigures rebuild both frames via
-        # Window.rebuild_frame; canvas_box rebinds to the new draw buffer).
-
-        # Scroll (retained-state paths only; draw() reads ui for the rest)
-
-        # Keyboard (retained-tate paths only; draw() reads ui for the rest)
-        if screen.current == 0:
-            login.handle_keyboard(
-                win.input.frame_key_pressed(KEY_ENTER),
-                app_state,
-            )
+        # covers retained-state paths (search typing).
 
         # --- Pagination requests from the library screen ---
         # draw() sets next_page_requested/prev_page_requested; we re-fetch
@@ -541,10 +536,29 @@ def main() raises:
         # NOTE: library (1) has no escape-back on purpose — the Selection
         # screen is reachable only via the Settings screen's SELECT LIBRARY
         # button, so a stray Esc can't bounce the user out of the library.
-        if win.input.frame_key_pressed(KEY_ESCAPE):
+        # Gamepad B (RIGHT_FACE_RIGHT, the back_button bind) mirrors Esc.
+        var back_now = win.input.frame_key_pressed(KEY_ESCAPE)
+        if (
+            not back_now
+            and win.input.focused
+            and pad_ok
+            and pad_box[unsafe_offset=0].was_pressed(6)
+        ):
+            back_now = True  # gamepad B face button
+        if back_now:
             if screen.current == 3:
-                # Selection screen: back to login
-                screen.current = 0
+                if selection.phase == 1:
+                    # Mirror the selection screen's BACK click: lift back
+                    # to the server list, not out to login.
+                    selection.phase = 0
+                    selection.selected_library_idx = -1
+                    selection.libraries = List[LibraryItem]()
+                    selection.scroll_offset = 0.0
+                    selection.status_message = "Select a server"
+                    selection.status_color = TEXT_DIM
+                else:
+                    # Selection screen: back to login
+                    screen.current = 0
             elif screen.current == 2:
                 # Player → Library, stop audio
                 player.stop_and_unload_stream()
@@ -713,10 +727,32 @@ def main() raises:
             1.0,
             font_multiplier,
             Optional[Pointer[Gamepad, MutUntrackedOrigin]](pad_box),
+            Optional[Pointer[NavState, MutUntrackedOrigin]](nav_box),
+            screen.current,
+            # Rebind capture owns the pad while the settings screen waits
+            # for a button (nav must not eat the press being captured).
+            not (
+                screen.current == 4
+                and settings.rebinding_action.byte_length() > 0
+            ),
+            # The player screen's base layout owns left/right for the ±30s
+            # seeks; overlays (chapter drawer / popovers) hand them back.
+            screen.current != 2 or player.overlay_mode != OVERLAY_NONE,
         )
 
         # Library search input consumes keystrokes via the UI context.
         library.handle_keyboard(ui, ascii)
+
+        # Login Enter-to-connect runs AFTER the UI context consumed the
+        # frame's nav edges: a dpad/gamepad-focused connect button must
+        # not double-fire the OAuth flow (its activation fires at draw
+        # time), so plain-Enter only connects when nothing is focused.
+        if screen.current == 0:
+            login.handle_keyboard(
+                win.input.frame_key_pressed(KEY_ENTER)
+                and ui.nav_focused_id() < 0,
+                app_state,
+            )
 
         canvas_box[unsafe_offset=0].clear_gradient(
             BG_GRADIENT_TOP, BG_GRADIENT_BOTTOM

@@ -41,9 +41,21 @@ def write_be32(mut buf: List[UInt8], value: UInt32):
 
 
 def write_ascii(mut buf: List[UInt8], text: String):
-    """Append ASCII string bytes to the buffer."""
-    for i in range(text.byte_length()):
-        buf.append(UInt8(ord(text[byte=i])))
+    """Append ASCII string bytes to the buffer.
+
+    Non-ASCII codepoints collapse to '?' instead of aborting: the old
+    byte-walk panicked at the first multi-byte character ("String span
+    index ... does not lie on a codepoint boundary") and image
+    metadata/captions can carry non-ASCII text.
+    """
+    for cp_slice in text.codepoint_slices():
+        var w = cp_slice.byte_length()
+        if w == 1:
+            var cp = ord(String(cp_slice))
+            if cp < 0x80:
+                buf.append(UInt8(cp))
+                continue
+        buf.append(UInt8(0x3F))
 
 
 def append_bytes(mut buf: List[UInt8], data: List[UInt8]):

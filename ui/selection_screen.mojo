@@ -6,7 +6,8 @@ from resources.keys import (
     KEY_DELETE,
     KEY_ESCAPE,
 )
-from render.imui import UIContext, UIResult, Vec2, Rect
+from std.math import max
+from render.imui import UIContext, UIResult, Vec2, Rect, NAV_DOWN, NAV_UP
 
 from functions.helpers import (
     format_time,
@@ -269,6 +270,7 @@ struct SelectionScreen:
                 self.scroll_offset = 0.0
                 self.status_message = "Select a server"
                 self.status_color = TEXT_DIM
+                ui.nav_reset()
             else:
                 screen.current = 0
             return
@@ -304,6 +306,35 @@ struct SelectionScreen:
         var scroll_design = Float64(self.scroll_offset) / Float64(ui.ui_scale)
         var list_y_design = list_top - scroll_design
 
+        # Scroll-region hint + edge scrolling for the card list (nav
+        # region 1): a held dpad walks the cards, scrolling at the edges.
+        var nav_item_count = len(self.servers)
+        if self.phase == 1:
+            nav_item_count = len(self.libraries)
+        var nav_total = Float64(nav_item_count) * (card_h + card_gap) - card_gap
+        var nav_scroll_design = Float64(self.scroll_offset) / Float64(
+            ui.ui_scale
+        )
+        ui.nav_scroll_hint(
+            1,
+            nav_scroll_design > 0.5,
+            (nav_total - nav_scroll_design) > Float64(list_height) + 0.5,
+        )
+        var nav_stride = card_h + card_gap
+        if ui.nav_scroll_edge(1, NAV_DOWN):
+            self.scroll_offset = Float32(
+                Float64(self.scroll_offset) + nav_stride * Float64(ui.ui_scale)
+            )
+            var nav_max = Float32(max(nav_total - Float64(list_height), 0.0))
+            if self.scroll_offset > nav_max:
+                self.scroll_offset = nav_max
+        elif ui.nav_scroll_edge(1, NAV_UP):
+            self.scroll_offset = Float32(
+                Float64(self.scroll_offset) - nav_stride * Float64(ui.ui_scale)
+            )
+            if self.scroll_offset < 0.0:
+                self.scroll_offset = 0.0
+
         if self.phase == 0:
             # --- Server cards ---
             for i in range(len(self.servers)):
@@ -318,7 +349,7 @@ struct SelectionScreen:
 
                 var selected = i == self.selected_server_idx
                 var row_result = ui.selectable_row(
-                    card_pad, card_y, card_w, card_h, selected
+                    card_pad, card_y, card_w, card_h, selected, region=1
                 )
 
                 if row_result.clicked:
@@ -329,6 +360,7 @@ struct SelectionScreen:
                     # main.mojo consumes the flag next frame and runs
                     # load_libraries() outside the render loop.
                     self.libraries_requested = True
+                    ui.nav_reset()
                     ui.end_clip()
                     return
 
@@ -420,7 +452,7 @@ struct SelectionScreen:
 
                 var selected = i == self.selected_library_idx
                 var row_result = ui.selectable_row(
-                    card_pad, card_y, card_w, card_h, selected
+                    card_pad, card_y, card_w, card_h, selected, region=1
                 )
 
                 if row_result.clicked:

@@ -14,7 +14,15 @@ from resources.keys import (
     KEY_DELETE,
     KEY_ESCAPE,
 )
-from render.imui import DESIGN_W, UIContext, UIResult, Vec2, Rect
+from render.imui import (
+    DESIGN_W,
+    UIContext,
+    UIResult,
+    Vec2,
+    Rect,
+    NAV_DOWN,
+    NAV_UP,
+)
 
 from functions.helpers import (
     format_time,
@@ -1202,18 +1210,20 @@ struct PlayerScreen:
         if ok and was_playing:
             self.audio_backend.play()
 
-    def _set_overlay(mut self, mode: Int):
+    def _set_overlay(mut self, mut ui: UIContext, mode: Int):
         """Open one overlay (or close everything). Mutually exclusive.
 
         Reopening the same mode closes it — a toggle, so a rail icon is its
         own dismiss control. Switching modes resets the slide animation
-        (instant appearance of the new panel)."""
+        (instant appearance of the new panel) and drops the spatial-nav
+        focus (the node set changes completely under the new panel)."""
         if self.overlay_mode == mode:
             self.overlay_mode = OVERLAY_NONE
         else:
             self.overlay_mode = mode
         self.overlay_armed = True
         self.chapter_scroll_offset = 0.0
+        ui.nav_reset()
 
     def _skip(mut self, seconds: Float64) raises:
         """Skip by signed seconds, clamped and streamed consistently."""
@@ -1424,6 +1434,8 @@ struct PlayerScreen:
         ui.label(title, title_size, TEXT_BRIGHT)
 
         # Top-right stubs — global settings + history (not implemented).
+        # Not focusable (region -1): dead controls must not collect a
+        # spatial-nav walk in the header.
         var stub_size = 80.0
         var stub_y = 8.0
         var stub_gap = 16.0
@@ -1437,6 +1449,7 @@ struct PlayerScreen:
             PLAYER_BG,
             TEXT_DIM,
             Color(30, 60, 74, 255),
+            region=-1,
         )
         var head_x = stubs_x + stub_size + stub_gap
         var headphones_stub = ui.button_at(
@@ -1448,6 +1461,7 @@ struct PlayerScreen:
             PLAYER_BG,
             TEXT_DIM,
             Color(30, 60, 74, 255),
+            region=-1,
         )
         if list_stub.clicked or headphones_stub.clicked:
             pass  # stubs: global settings / history — wired in a later pass
@@ -1654,7 +1668,7 @@ struct PlayerScreen:
             Color(30, 60, 74, 255),
         )
         if layers_result.clicked:
-            self._set_overlay(OVERLAY_CHAPTERS)
+            self._set_overlay(ui, OVERLAY_CHAPTERS)
 
         # Sliders → settings popover (speed + volume)
         var tune_y = rail_y + btn + gap
@@ -1669,7 +1683,7 @@ struct PlayerScreen:
             Color(30, 60, 74, 255),
         )
         if tune_result.clicked:
-            self._set_overlay(OVERLAY_SETTINGS)
+            self._set_overlay(ui, OVERLAY_SETTINGS)
 
         # Info → book details popover
         var info_y = rail_y + 2.0 * (btn + gap)
@@ -1684,7 +1698,7 @@ struct PlayerScreen:
             Color(30, 60, 74, 255),
         )
         if info_result.clicked:
-            self._set_overlay(OVERLAY_INFO)
+            self._set_overlay(ui, OVERLAY_INFO)
 
     # ------------------------------------------------------------------
     # Right rail — ±30s skips and circled play/pause
@@ -1922,6 +1936,7 @@ struct PlayerScreen:
         )
         if close_result.clicked:
             self.overlay_mode = OVERLAY_NONE
+            ui.nav_reset()
             return
 
         # Scrollable chapter rows.
@@ -1933,6 +1948,34 @@ struct PlayerScreen:
         var list_top = y + DRAWER_TITLE_ROW
         var list_h = h - DRAWER_TITLE_ROW - DRAWER_PAD_BOTTOM
         var chap_h = CHAPTER_ROW_H
+
+        # Scroll region for the spatial-nav engine: the chapter rows are
+        # nav region 1 of this screen; the hint lets a held dpad scroll
+        # the drawer instead of escaping into the close button.
+        var nav_scroll_design = Float64(self.chapter_scroll_offset) / Float64(
+            ui.ui_scale
+        )
+        var nav_total = Float64(len(self.chapters)) * Float64(chap_h)
+        ui.nav_scroll_hint(
+            1,
+            nav_scroll_design > 0.5,
+            (nav_total - nav_scroll_design) > Float64(list_h) + 0.5,
+        )
+        if ui.nav_scroll_edge(1, NAV_DOWN):
+            self.chapter_scroll_offset = Float32(
+                Float64(self.chapter_scroll_offset)
+                + Float64(chap_h) * Float64(ui.ui_scale)
+            )
+            var max_scroll = Float32(nav_total - Float64(list_h))
+            if self.chapter_scroll_offset > max_scroll:
+                self.chapter_scroll_offset = max_scroll
+        elif ui.nav_scroll_edge(1, NAV_UP):
+            self.chapter_scroll_offset = Float32(
+                Float64(self.chapter_scroll_offset)
+                - Float64(chap_h) * Float64(ui.ui_scale)
+            )
+            if self.chapter_scroll_offset < 0.0:
+                self.chapter_scroll_offset = 0.0
 
         ui.begin_clip(x, list_top, w, list_h)
 
@@ -1996,9 +2039,15 @@ struct PlayerScreen:
             ui.move_to(dur_x, row_y + 42.0)
             ui.label(duration_text, 14, TEXT_MUTED)
 
-            # Click detection for chapter row (same rect as drawn).
+            # Click detection for chapter row (same rect as drawn), plus
+            # the spatial-nav registration: A on the focused row seeks to
+            # the chapter, same as clicking it.
             var click_rect = ui.rect(x + 10.0, row_y, w - 20.0, chap_h)
-            if ui._clicked(click_rect):
+            var row_nav = ui.nav_node(click_rect, 1)
+            var row_activated = ui.nav_activated(row_nav)
+            if ui.nav_focused(row_nav):
+                ui.focus_ring(click_rect)
+            if row_activated or ui._clicked(click_rect):
                 self.current_time = Float64(chap.start_time_ms) / 1000.0
                 self._update_current_chapter()
                 self._seek_to_current()
@@ -2035,6 +2084,7 @@ struct PlayerScreen:
         )
         if close_result.clicked:
             self.overlay_mode = OVERLAY_NONE
+            ui.nav_reset()
             return
 
         var row_y = y + 70.0
@@ -2147,6 +2197,7 @@ struct PlayerScreen:
         )
         if close_result.clicked:
             self.overlay_mode = OVERLAY_NONE
+            ui.nav_reset()
             return
 
         var text_x = x + 24.0

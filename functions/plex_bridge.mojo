@@ -2,10 +2,13 @@
 
 HTTP calls go through Python httpx (Mojo has no native HTTP client yet),
 but the Python boundary is narrow: _http_get and _http_post_form are the
-only functions that touch PythonObject, and they return a parsed emberjson
-Value — every endpoint downstream is pure Mojo working on checked JSON
-accessors. Headers live in the native PlexHeaders struct and only cross
-into Python at the httpx call sites.
+only functions that touch PythonObject, and they return a parsed
+XmlElement — every endpoint downstream is pure Mojo working on checked
+XML accessors. Plex is asked for XML on every transport (Accept:
+application/xml, plex.tv v2 included) and the responses parse in pure
+Mojo with resources.xmlparse — no JSON parser anywhere. Headers live in
+the native PlexHeaders struct and only cross into Python at the httpx
+call sites.
 """
 
 from std.logger import Logger, Level
@@ -14,9 +17,6 @@ from std.python.conversions import ConvertibleToPython
 from std.os import makedirs, path, remove, getenv
 from std.pathlib import Path
 from std.time import perf_counter
-
-from emberjson import from_json, Value, Object
-from emberjson.array import Array as JsonArray
 
 from functions.helpers import _mojo_rename
 from resources.xmlparse import parse_xml, XmlElement
@@ -106,26 +106,56 @@ def _percent_encode(s: String) -> String:
     """Percent-encode a string for URL query parameters (RFC 3986).
 
     Encodes everything except unreserved characters (A-Z, a-z, 0-9, -._~).
-    Spaces become %20 (not +). Replaces Python urllib.parse.quote.
+    Spaces become %20 (not +). Multi-byte UTF-8 codepoints encode
+    byte-by-byte per RFC 3986 (each UTF-8 byte is its own %XX escape).
+
+    Walks codepoint slices, not byte indices: a byte cursor panics the
+    moment a string carries one non-ASCII character ("String span index,
+    N does not lie on a codepoint boundary" — an uncatchable abort that
+    used to kill the app whenever a search query held an accented char,
+    a curly quote, an ellipsis, ...).
     """
     var result = String()
-    for i in range(s.byte_length()):
-        var ch = s[byte=i]
-        var code = ord(ch)
-        var is_unreserved = (
-            (code >= ord("A") and code <= ord("Z"))
-            or (code >= ord("a") and code <= ord("z"))
-            or (code >= ord("0") and code <= ord("9"))
-            or ch == "-"
-            or ch == "."
-            or ch == "_"
-            or ch == "~"
-        )
-        if is_unreserved:
-            result += String(ch)
+    for cp_slice in s.codepoint_slices():
+        var cp = ord(String(cp_slice))
+        var w = cp_slice.byte_length()
+        if w == 1:
+            if _is_unreserved(cp):
+                result += String(cp_slice)
+            else:
+                result += "%" + _hex_digit(cp >> 4) + _hex_digit(cp & 0xF)
         else:
-            result += "%" + _hex_digit(code >> 4) + _hex_digit(code & 0xF)
+            # Standard UTF-8 lead + continuation bytes for this codepoint.
+            var utf8 = List[UInt8]()
+            if w == 2:
+                utf8.append(UInt8(0xC0 | (cp >> 6)))
+                utf8.append(UInt8(0x80 | (cp & 0x3F)))
+            elif w == 3:
+                utf8.append(UInt8(0xE0 | (cp >> 12)))
+                utf8.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
+                utf8.append(UInt8(0x80 | (cp & 0x3F)))
+            else:
+                utf8.append(UInt8(0xF0 | (cp >> 18)))
+                utf8.append(UInt8(0x80 | ((cp >> 12) & 0x3F)))
+                utf8.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
+                utf8.append(UInt8(0x80 | (cp & 0x3F)))
+            for i in range(len(utf8)):
+                var b = Int(utf8[i])
+                result += "%" + _hex_digit(b >> 4) + _hex_digit(b & 0xF)
     return result
+
+
+def _is_unreserved(cp: Int) -> Bool:
+    """RFC 3986 unreserved characters (their UTF-8 byte equals the cp)."""
+    return (
+        (cp >= ord("A") and cp <= ord("Z"))
+        or (cp >= ord("a") and cp <= ord("z"))
+        or (cp >= ord("0") and cp <= ord("9"))
+        or cp == ord("-")
+        or cp == ord(".")
+        or cp == ord("_")
+        or cp == ord("~")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +235,7 @@ def plex_headers(
         cid = get_or_create_client_id()
 
     var headers = PlexHeaders()
-    headers["Accept"] = "application/json"
+    headers["Accept"] = "application/xml"
     headers["X-Plex-Product"] = PRODUCT_NAME
     headers["X-Plex-Version"] = PRODUCT_VERSION
     headers["X-Plex-Client-Identifier"] = cid
@@ -259,13 +289,14 @@ def _httpx_module() raises -> PythonObject:
 
 def _http_get(
     url: String, headers: PlexHeaders, timeout: Float64 = 30.0
-) raises -> Value:
-    """GET via httpx, parse the body into an emberjson Value.
+) raises -> XmlElement:
+    """GET via httpx, parse the body into an XmlElement.
 
     The Python boundary: httpx runs here, and the response text crosses
-    back as a String exactly once. Callers get a parsed Value — checked,
-    native Mojo from here down.
-    """
+    back as a String exactly once. Callers get a parsed element tree —
+    native Mojo from here down. Plex serves XML on every transport the
+    bridge uses (Accept: application/xml); a non-XML body fails to parse
+    and callers' existing catch-and-degrade paths handle it."""
     var httpx = _httpx_module()
 
     var logger = Logger[LOG_LEVEL]()
@@ -285,9 +316,8 @@ def _http_get(
 
     resp.raise_for_status()
 
-    var content_type = String(resp.headers.get("content-type", ""))
     var text = String(resp.text)
-    return _parse_payload(text, content_type)
+    return parse_xml(text)
 
 
 def _http_post_form(
@@ -295,8 +325,9 @@ def _http_post_form(
     headers: PlexHeaders,
     body: Dict[String, String],
     timeout: Float64 = 30.0,
-) raises -> Value:
-    """POST with urlencoded form body, parse the response into a Value.
+) raises -> XmlElement:
+    """POST with urlencoded form body, parse the response into an
+    XmlElement.
 
     Companion to _http_get — same Python boundary, native Mojo inputs.
     """
@@ -328,63 +359,99 @@ def _http_post_form(
 
     resp.raise_for_status()
 
-    var content_type = String(resp.headers.get("content-type", ""))
     var text = String(resp.text)
-    return _parse_payload(text, content_type)
-
-
-def _parse_payload(text: String, content_type: String) raises -> Value:
-    """Parse a response body into a Value by sniffing JSON vs XML vs raw.
-
-    Both JSON (emberjson) and XML (resources.xmlparse) parse in pure
-    Mojo — the only Python left in this module is httpx itself.
-    Anything non-JSON/XML wraps as {"raw": text}.
-    """
-    var stripped = text.strip()
-
-    if (
-        content_type.find("json") >= 0
-        or stripped.startswith("{")
-        or stripped.startswith("[")
-    ):
-        return from_json[Value](text)
-    elif content_type.find("xml") >= 0 or stripped.startswith("<"):
-        return _xml_element_to_value(parse_xml(text))
-    else:
-        var raw = Object()
-        raw["raw"] = Value(text)
-        return Value(raw^)
+    return parse_xml(text)
 
 
 # ---------------------------------------------------------------------------
-# XML parsing (pure Mojo — resources.xmlparse)
+# XML accessors — Plex's attribute-typed surface. PMS protocol-1 XML and
+# the plex.tv v2 serializer both ride attributes (element fields never
+# have child text), so every field read is an attribute read, typed
+# through these guards instead of trusting the wire.
 # ---------------------------------------------------------------------------
 
 
-def _xml_element_to_value(elem: XmlElement) raises -> Value:
-    """XmlElement -> emberjson Value, reproducing the old element_to_dict:
-    attributes ride the same map as children; a tag appearing once is a
-    single object, twice becomes an array (first occurrence hoisted)."""
-    var obj = Object()
-    # Attributes first — a colliding child tag overwrites, matching the
-    # old dict-attrib-then-child-insertion order.
-    for entry in elem.attrs.items():
-        obj[entry.key] = Value(entry.value)
-    for i in range(len(elem.children)):
-        ref child = elem.children[i]
-        if child.tag in obj:
-            var existing = obj[child.tag].copy()
-            if existing.is_array():
-                existing.array().append(_xml_element_to_value(child))
-                obj[child.tag] = existing^
-            else:
-                var both = JsonArray()
-                both.append(existing^)
-                both.append(_xml_element_to_value(child))
-                obj[child.tag] = Value(both^)
-        else:
-            obj[child.tag] = _xml_element_to_value(child)
-    return Value(obj^)
+def _tag_eq(tag: String, want: String) -> Bool:
+    """Case-insensitive tag comparison. PMS protocol-1 XML is PascalCase
+    (MediaContainer, Metadata); plex.tv v2 serializes the JSON keys as
+    lowercase tags (pin, resource)."""
+    if tag == want:
+        return True
+    return tag.lower() == want.lower()
+
+
+def _has(v: XmlElement, key: String) -> Bool:
+    """True when v carries key as an attribute."""
+    return key in v.attrs
+
+
+def _vstr(v: XmlElement, key: String, default: String = "") -> String:
+    """Field as String — attributes arrive as text; no coercion needed."""
+    if key in v.attrs:
+        return String(v.attrs.get(key, default))
+    return default
+
+
+def _vint(v: XmlElement, key: String, default: Int = 0) -> Int:
+    """Field as Int. Plex XML encodes every field as text; strict parse,
+    garbage falls back to the default."""
+    if key in v.attrs:
+        var raw = String(v.attrs.get(key, ""))
+        if raw.byte_length() == 0:
+            return default
+        try:
+            return Int(raw)
+        except:
+            return default
+    return default
+
+
+def _vtruthy(v: XmlElement, key: String, default: Bool = False) -> Bool:
+    """Field as Bool. XML booleans are textual: "1" (PMS protocol-1 and
+    plex.tv v2 — pin XML shows trusted="0") or "true"; anything else is
+    False."""
+    if key in v.attrs:
+        var raw = String(v.attrs.get(key, ""))
+        return raw == "1" or raw == "true"
+    return default
+
+
+def _container_of(
+    var data: XmlElement, key: String = "MediaContainer"
+) raises -> XmlElement:
+    """Unwrap the envelope element; pass the element through when absent.
+
+    Covers both shapes the bridge sees: a root MediaContainer whose
+    children are the payload (PMS listings), and a bare typed root
+    (PlayQueue, pin, user /resource entries)."""
+    for i in range(len(data.children)):
+        if _tag_eq(data.children[i].tag, key):
+            return data.children[i].copy()
+    return data^
+
+
+def _vitems(
+    v: XmlElement, tag: String, alt: String = ""
+) raises -> List[XmlElement]:
+    """Direct children tagged `tag`, as a fresh list.
+
+    Exact-tag pass, then case-insensitive (protocol-1 PascalCase vs v2
+    lowercase), then the `alt` spelling when both miss — one call covers
+    Directory/Metadata-era shapes across servers."""
+    var out = List[XmlElement]()
+    for i in range(len(v.children)):
+        if v.children[i].tag == tag:
+            out.append(v.children[i].copy())
+    if len(out) > 0:
+        return out^
+    for i in range(len(v.children)):
+        if _tag_eq(v.children[i].tag, tag):
+            out.append(v.children[i].copy())
+    if len(out) == 0 and alt != "":
+        for i in range(len(v.children)):
+            if _tag_eq(v.children[i].tag, alt):
+                out.append(v.children[i].copy())
+    return out^
 
 
 # ---------------------------------------------------------------------------
@@ -440,12 +507,16 @@ def get_account_info(
 ) raises -> AccountInfo:
     """Fetch Plex account info (username, email, title).
 
-    GET https://plex.tv/users/account.json
-    Returns AccountInfo struct.
+    GET https://plex.tv/api/v2/user — the v1 /users/account.json route is
+    JSON-only, and this bridge is XML-only; the v2 route with Accept:
+    application/xml serves the same fields as attributes (root <user>,
+    same keys python-plexapi's MyPlexAccount reads).
+    Returns AccountInfo struct; an unreachable shape degrades to blanks
+    (same contract as before).
     """
     var headers = plex_headers(token=account_token, client_id=client_id)
     try:
-        var data = _http_get("https://plex.tv/users/account.json", headers)
+        var data = _http_get("https://plex.tv/api/v2/user", headers)
         var user = _container_of(data^, key="user")
         var result = AccountInfo()
         result.username = _vstr(user, "username")
@@ -462,103 +533,10 @@ def get_account_info(
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Value accessors — Plex's JSON typing is loose (XML-origin fields arrive as
-# strings, JSON-origin as numbers/bools), so every field read goes through
-# these guards instead of trusting the wire type.
-# ---------------------------------------------------------------------------
-
-
-def _has(v: Value, key: String) -> Bool:
-    """True when v is an object containing key."""
-    return v.is_object() and key in v.object()
-
-
-def _vstr(v: Value, key: String, default: String = "") raises -> String:
-    """Field as String. Numbers stringify (XML attrs arrive as strings;
-    JSON ints/floats coerce the same way Python's str() did)."""
-    if not _has(v, key):
-        return default
-    ref field = v[key]
-    if field.is_string():
-        return String(field.string())
-    if field.is_int() or field.is_uint():
-        return String(field.int())
-    if field.is_float():
-        return String(field.float())
-    return default
-
-
-def _vint(v: Value, key: String, default: Int = 0) raises -> Int:
-    """Field as Int. Accepts int/uint, float (truncates, matching Python's
-    int()), and numeric strings (XML-origin fields)."""
-    if not _has(v, key):
-        return default
-    ref field = v[key]
-    if field.is_int() or field.is_uint():
-        return Int(field.int())
-    if field.is_float():
-        return Int(field.float())
-    if field.is_string():
-        try:
-            return Int(field.string())
-        except:
-            return default
-    return default
-
-
-def _vtruthy(v: Value, key: String, default: Bool = False) raises -> Bool:
-    """Field as Bool. Accepts bool, "1"/"0" strings (XML origin), and
-    nonzero ints."""
-    if not _has(v, key):
-        return default
-    ref field = v[key]
-    if field.is_bool():
-        return field.bool()
-    if field.is_string():
-        return field.string() == "1"
-    if field.is_int() or field.is_uint():
-        return field.int() != 0
-    return default
-
-
-def _container_of(
-    var data: Value, key: String = "MediaContainer"
-) raises -> Value:
-    """Unwrap the MediaContainer envelope; pass through when absent."""
-    if _has(data, key):
-        return data[key].copy()
-    return data^
-
-
-def _as_items(var v: Value) raises -> List[Value]:
-    """Normalize a single object to a one-item list; pass arrays through."""
-    var out = List[Value]()
-    if v.is_array():
-        var n = len(v.array())
-        for i in range(n):
-            out.append(v[i].copy())
-    elif v.is_object():
-        out.append(v^)
-    return out^
-
-
-def _vitems(
-    v: Value,
-    key: String,
-    var default_items: List[Value] = List[Value](),
-) raises -> List[Value]:
-    """Field as a list of Values, normalized from object-or-array. Missing
-    field yields default_items."""
-    if not _has(v, key):
-        return default_items^
-    var field = v[key].copy()
-    return _as_items(field^)
-
-
-def _card_from_metadata(v: Value) raises -> PlexBookCard:
-    """One PlexBookCard from a Metadata element. Shared by every listing
-    path (library browse, search, collection members)."""
+def _card_from_metadata(v: XmlElement) raises -> PlexBookCard:
+    """One PlexBookCard from a listing (album) element. Shared by every
+    listing path (library browse, search, collection members). Album
+    listings arrive as <Directory> elements in PMS protocol-1 XML."""
     var card = PlexBookCard()
     card.rating_key = _vstr(v, "ratingKey")
     card.title = _vstr(v, "title")
@@ -579,7 +557,11 @@ def get_servers(
 ) raises -> List[ServerItem]:
     """Discover user's Plex servers via plex.tv.
 
-    Returns list of ServerItem structs.
+    GET https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1
+    XML: items are <resource ...> elements (plexapi MyPlexResource.TAG
+    is 'resource' — the v2 serializer lowercases the JSON keys), each
+    carrying its <Connection> children directly or under a <connections>
+    wrapper. Returns list of ServerItem structs.
     """
     var headers = plex_headers(token=account_token, client_id=client_id)
     var data = _http_get(
@@ -588,23 +570,32 @@ def get_servers(
     )
     var servers = List[ServerItem]()
 
-    # Normalize: array root is the server list; a single server object is
-    # the one-item case.
-    var server_list = _as_items(data^)
-    if len(server_list) == 1 and not _has(server_list[0], "name"):
+    var container = _container_of(data^)
+    var server_elems = _vitems(container, "resource", alt="Server")
+    if len(server_elems) == 0:
+        # No resource elements at all: auth error or empty account.
         return servers^
 
-    var count = len(server_list)
+    var count = len(server_elems)
     for i in range(count):
-        ref s = server_list[i]
+        ref s = server_elems[i]
         var item = ServerItem()
         item.name = _vstr(s, "name")
         item.token = _vstr(s, "accessToken")
         item.machine_id = _vstr(s, "clientIdentifier")
         item.is_owned = _vtruthy(s, "owned")
 
+        # <Connection> children ride the resource element either directly
+        # or under a <connections> wrapper element.
+        var connections = _vitems(s, "Connection")
+        if len(connections) == 0:
+            var wrappers = _vitems(s, "connections")
+            for w in range(len(wrappers)):
+                var conn_children = _vitems(wrappers[w], "Connection")
+                for c in range(len(conn_children)):
+                    connections.append(conn_children[c].copy())
+
         # Extract best connection URL
-        var connections = _vitems(s, "connections")
         var conn_count = len(connections)
         var best_url = String()
         for j in range(conn_count):
@@ -758,7 +749,7 @@ def get_audiobooks(
     headers["X-Plex-Container-Size"] = String(size)
 
     var url = "{}/library/sections/{}/all?type=9".format(server_url, library_id)
-    var data: Value
+    var data: XmlElement
 
     try:
         data = _http_get(url, headers)
@@ -782,7 +773,7 @@ def get_audiobooks(
         var total_size_val = _vint(
             container, "totalSize", _vint(container, "size")
         )
-        var metadata = _vitems(container, "Metadata")
+        var metadata = _vitems(container, "Directory", alt="Metadata")
 
         var items = List[PlexBookCard]()
         var count = len(metadata)
@@ -834,7 +825,7 @@ def search_audiobooks(
         server_url, library_id, encoded_query
     )
 
-    var data: Value
+    var data: XmlElement
     try:
         data = _http_get(url, headers)
     except e:
@@ -854,7 +845,7 @@ def search_audiobooks(
         var total_size_val = _vint(
             container, "totalSize", _vint(container, "size")
         )
-        var metadata = _vitems(container, "Metadata")
+        var metadata = _vitems(container, "Directory", alt="Metadata")
 
         # Client-side author fallback: if title= returned nothing, try
         # fetching a larger batch and filtering on title+author locally.
@@ -900,7 +891,7 @@ def _search_by_author(
     headers["X-Plex-Container-Size"] = "500"
     var url = "{}/library/sections/{}/all?type=9".format(server_url, library_id)
 
-    var data: Value
+    var data: XmlElement
     try:
         data = _http_get(url, headers)
     except e:
@@ -913,7 +904,7 @@ def _search_by_author(
 
     try:
         var container = _container_of(data^)
-        var metadata = _vitems(container, "Metadata")
+        var metadata = _vitems(container, "Directory", alt="Metadata")
 
         # Lowercase the query once (Mojo String.lower, no Python needed).
         var query_lower = query.lower()
@@ -957,7 +948,7 @@ def get_book_detail(
     var data = _http_get(url, headers)
 
     var container = _container_of(data^)
-    var metadata_list = _vitems(container, "Metadata")
+    var metadata_list = _vitems(container, "Directory", alt="Metadata")
     if len(metadata_list) == 0:
         return BookDetail()
 
@@ -1000,7 +991,9 @@ def get_book_tracks(
     var data = _http_get(url, headers)
 
     var container = _container_of(data^)
-    var metadata = _vitems(container, "Metadata")
+    # Tracks arrive as <Track> elements (protocol-1 <Directory> for
+    # albums only; children endpoint serves Track).
+    var metadata = _vitems(container, "Track", alt="Metadata")
 
     var tracks = List[PlexTrack]()
     var count = len(metadata)
@@ -1040,14 +1033,19 @@ def get_track_chapters(
     var data = _http_get(url, headers)
 
     var container = _container_of(data^)
-    var metadata_list = _vitems(container, "Metadata")
+    var metadata_list = _vitems(container, "Track", alt="Metadata")
     if len(metadata_list) == 0:
         return List[PlexChapter]()
 
     ref m = metadata_list[0]
-    var chapters_raw = _vitems(
-        m, "Chapter", default_items=_vitems(m, "Chapters")
-    )
+    # Chapters ride directly on the element (protocol-1 XML); a JSON-era
+    # <Chapters> wrapper, when a server sends one, unwraps a level.
+    var chapters_raw = _vitems(m, "Chapter")
+    var wrappers = _vitems(m, "Chapters")
+    for w in range(len(wrappers)):
+        var wrapped = _vitems(wrappers[w], "Chapter")
+        for c in range(len(wrapped)):
+            chapters_raw.append(wrapped[c].copy())
 
     var chapters = List[PlexChapter]()
     var count = len(chapters_raw)
@@ -1091,9 +1089,7 @@ def get_collections(
     var data = _http_get(url, headers)
 
     var container = _container_of(data^)
-    var directories = _vitems(
-        container, "Directory", default_items=_vitems(container, "Metadata")
-    )
+    var directories = _vitems(container, "Directory", alt="Metadata")
 
     var collections = List[CollectionItem]()
     var count = len(directories)
@@ -1124,7 +1120,7 @@ def get_collection_books(
     var data = _http_get(url, headers)
 
     var container = _container_of(data^)
-    var metadata = _vitems(container, "Metadata")
+    var metadata = _vitems(container, "Directory", alt="Metadata")
 
     var items = List[PlexBookCard]()
     var count = len(metadata)
@@ -1184,7 +1180,7 @@ def get_playback_decision(
 
     var url = server_url + "/audio/:/transcode/universal/decision?" + query
 
-    var data: Value
+    var data: XmlElement
     try:
         data = _http_get(url, headers)
     except:
@@ -1198,9 +1194,7 @@ def get_playback_decision(
     var stream_url = ""
     var is_direct = direct_play_code == 1000
 
-    var metadata_list = _vitems(
-        container, "Metadata", default_items=_vitems(container, "Track")
-    )
+    var metadata_list = _vitems(container, "Metadata", alt="Track")
 
     if len(metadata_list) > 0:
         var media_list = _vitems(metadata_list[0], "Media")
@@ -1208,16 +1202,21 @@ def get_playback_decision(
             # First media flagged selected, else the first media.
             var selected_media = media_list[0].copy()
             for i in range(len(media_list)):
-                if _vtruthy(media_list[i], "selected"):
+                if _vtruthy(media_list[i], "selected") or _has(
+                    media_list[i], "decision"
+                ):
                     selected_media = media_list[i].copy()
                     break
 
             var parts = _vitems(selected_media, "Part")
             if len(parts) > 0:
-                # First part flagged selected, else the first part.
+                # First part flagged selected (or carrying the decision
+                # attribute), else the first part.
                 var selected_part = parts[0].copy()
                 for i in range(len(parts)):
-                    if _vtruthy(parts[i], "selected"):
+                    if _vtruthy(parts[i], "selected") or _has(
+                        parts[i], "decision"
+                    ):
                         selected_part = parts[i].copy()
                         break
 
@@ -1290,7 +1289,7 @@ def start_play_queue(
         query += _percent_encode(entry.key) + "=" + _percent_encode(entry.value)
 
     var url = server_url + "/playQueues?" + query
-    var data: Value
+    var data: XmlElement
     try:
         data = _http_post_form(
             url, headers, Dict[String, String](), timeout=30.0
@@ -1298,13 +1297,18 @@ def start_play_queue(
     except:
         return PlayQueueResult()
 
-    var container = _container_of(data^)
-    var pq_id = _vint(container, "playQueueID")
-    var selected_item_id = _vint(container, "playQueueSelectedItemID")
+    # The response root is a typed <PlayQueue> element carrying the queue
+    # ids as attributes; unwrap a MediaContainer should one wrap it.
+    var pq = _container_of(data^, key="PlayQueue")
+    var pq_id = _vint(pq, "playQueueID")
+    var selected_item_id = _vint(pq, "playQueueSelectedItemID")
 
-    var metadata = _vitems(
-        container, "Metadata", default_items=_vitems(container, "PlayQueueItem")
-    )
+    # Queue items are the media elements themselves (Track for audio),
+    # with playQueueItemID riding as an attribute — same shape
+    # python-plexapi parses.
+    var metadata = _vitems(pq, "Track", alt="Metadata")
+    if len(metadata) == 0:
+        metadata = _vitems(pq, "PlayQueueItem")
 
     var items = List[PlayQueueItem]()
     var count = len(metadata)

@@ -1,9 +1,11 @@
 """Quire — minimal XML parser (pure safe Mojo).
 
-Implementation: recursive descent over codepoints. String indexing by
-byte traps on non-ASCII on this toolchain (probed), so the cursor walks
-codepoint indices and value runs are sliced from the source by index
-(UTF-8 titles survive byte-for-byte).
+Implementation: recursive descent with a byte-positioned UTF-8 cursor.
+`String[byte=N]` on a codepoint boundary yields the codepoint starting
+at N plus its byte width (probed), so next() is an O(1) decode step and
+multi-byte UTF-8 survives byte-for-byte; byte N mid-codepoint aborts
+(and codepoint-index rescan would be O(n) per read), so pos is only
+ever advanced by a codepoint's decoded width.
 """
 
 from std.collections import List
@@ -14,8 +16,12 @@ from std.collections import List
 # ---------------------------------------------------------------------------
 
 
-struct XmlElement(Deinitable, Movable):
-    """One parsed element: tag, attributes, children."""
+struct XmlElement(Copyable, Deinitable, Movable):
+    """One parsed element: tag, attributes, children.
+
+    Copyable so the bridge layer (functions.plex_bridge accessors) can
+    lift children out of a parse tree into its own lists — a response
+    tree is read through borrowed refs everywhere else."""
 
     var tag: String
     var attrs: Dict[String, String]
@@ -25,6 +31,11 @@ struct XmlElement(Deinitable, Movable):
         self.tag = tag
         self.attrs = Dict[String, String]()
         self.children = List[XmlElement]()
+
+    def __init__(out self, *, copy: Self):
+        self.tag = copy.tag
+        self.attrs = copy.attrs.copy()
+        self.children = copy.children.copy()
 
     def __deinit__(deinit self):
         pass
@@ -36,66 +47,41 @@ struct XmlElement(Deinitable, Movable):
 
 
 # ---------------------------------------------------------------------------
-# Cursor: codepoint-index walker with one-slot pushback
+# Cursor: byte-positioned UTF-8 walker with one-slot pushback
 # ---------------------------------------------------------------------------
 
 
 struct _Cursor:
-    """Codepoint cursor with one-slot pushback. next() yields the
-    codepoint value (Int, -1 at end); slices are recovered by index via
-    _slice so multi-byte codepoints append intact."""
+    """Forward-only UTF-8 cursor with one-slot pushback. next() decodes
+    exactly one codepoint at the cursor's byte offset: String[byte=N] at
+    a codepoint boundary (probed) yields the codepoint starting there
+    plus its byte width, so each step is O(1) and multi-byte UTF-8
+    survives byte-for-byte. pos rests on a codepoint boundary whenever
+    it is not the sentinel end."""
 
     var src: String
-    var slices: List[String]  # codepoint slices, materialized lazily
-    var pos: Int  # codepoint index of the next read
-    var pushback: Int  # -1 when empty
+    var pos: Int  # byte offset of the next read
+    var pushback: Int  # codepoint value; -1 when empty
 
     def __init__(out self, src: String):
         self.src = src
-        self.slices = List[String]()
         self.pos = 0
         self.pushback = -1
-
-    def count(self) -> Int:
-        return self.src.count_codepoints()
 
     def next(mut self) -> Int:
         if self.pushback >= 0:
             var cp = self.pushback
             self.pushback = -1
             return cp
-        if self.pos >= self.count():
+        var end = self.src.byte_length()
+        if self.pos >= end:
             return -1
-        var idx = self.pos
-        self.pos += 1
-        return _codepoint_at(self.src, idx)
+        var at = self.src[byte=self.pos]
+        self.pos += at.byte_length()
+        return ord(String(at))
 
     def unread(mut self, cp: Int):
         self.pushback = cp
-
-    def consume_index(mut self) -> Int:
-        """Codepoint index of the most recent next() (for slicing)."""
-        if self.pushback >= 0:
-            return self.pos - 2
-        return self.pos - 1
-
-
-def _codepoint_at(src: String, idx: Int) -> Int:
-    var i = 0
-    for cp in src.codepoints():
-        if i == idx:
-            return Int(cp)
-        i += 1
-    return -1
-
-
-def _slice_at(src: String, idx: Int) -> String:
-    var i = 0
-    for cp in src.codepoint_slices():
-        if i == idx:
-            return String(cp)
-        i += 1
-    return String()
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +107,61 @@ def _is_name_char(cp: Int) -> Bool:
     )
 
 
+def _entity_codepoint(body: String, start_cp: Int, hex_mode: Bool) -> Int:
+    """Numeric value of the digit run at codepoint index start_cp; -1 on
+    an empty run, a non-digit character, or an out-of-range value (the
+    caller then keeps the entity as literal text, like an unknown name).
+
+    Entity bodies are ASCII (digits x/X only), so byte and codepoint
+    indices agree here and the digit run is always well-formed to walk.
+    """
+    var value = 0
+    var count = 0
+    var i = 0
+    for cp in body.codepoints():
+        if i < start_cp:
+            i += 1
+            continue
+        var c = Int(cp)
+        var digit: Int
+        if c >= 48 and c <= 57:  # 0-9
+            digit = c - 48
+        elif hex_mode and c >= 97 and c <= 102:  # a-f
+            digit = c - 87
+        elif hex_mode and c >= 65 and c <= 70:  # A-F
+            digit = c - 55
+        else:
+            return -1
+        value = value * (16 if hex_mode else 10) + digit
+        count += 1
+        if value > 0x10FFFF:
+            return -1
+    if count == 0 or value < 1:
+        return -1
+    return value
+
+
 def _decode_entity(body: String) -> String:
-    """The five predefined XML entities; anything else passes through
+    """Decode one entity body (the text between '&' and ';').
+
+    The five predefined XML entities plus numeric character references —
+    decimal (&#39;) and hex (&#x27;). Plex serializes apostrophes and
+    quotes inside titles/attributes as numeric refs, so they must decode
+    or every "it's" renders as "it&#39;s". Anything else passes through
     unchanged (matching ET's leniency for unknown entities)."""
+    if body.byte_length() > 0 and String(body[byte=0]) == "#":
+        var cp: Int
+        if body.byte_length() > 2 and (
+            String(body[byte=1]) == "x" or String(body[byte=1]) == "X"
+        ):
+            # Hex form: &#x27; / &#X27;
+            cp = _entity_codepoint(body, 2, True)
+        else:
+            # Decimal form: &#39;
+            cp = _entity_codepoint(body, 1, False)
+        if cp > 0 and cp <= 0x10FFFF and not (cp >= 0xD800 and cp <= 0xDFFF):
+            return String(chr(cp))
+        return "&" + body + ";"
     if body == "amp":
         return "&"
     if body == "lt":
@@ -132,6 +170,8 @@ def _decode_entity(body: String) -> String:
         return ">"
     if body == "quot":
         return '"'
+    if body == "apos":
+        return "'"
     if body == "apos":
         return "'"
     return "&" + body + ";"
@@ -173,7 +213,6 @@ def _read_attr_value(mut c: _Cursor) raises -> String:
 
     var value = String()
     while True:
-        var idx_before = c.consume_index() + 1  # index of the next read
         var cp = c.next()
         if cp < 0:
             raise Error("xml: unterminated attribute value")
@@ -182,7 +221,7 @@ def _read_attr_value(mut c: _Cursor) raises -> String:
         if cp == ord("&"):
             value += _read_entity(c)
         else:
-            value += _slice_at(c.src, idx_before)
+            value += String(chr(cp))
 
 
 def _read_entity(mut c: _Cursor) -> String:
