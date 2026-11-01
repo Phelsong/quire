@@ -32,7 +32,7 @@ Icon=quire
 Categories=Audio;AudioVideo;
 """
 
-UPSTREAM_PNG = REPO / "resources" / "icon.png"
+UPSTREAM_PNG = REPO / "assets" / "quire-logo-background.png"
 
 
 def fail(msg: str) -> None:
@@ -71,10 +71,13 @@ def main() -> None:
 """
     )
 
-    # Icon: reuse any repo PNG; placeholder if none exists yet.
+    # Icon: prefer the project logo, fall back to any repo PNG; placeholder
+    # if none exists.
     icon_dst = APPDIR / "quire.png"
     if not icon_dst.exists():
-        candidates = list((REPO / "resources").glob("*.png"))
+        candidates = [p for p in (UPSTREAM_PNG,
+                                  *(REPO / "resources").glob("*.png"))
+                      if p.is_file()]
         if candidates:
             shutil.copyfile(candidates[0], icon_dst)
         else:

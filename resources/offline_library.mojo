@@ -285,7 +285,6 @@ def delete_saved_book(rating_key: String, audio_dir: String) -> Bool:
         except e:
             print("[Quire] delete sidecar failed: " + String(e))
 
-
     var extensions = List[String]()
     extensions.append(".mp3")
     extensions.append(".ogg")

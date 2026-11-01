@@ -7,7 +7,7 @@ Produces:
     bin/quire.bin        the linked Mojo binary
     bin/ffmpeg, bin/ffprobe
     lib/                 recursive pixi-owned shared-lib closure (+ libpython)
-    python3.14/          full Python runtime (stdlib + site-packages)
+    python3.14/          Python home: lib/python3.14 = stdlib + site-packages
   dist/quire-linux-x86_64.tar.gz
 
 Run from the repo root (or via `pixi run dist`).
@@ -33,7 +33,7 @@ SYSTEM_PREFIXES = ("/usr/lib", "/lib", "libc.so", "libm.so", "ld-linux",
                    "linux-vdso", "libpthread.so", "libdl.so", "librt.so")
 
 
-def ldd_closure(entry: Path) -> set:
+def ldd_closure(entry: Path, index: dict[str, Path]) -> set:
     """Recursive pixi-owned .so closure of `entry` (resolved via env libs)."""
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = f"{PIXI_LIB}:{ENV_LIB}"
@@ -49,31 +49,47 @@ def ldd_closure(entry: Path) -> set:
             if not lib or not lib.startswith("/"):
                 continue
             p = Path(lib).resolve()
-            name = p.name
-            if name not in found:
-                found.append(name)
+            # Record both names: the loader matches DT_NEEDED against the
+            # SONAME file (often a versioned symlink like libavdevice.so.63),
+            # while the walk needs the resolved real file for transitive
+            # deps. Recording only the real name shipped `.so.63.1.102`
+            # without the `.so.63` link the loader looks for.
+            if p.name not in found:
+                found.append(p.name)
+            if Path(lib).name not in found:
+                found.append(Path(lib).name)
             if (not p.as_posix().startswith(SYSTEM_PREFIXES) or
                     "pixi" in p.as_posix()):
-                if name not in [s.name for s in stack]:
+                if p.name not in [s.name for s in stack]:
                     stack.append(p)
-    # keep only pixi-owned files
-    pixi_names = {p.name for d in (ENV_LIB, PIXI_LIB)
-                  for p in d.iterdir() if p.is_file() or p.is_symlink()}
-    return {n for n in found if n in pixi_names}
+    # keep only pixi-owned libs
+    return {n for n in found if n in index}
 
 
-def find_lib(name: str) -> Path | None:
+def build_lib_index() -> dict[str, Path]:
+    """Map lib file name -> source path, recursively under ENV_LIB/PIXI_LIB.
+
+    ENV_LIB entries win, so a name resolves to its env copy. Subdirectories
+    matter: conda scatters deps in them (e.g. lib/pulseaudio/
+    libpulsecommon-17.0.so, which libpulse finds via its $ORIGIN RPATH).
+    """
+    index: dict[str, Path] = {}
     for d in (ENV_LIB, PIXI_LIB):
-        p = d / name
-        if p.exists():
-            return p
-    return None
+        for p in d.rglob("*"):
+            if p.is_symlink() or p.is_file():
+                index.setdefault(p.name, p)
+    return index
 
 
-def copy_lib(name: str, dst_dir: Path, copied: set) -> None:
+def find_lib(name: str, index: dict[str, Path]) -> Path | None:
+    return index.get(name)
+
+
+def copy_lib(name: str, dst_dir: Path, copied: set,
+             index: dict[str, Path]) -> None:
     if name in copied:
         return
-    src = find_lib(name)
+    src = find_lib(name, index)
     if src is None:
         print(f"WARN: lib not found in pixi env: {name}", file=sys.stderr)
         return
@@ -85,7 +101,7 @@ def copy_lib(name: str, dst_dir: Path, copied: set) -> None:
         copied.add(src.name)
         copied.add(target.name)
         # recurse on symlink chain
-        copy_lib(target.name, dst_dir, copied)
+        copy_lib(target.name, dst_dir, copied, index)
     else:
         shutil.copy2(src, dst_dir / name)
         copied.add(name)
@@ -104,13 +120,21 @@ def main() -> None:
     shutil.copy2(MAIN, APPDIR / "bin/quire.bin")
 
     # -- shared library closure ------------------------------------------------
+    # Cover quire.bin AND the bundled ffmpeg/ffprobe, or their libav* deps
+    # only resolve via the build machine's system libs (silently works on
+    # the dev box, breaks in flatpak/any sandbox).
+    index = build_lib_index()
+    closure: set = set()
+    for entry in (MAIN, ENV_BIN / "ffmpeg", ENV_BIN / "ffprobe"):
+        if entry.exists():
+            closure |= ldd_closure(entry, index)
     copied: set = set()
-    for name in sorted(ldd_closure(MAIN)):
-        copy_lib(name, APPDIR / "lib", copied)
+    for name in sorted(closure):
+        copy_lib(name, APPDIR / "lib", copied, index)
     # Mojo's Python interop dlopens libpython; pull it explicitly.
     # It probes the unversioned "libpython3.14.so" name, so ship the
     # symlink trio (libpython3.so -> libpython3.14.so -> .so.1.0) too.
-    copy_lib("libpython3.14.so.1.0", APPDIR / "lib", copied)
+    copy_lib("libpython3.14.so.1.0", APPDIR / "lib", copied, index)
     for sym in ("libpython3.14.so", "libpython3.so"):
         src = ENV_LIB / sym
         if src.is_symlink():
@@ -125,10 +149,14 @@ def main() -> None:
             print(f"WARN: {tool} not in env bin", file=sys.stderr)
 
     # -- python runtime ---------------------------------------------------------
+    # Layout: <pyhome>/lib/python3.14 = the env's lib/. Python getpath
+    # resolves stdlib as <PYTHONHOME>/lib/<platlibdir>/python3.14 and
+    # site processing picks up <stdlib>/site-packages — so pointing
+    # PYTHONHOME at py_dest works on any machine (see bin/quire launcher).
     py_dest = APPDIR / "python3.14"
     if py_dest.exists():
         shutil.rmtree(py_dest)
-    shutil.copytree(ENV_LIB.parent / "lib", py_dest, symlinks=True,
+    shutil.copytree(ENV_LIB.parent / "lib", py_dest / "lib", symlinks=True,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
     # -- data assets -------------------------------------------------------------
@@ -150,7 +178,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 ROOT="$(dirname "$HERE")"
 export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export PYTHONPATH="$ROOT/python3.14/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+# python3.14/ is a python home (<pyhome>/lib/<platlibdir>/python3.14 = stdlib).
+# Without PYTHONHOME, getpath falls back to the build machine's compiled-in
+# prefix (e.g. the dev .pixi env), which breaks the bundle on any other
+# machine — and inside flatpak sandboxes.
+export PYTHONHOME="$ROOT/python3.14"
+export PYTHONPATH="$ROOT/python3.14/lib/python3.14/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 export CONDA_PREFIX="$ROOT"
 # Mojo's Python interop loads libpython via this exact path (no guessing).
 export MOJO_PYTHON_LIBRARY="$ROOT/lib/libpython3.14.so.1.0"
@@ -161,15 +194,21 @@ exec "$ROOT/bin/quire.bin" "$@"
     launcher.chmod(0o755)
     (APPDIR / "bin/quire.bin").chmod(0o755)
 
-    # -- sanity: bundle binary resolves all libs against bundle lib/ -----------
+    # -- sanity: bundled binaries resolve all libs against bundle lib/ ---------
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = str(APPDIR / "lib")
-    out = subprocess.run(["ldd", str(APPDIR / "bin/quire.bin")],
-                         capture_output=True, text=True, env=env)
-    missing = [ln for ln in out.stdout.splitlines() if "not found" in ln]
-    if missing:
-        print("\n".join(missing), file=sys.stderr)
-        sys.exit("error: unresolved libs in bundle")
+    for exe in ("bin/quire.bin", "bin/ffmpeg", "bin/ffprobe"):
+        exe_path = APPDIR / exe
+        if not exe_path.exists():
+            print(f"WARN: {exe} missing from bundle", file=sys.stderr)
+            continue
+        out = subprocess.run(["ldd", str(exe_path)],
+                             capture_output=True, text=True, env=env)
+        missing = [ln for ln in out.stdout.splitlines() if "not found" in ln]
+        if missing:
+            print(f"--- {exe}", file=sys.stderr)
+            print("\n".join(missing), file=sys.stderr)
+            sys.exit(f"error: unresolved libs in bundle ({exe})")
 
     # -- tarball -----------------------------------------------------------------
     tarball = DIST / "quire-linux-x86_64.tar.gz"
